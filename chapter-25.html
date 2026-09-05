@@ -1,0 +1,772 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 25 — Project 9 — Mobile Authentication | Master Auth0</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">🔐 Master Auth0</a>
+  <nav class="topnav">
+    <a href="chapter-24.html">← Prev</a>
+    <a href="index.html">Contents</a>
+    <a href="chapter-26.html">Next →</a>
+  </nav>
+</header>
+<main class="container">
+  <div class="chapter-head">
+    <span class="phase">Phase 8 · Integration Projects</span>
+    <h1>Chapter 25 — Project 9 — Mobile Authentication</h1>
+    <p class="lead">A phone is a hostile place to store a secret. There is no server you control, the binary ships to every attacker who wants it, and a stolen device is a stolen vault. Yet mobile is where most of your users live. This chapter builds <em>native</em> authentication with Auth0 from first principles: why the <strong>Authorization Code flow with PKCE</strong> is the only correct grant for a public client, why you must open the <strong>system browser</strong> and never an embedded webview, how the OS hands the redirect back to your app through <strong>deep links / app links</strong>, where tokens actually live (the iOS <strong>Keychain</strong> and Android <strong>Keystore</strong>), how <strong>biometric unlock</strong> gates that storage, and how <strong>refresh token rotation</strong> keeps a long-lived session safe on a device you do not trust. Our primary code is <strong>React Native</strong> with <code>react-native-auth0</code>, backed by native <strong>Swift</strong> and <strong>Kotlin</strong> snippets so you understand what the SDK does for you. By the end you will be able to ship mobile auth that survives a security review, explain every decision in a senior interview, and answer the certification's mobile questions cold.</p>
+  </div>
+
+  <!-- 1 -->
+  <section id="theory">
+    <h2>1. Theory — Why Mobile Auth Is Different (First Principles)</h2>
+    <p>Everything about mobile auth flows from one uncomfortable fact: <strong>a native app is a public client</strong>. To understand why that single classification dictates every later decision, we have to define the term precisely.</p>
+    <p>In OAuth 2.0, a <strong>client</strong> is the application requesting access on behalf of a user. Clients come in two kinds:</p>
+    <ul>
+      <li>A <strong>confidential client</strong> can keep a secret. It runs on a server you control. It can hold a <code>client_secret</code> in an environment variable that no end user ever sees. When it talks to the token endpoint it proves "I really am this app" by presenting that secret.</li>
+      <li>A <strong>public client</strong> <em>cannot</em> keep a secret. A native mobile app, a single-page app, a desktop app — anything whose code is fully delivered to the user's device — falls here. Whatever secret you compile into the binary can be extracted with a decompiler in minutes. There is no hiding place.</li>
+    </ul>
+    <div class="callout key"><span class="tag">Key</span><p>A native app is a <strong>public client</strong>. It has <em>no</em> client secret, because any secret you ship is already compromised. This is not a limitation to work around — it is the premise that the entire mobile flow is designed to respect.</p></div>
+    <h3>The consequence: you cannot use a secret to prove identity, so you must prove control of the request another way</h3>
+    <p>If a public client can't present a secret, how does the authorization server know that the app redeeming an authorization code is the same app that started the login? It can't, with secrets. So OAuth's answer for public clients is <strong>PKCE</strong> (Proof Key for Code Exchange, pronounced "pixy"), defined in RFC 7636. PKCE replaces the static secret with a <em>fresh, per-request secret</em> that never has to be stored: the app invents a random value at the start of each login, sends only its hash up front, and reveals the original value when it redeems the code. We dissect the math in §5. For now, hold the shape: <strong>no permanent secret; a one-time proof per login.</strong></p>
+    <h3>The second consequence: you have no controlled redirect URI — you have a deep link</h3>
+    <p>On the web, after login the browser redirects to <code>https://yourapp.com/callback</code> — a URL your server owns. A mobile app is not a web server; it has no URL. So the operating system provides a mechanism to route a URL <em>into</em> a specific installed app: <strong>custom URL schemes</strong> (<code>myapp://callback</code>) and the more secure <strong>universal links</strong> (iOS) / <strong>app links</strong> (Android), which use real <code>https://</code> URLs that the OS verifies belong to your app. The redirect at the end of the OAuth dance lands on one of these, and the OS wakes your app. §3 and §7 make this concrete.</p>
+    <h3>The third consequence: where do tokens live on a device you don't trust?</h3>
+    <p>The server-side world stores sessions in a database behind a firewall. On a phone there is no firewall and the device may be lost, jailbroken, or rooted. The tokens (access token, ID token, and the prized long-lived refresh token) must rest in the platform's <strong>hardware-backed secure storage</strong> — the iOS <strong>Keychain</strong> and the Android <strong>Keystore</strong> — never in plain files, never in <code>UserDefaults</code>/<code>SharedPreferences</code>, never in <code>AsyncStorage</code>. And because a long-lived refresh token on a device is dangerous, we use <strong>refresh token rotation</strong>: each use burns the old token and issues a new one, so a stolen-and-replayed token can be detected and the whole family revoked.</p>
+    <p>Those three consequences — PKCE instead of a secret, deep links instead of a server redirect, hardware-backed storage with rotation instead of a database session — <em>are</em> mobile authentication. The rest of this chapter is detail on each.</p>
+  </section>
+
+  <!-- 2 -->
+  <section id="story">
+    <h2>2. Story-Based Explanation — Priya Builds "TrailMate"</h2>
+    <p>Priya is shipping <strong>TrailMate</strong>, a hiking app, to iOS and Android with a React Native codebase. Watch her make — and nearly miss — every key decision.</p>
+    <p><strong>Day 1 — the tempting shortcut.</strong> Priya's first instinct is to drop a username/password form right inside the app and POST it to Auth0's <code>/oauth/token</code> endpoint with the Resource Owner Password grant. It's one screen, no browser, feels native. Her security lead stops her: "Now <em>your app</em> sees the user's raw password. If your app is the thing handling the password, you've thrown away every benefit of delegating to an IdP — no SSO, no social login, no enterprise federation, and you're one bug away from leaking credentials. The password grant is deprecated for exactly this reason. Use the browser."</p>
+    <p><strong>Day 2 — webview vs. system browser.</strong> Priya tries an embedded <code>WKWebView</code> so the login "stays inside the app." It works in the demo. But the security lead points out three problems: the user can't tell a real Auth0 page from a phishing page rendered in <em>your</em> webview (no address bar), the webview can't share the system browser's session so <strong>SSO breaks</strong>, and Apple/Google increasingly <strong>reject</strong> apps that put third-party login in embedded webviews. She switches to <code>ASWebAuthenticationSession</code> on iOS / <code>Custom Tabs</code> on Android — the OS-blessed in-app browser that shares cookies with Safari/Chrome.</p>
+    <p><strong>Day 3 — the redirect vanishes.</strong> Login succeeds in Auth0, the browser tries to redirect to <code>com.trailmate://callback</code>... and nothing happens. The app never wakes. She forgot to register the URL scheme in <code>Info.plist</code> / <code>AndroidManifest.xml</code> and to add the callback URL to her Auth0 Application's <strong>Allowed Callback URLs</strong>. Once registered, the OS catches the redirect and hands control back to TrailMate with the authorization code.</p>
+    <p><strong>Day 4 — "stay logged in."</strong> Users hate re-logging-in. Priya requests the <code>offline_access</code> scope to get a <strong>refresh token</strong>, and stores it. The security lead's last lesson: "Don't put that in AsyncStorage — it's plaintext on a rooted phone. Put it in the Keychain/Keystore, gate it behind Face ID, and turn on refresh token rotation in Auth0 so a stolen token self-destructs on replay." Priya does all three. TrailMate ships, passes the pen test, and Priya can explain every line in her next interview.</p>
+    <div class="callout note"><span class="tag">Note</span><p>Every wrong turn Priya took is a real, common mistake — and each correct turn is a rule the certification tests. Keep her four days in mind; the chapter follows the same arc.</p></div>
+  </section>
+
+  <!-- 3 -->
+  <section id="diagrams">
+    <h2>3. ASCII Diagrams — The Mental Models</h2>
+    <h3>The end-to-end mobile login (Authorization Code + PKCE)</h3>
+    <pre class="diagram">
+  +------------+         +------------------+        +------------------+
+  | Native App |         | System Browser   |        |  Auth0 (/authz   |
+  | (public    |         | ASWebAuth / Tabs |        |  + /oauth/token) |
+  |  client)   |         +------------------+        +------------------+
+  +-----+------+                  |                            |
+        | 1. make code_verifier (random)                      |
+        |    code_challenge = SHA256(verifier)                |
+        |                                                      |
+        | 2. open browser to /authorize?                       |
+        |    client_id, redirect_uri, code_challenge,          |
+        |    code_challenge_method=S256, scope, state, nonce   |
+        |--------------------------->|                         |
+        |                            | 3. show LOGIN (real     |
+        |                            |    Auth0 page, has URL  |
+        |                            |    bar; shares SSO      |
+        |                            |    cookie w/ browser)   |
+        |                            |------------------------>|
+        |                            |   user authenticates    |
+        |                            |&lt;------------------------|
+        |                            | 4. 302 redirect to      |
+        |                            |    com.app://callback   |
+        |                            |    ?code=AUTH_CODE&state|
+        |   5. OS routes deep link   |                         |
+        |&lt;---------------------------|                         |
+        |                                                      |
+        | 6. POST /oauth/token  { code, code_verifier,         |
+        |    client_id, redirect_uri }   (NO secret!)          |
+        |----------------------------------------------------->|
+        |                          7. server hashes verifier,  |
+        |                             compares to challenge;   |
+        |                             if match -> issue tokens |
+        |&lt;-----------------------------------------------------|
+        |   { access_token, id_token, refresh_token, exp }     |
+        |                                                      |
+        | 8. store tokens in Keychain / Keystore               |
+        v                                                      v
+    </pre>
+    <h3>Why the system browser, not a webview</h3>
+    <pre class="diagram">
+  EMBEDDED WEBVIEW (WRONG)              SYSTEM BROWSER (RIGHT)
+  ------------------------              ----------------------
+  +-----------------------+            +-----------------------+
+  |  YOUR APP             |            |  YOUR APP             |
+  |  +-----------------+  |            |  (hands off to OS)    |
+  |  | WKWebView /     |  |            +----------+------------+
+  |  | Android WebView |  |                       | OS-owned
+  |  |  no URL bar     |  |                       v
+  |  |  app can read   |  |            +-----------------------+
+  |  |  the password!  |  |            | ASWebAuthSession /    |
+  |  |  no SSO cookie  |  |            | Custom Tab            |
+  |  +-----------------+  |            |  REAL url bar         |
+  +-----------------------+            |  app CANNOT read DOM  |
+   x  phishable                       |  shares Safari/Chrome |
+   x  app sees credentials            |  SSO session cookie   |
+   x  no SSO                          +-----------------------+
+   x  store rejection                  ok  isolated, trusted, SSO
+    </pre>
+    <h3>Token storage hierarchy on the device</h3>
+    <pre class="diagram">
+   LEAST SAFE  ----------------------------------------->  MOST SAFE
+   +----------------+  +-------------------+  +-----------------------+
+   | AsyncStorage / |  | Encrypted prefs / |  | Keychain (iOS) /      |
+   | UserDefaults / |  | EncryptedShared-  |  | Keystore (Android)    |
+   | SharedPrefs    |  | Preferences       |  | hardware-backed,      |
+   | PLAINTEXT      |  | software key      |  | biometric-gated,      |
+   | x NEVER tokens |  | ~ ok for non-PII  |  | Secure Enclave/TEE    |
+   +----------------+  +-------------------+  +-----------------------+
+                                              ok  ALL tokens go HERE
+    </pre>
+    <h3>Refresh token rotation (reuse detection)</h3>
+    <pre class="diagram">
+   App           Auth0 token endpoint
+    |  RT0 ---------------->|  valid, used
+    |&lt;------ AT1 + RT1 -----|  RT0 now INVALID (rotated)
+    |  RT1 ---------------->|  valid, used
+    |&lt;------ AT2 + RT2 -----|  RT1 now INVALID
+    |                       |
+    |  (attacker replays RT1 — already used!)
+    |  RT1 ---------------->|  REUSE DETECTED
+    |&lt;----- 403 + REVOKE ---|  whole token family killed
+    |                       |  legit app must re-login
+    </pre>
+  </section>
+
+  <!-- 4 -->
+  <section id="analogy">
+    <h2>4. Real-World Analogy — The Hotel, the Notary, and the Single-Use Coat Check</h2>
+    <p>Mobile auth has a lot of moving parts; anchor each in something physical.</p>
+    <h3>PKCE = the single-use coat-check ticket you tear in half</h3>
+    <p>Imagine you check your coat but you're worried someone will steal your claim ticket. So you tear a unique ticket in half: you keep one half (<code>code_verifier</code>) and hand the attendant the <em>other</em> half (<code>code_challenge</code>) when you drop the coat. When you return, you present your half; the attendant matches the torn edges. A thief who grabs your coat ticket (the authorization code) off the floor still can't claim the coat, because they don't hold the matching torn half. The verifier never sat on a public counter — it stayed in your pocket the whole time. That is exactly PKCE: the challenge goes up front in the open redirect; the verifier is revealed only at redemption, over a direct back-channel.</p>
+    <h3>System browser = the hotel's official front desk, not a clerk who follows you to your room</h3>
+    <p>You give your passport to the <strong>front desk</strong> (the system browser, an institution you can see and trust, with a sign over it — the URL bar). You would never hand your passport to a stranger in the hallway who <em>claims</em> to work for the hotel and offers to "process it in your room" (an embedded webview inside the app, with no sign, who could be anyone and is standing in your private space watching). The front desk also remembers you for the rest of your stay (the shared SSO session cookie), so you don't re-prove yourself at the spa and the gym.</p>
+    <h3>Keychain/Keystore = the in-room safe bolted to the wall, opened by your fingerprint</h3>
+    <p>Your room key card (the tokens) doesn't get left on the nightstand (AsyncStorage). It goes in the <strong>safe</strong> (Keychain/Keystore) that is physically bolted into the building's structure (the Secure Enclave / Trusted Execution Environment — a separate chip even the main OS can't read out of), and the safe only opens to <em>your</em> fingerprint (biometric unlock). Steal the whole room and you still can't crack the bolted safe.</p>
+    <h3>Refresh token rotation = a hotel key that reprograms itself every time you tap it</h3>
+    <p>Each time you tap your key card on your door, the lock issues you a fresh card and invalidates the old one. If a pickpocket copies your card and taps it, the lock sees a card that was <em>already replaced</em> — it knows a copy exists, alarms, and disables your room entirely until you check in again at the front desk. The attacker's copy and your real card both die. That is reuse detection.</p>
+    <div class="callout tip"><span class="tag">Tip</span><p>If you can retell the "torn coat-check ticket" story for PKCE and the "self-reprogramming hotel key" story for rotation, you can answer the two hardest mobile interview questions on the spot.</p></div>
+  </section>
+
+  <!-- 5 -->
+  <section id="internal">
+    <h2>5. Internal Working — PKCE, Deep Links, and Secure Enclaves Under the Hood</h2>
+    <h3>5.1 PKCE, step by step with the actual math</h3>
+    <ol>
+      <li><strong>Generate the verifier.</strong> The app creates a cryptographically random string, 43–128 characters, from the unreserved URL set (<code>[A-Z a-z 0-9 - . _ ~]</code>). This is the <code>code_verifier</code>. It stays in memory on the device; it is never sent in the front-channel (the browser redirect).</li>
+      <li><strong>Derive the challenge.</strong> Compute <code>code_challenge = BASE64URL( SHA-256( ASCII(code_verifier) ) )</code> and set <code>code_challenge_method=S256</code>. (A "plain" method exists where challenge = verifier, but you must always use S256 — plain offers no protection if the front channel leaks.)</li>
+      <li><strong>Front-channel.</strong> The app opens the browser to <code>/authorize</code> carrying the <em>challenge</em> (the hash). Even if malware reads the redirect URL, it sees only the hash — and SHA-256 is one-way, so it can't recover the verifier.</li>
+      <li><strong>Back-channel.</strong> After the user authenticates, the app receives the authorization <code>code</code> via the deep link and POSTs it to <code>/oauth/token</code> together with the original <code>code_verifier</code>.</li>
+      <li><strong>Server proof.</strong> Auth0 hashes the received verifier and checks it equals the challenge it stored at step 3. Match → it knows the redeemer is the same party that started the flow → it issues tokens. No secret was ever needed.</li>
+    </ol>
+    <div class="callout note"><span class="tag">Why this defeats the attack</span><p>The threat PKCE kills is <strong>authorization-code interception</strong>: on mobile, another malicious app could register the <em>same</em> custom URL scheme and intercept the redirect, stealing the code. Without PKCE, that stolen code could be redeemed for tokens. With PKCE, the thief has the code but not the in-memory <code>code_verifier</code>, so redemption fails.</p></div>
+    <h3>5.2 How a deep link actually routes back into your app</h3>
+    <p>Two mechanisms, with very different security:</p>
+    <table>
+      <thead><tr><th></th><th>Custom URL scheme</th><th>Universal Link (iOS) / App Link (Android)</th></tr></thead>
+      <tbody>
+        <tr><td>Looks like</td><td><code>com.trailmate://callback</code></td><td><code>https://trailmate.com/callback</code></td></tr>
+        <tr><td>Ownership</td><td>Any app can claim the same scheme</td><td>OS verifies you own the domain (file on your server)</td></tr>
+        <tr><td>Verification</td><td>None — collision possible</td><td>iOS fetches <code>/.well-known/apple-app-site-association</code>; Android fetches <code>/.well-known/assetlinks.json</code></td></tr>
+        <tr><td>Interception risk</td><td>Higher (mitigated by PKCE)</td><td>Very low — only the verified app opens it</td></tr>
+        <tr><td>Recommended for</td><td>Acceptable with PKCE; common in samples</td><td>Production — strongest binding of redirect to your app</td></tr>
+      </tbody>
+    </table>
+    <p>When the browser issues the final 302 to your redirect URI, the OS looks at the scheme/host. For a custom scheme it dispatches to whatever app registered it; for a verified universal/app link it checks the association file it downloaded at install time and dispatches only to <em>your</em> app. Either way your app receives the URL in a platform callback (iOS <code>application(_:open:)</code> / <code>SceneDelegate</code>, or Android an <code>Intent</code> with <code>ACTION_VIEW</code>), from which the SDK extracts <code>code</code> and <code>state</code>.</p>
+    <h3>5.3 Where the Keychain and Keystore get their hardware</h3>
+    <p>On modern iPhones the <strong>Secure Enclave</strong> is a separate coprocessor with its own boot ROM and keys that the main CPU and OS can never read. Keychain items can be bound to it and to a biometric "access control" so the OS only releases the secret after a successful Face ID/Touch ID check. On Android the <strong>Keystore</strong> backs keys in a <strong>Trusted Execution Environment (TEE)</strong> or a dedicated <strong>StrongBox</strong> secure element; keys can be marked <code>setUserAuthenticationRequired(true)</code> so they're usable only just after a biometric/credential unlock. In both, the raw key material never enters your app's address space — you ask the secure hardware to encrypt/decrypt on your behalf.</p>
+    <h3>5.4 Refresh token rotation internals</h3>
+    <p>With rotation enabled, each refresh token is single-use and linked into a <em>family</em>. Redeeming RT<sub>n</sub> returns a new access token plus RT<sub>n+1</sub> and immediately invalidates RT<sub>n</sub>. Auth0 keeps a small grace window for in-flight network retries. If a previously-used token is presented again, Auth0 concludes the token was leaked and <strong>revokes the entire family</strong>, forcing a fresh interactive login. This converts the worst property of refresh tokens (long-lived, replayable) into a self-tripping alarm.</p>
+  </section>
+
+  <!-- 6 -->
+  <section id="walkthrough">
+    <h2>6. Code Walkthrough — react-native-auth0, Line by Line</h2>
+    <p>The SDK hides the choreography of §3 behind a few calls. Let's read what each one does.</p>
+    <h4>Install and configure</h4>
+    <pre><code class="language-bash"># React Native
+npm install react-native-auth0
+cd ios &amp;&amp; pod install &amp;&amp; cd ..   # iOS native deps
+</code></pre>
+    <p>You configure two values from your Auth0 <strong>Native</strong> application: the tenant <strong>domain</strong> and the <strong>client ID</strong>. There is deliberately <strong>no client secret</strong> — remember, a native app is a public client.</p>
+    <pre><code class="language-javascript">// App.tsx — wrap your tree in the provider
+import { Auth0Provider } from 'react-native-auth0';
+
+export default function Root() {
+  return (
+    &lt;Auth0Provider
+      domain="your-tenant.us.auth0.com"
+      clientId="YOUR_NATIVE_CLIENT_ID"&gt;
+      {/* no clientSecret — public client */}
+      &lt;App /&gt;
+    &lt;/Auth0Provider&gt;
+  );
+}
+</code></pre>
+    <h4>Login — one call that performs the entire §3 flow</h4>
+    <pre><code class="language-javascript">import { useAuth0 } from 'react-native-auth0';
+
+function LoginButton() {
+  const { authorize, user, error } = useAuth0();
+
+  const onLogin = async () =&gt; {
+    await authorize({
+      // request a refresh token (long-lived session) + standard OIDC claims
+      scope: 'openid profile email offline_access',
+      audience: 'https://api.trailmate.com',   // so the access token works on YOUR API
+    });
+    // Under the hood, authorize() did ALL of this for you:
+    //   1. generated code_verifier + code_challenge (S256)
+    //   2. opened the SYSTEM BROWSER (ASWebAuthSession / Custom Tab)
+    //   3. built /authorize URL with state, nonce, PKCE challenge
+    //   4. caught the deep-link redirect with the code
+    //   5. POSTed code + code_verifier to /oauth/token (no secret)
+    //   6. validated id_token signature + nonce, stored tokens securely
+  };
+
+  return &lt;Button title="Log in" onPress={onLogin} /&gt;;
+}
+</code></pre>
+    <div class="callout key"><span class="tag">Key</span><p>The single most important options here: <code>offline_access</code> asks for a <strong>refresh token</strong> (without it you get no long-lived session), and <code>audience</code> tells Auth0 to mint an <strong>access token for your API</strong> rather than an opaque token only usable at <code>/userinfo</code>. Omit <code>audience</code> and your API calls will fail validation.</p></div>
+    <h4>Reading the session, refreshing, and logging out</h4>
+    <pre><code class="language-javascript">function Profile() {
+  const { user, getCredentials, clearSession } = useAuth0();
+
+  const callApi = async () =&gt; {
+    // getCredentials() returns a VALID access token, transparently using the
+    // stored refresh token to renew it if it has expired. You never touch the RT.
+    const { accessToken } = await getCredentials();
+    await fetch('https://api.trailmate.com/trails', {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+  };
+
+  const onLogout = async () =&gt; {
+    // Opens the browser to /v2/logout to clear the SSO session AND
+    // wipes the locally stored tokens from the Keychain/Keystore.
+    await clearSession();
+  };
+
+  return user ? (&lt;View&gt;{/* ... */}&lt;/View&gt;) : null;
+}
+</code></pre>
+    <h4>The native truth: what Swift does (iOS)</h4>
+    <pre><code class="language-swift">import Auth0
+
+// The native SDK call mirrors authorize(); it too uses ASWebAuthenticationSession.
+Auth0
+  .webAuth()
+  .scope("openid profile email offline_access")
+  .audience("https://api.trailmate.com")
+  .start { result in
+    switch result {
+    case .success(let credentials):
+      // Store in Keychain via the SDK helper, optionally biometric-gated.
+      let store = CredentialsManager(authentication: Auth0.authentication())
+      _ = store.store(credentials: credentials)
+    case .failure(let error):
+      print("Login failed: \(error)")
+    }
+  }
+</code></pre>
+    <h4>The native truth: what Kotlin does (Android)</h4>
+    <pre><code class="language-kotlin">import com.auth0.android.Auth0
+import com.auth0.android.provider.WebAuthProvider
+import com.auth0.android.authentication.AuthenticationException
+import com.auth0.android.result.Credentials
+
+val account = Auth0("YOUR_NATIVE_CLIENT_ID", "your-tenant.us.auth0.com")
+
+WebAuthProvider.login(account)              // uses Chrome Custom Tabs + PKCE
+  .withScope("openid profile email offline_access")
+  .withAudience("https://api.trailmate.com")
+  .start(context, object : com.auth0.android.callback.Callback&lt;Credentials, AuthenticationException&gt; {
+    override fun onSuccess(credentials: Credentials) {
+      // SecureCredentialsManager stores tokens in the Android Keystore,
+      // and can require biometric auth before returning them.
+      manager.saveCredentials(credentials)
+    }
+    override fun onFailure(error: AuthenticationException) {
+      Log.e("Auth0", "Login failed", error)
+    }
+  })
+</code></pre>
+    <div class="callout note"><span class="tag">Note</span><p>Notice all three SDKs expose the same shape: <code>scope</code> + <code>audience</code> + a browser-based <code>start/authorize</code>, then a secure credentials manager. React Native's <code>react-native-auth0</code> is a thin bridge over these exact native libraries — which is why understanding the Swift/Kotlin layer makes you a better React Native developer.</p></div>
+  </section>
+
+  <!-- 7 -->
+  <section id="practical">
+    <h2>7. Practical Implementation — Wiring the Deep Link and Storage</h2>
+    <p>The SDK can't register your URL scheme for you — the OS requires it in native config. This is the step beginners most often miss, so do it carefully.</p>
+    <h3>7.1 Auth0 dashboard</h3>
+    <ol>
+      <li>Create an Application of type <strong>Native</strong> (not Regular Web, not SPA).</li>
+      <li>In <strong>Allowed Callback URLs</strong> and <strong>Allowed Logout URLs</strong>, add the platform-specific URLs the SDK expects (shown below).</li>
+      <li>Enable <strong>Refresh Token Rotation</strong> and set a reasonable <strong>Refresh Token Expiration</strong> (absolute + inactivity) under the Application's <em>Grant</em> / <em>Refresh Token</em> settings.</li>
+    </ol>
+    <h3>7.2 iOS — register the callback (Info.plist) and (optionally) universal links</h3>
+    <pre><code class="language-xml">&lt;!-- ios/TrailMate/Info.plist : register the custom scheme so the OS routes
+     com.trailmate.app://...callback back into this app --&gt;
+&lt;key&gt;CFBundleURLTypes&lt;/key&gt;
+&lt;array&gt;
+  &lt;dict&gt;
+    &lt;key&gt;CFBundleURLSchemes&lt;/key&gt;
+    &lt;array&gt;
+      &lt;string&gt;$(PRODUCT_BUNDLE_IDENTIFIER)&lt;/string&gt;
+    &lt;/array&gt;
+  &lt;/dict&gt;
+&lt;/array&gt;
+</code></pre>
+    <p>Auth0 callback URL to register for iOS (bundle id = <code>com.trailmate.app</code>):</p>
+    <pre><code class="language-text">com.trailmate.app://your-tenant.us.auth0.com/ios/com.trailmate.app/callback</code></pre>
+    <h3>7.3 Android — manifest placeholders</h3>
+    <pre><code class="language-groovy">// android/app/build.gradle — tell the SDK manifest your scheme + host
+android {
+  defaultConfig {
+    manifestPlaceholders = [
+      auth0Domain: "your-tenant.us.auth0.com",
+      auth0Scheme: "${applicationId}"   // e.g. com.trailmate.app
+    ]
+  }
+}
+</code></pre>
+    <p>Auth0 callback URL to register for Android (app id = <code>com.trailmate.app</code>):</p>
+    <pre><code class="language-text">com.trailmate.app://your-tenant.us.auth0.com/android/com.trailmate.app/callback</code></pre>
+    <h3>7.4 Storing tokens securely + biometric gate (React Native)</h3>
+    <p>The SDK already stores credentials in the Keychain/Keystore. To <em>require biometrics</em> before those tokens are released, enable Local Authentication:</p>
+    <pre><code class="language-javascript">import Auth0 from 'react-native-auth0';
+
+const auth0 = new Auth0({ domain, clientId });
+
+// Require Face ID / Touch ID / device passcode before credentials are returned.
+auth0.credentialsManager.requireLocalAuthentication(
+  'Unlock TrailMate',        // iOS prompt title
+  'Cancel',                  // cancel button
+  'Authenticate',            // fallback title (Android)
+  'Use device passcode',     // fallback
+  /* LAPolicy */ undefined,
+);
+
+// Now getCredentials() will trigger the biometric prompt and, on success,
+// release a valid (auto-refreshed) access token from secure storage.
+const { accessToken } = await auth0.credentialsManager.getCredentials();
+</code></pre>
+    <h3>7.5 The native storage primitive (so you know what's underneath)</h3>
+    <pre><code class="language-swift">// iOS — Keychain item bound to the Secure Enclave + biometrics
+let access = SecAccessControlCreateWithFlags(
+  nil, kSecAttrAccessibleWhenUnlockedThisDeviceOnly,
+  .biometryCurrentSet, nil)            // require Face ID / Touch ID
+var query: [String: Any] = [
+  kSecClass as String: kSecClassGenericPassword,
+  kSecAttrAccount as String: "auth0.refresh_token",
+  kSecValueData as String: tokenData,
+  kSecAttrAccessControl as String: access as Any,
+]
+SecItemAdd(query as CFDictionary, nil)  // stored, hardware-protected
+</code></pre>
+    <pre><code class="language-kotlin">// Android — Keystore-backed key that needs a fresh biometric unlock
+val spec = KeyGenParameterSpec.Builder("auth0_rt_key",
+        KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT)
+    .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+    .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+    .setUserAuthenticationRequired(true)     // must unlock with biometric/PIN
+    .setIsStrongBoxBacked(true)              // dedicated secure element if present
+    .build()
+val kg = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore")
+kg.init(spec); kg.generateKey()              // key never leaves the TEE/StrongBox
+</code></pre>
+    <div class="callout warn"><span class="tag">Warn</span><p>If you skip §7.2/§7.3, login appears to work right up until the redirect, then silently fails to return to the app. "The browser opens, I log in, nothing happens" is almost always a missing URL scheme or a callback URL not added in the dashboard.</p></div>
+  </section>
+
+  <!-- 8 -->
+  <section id="architecture">
+    <h2>8. Production Architecture — Mobile + BFF + API</h2>
+    <p>A real mobile system is not just the app and Auth0. It includes your APIs, and increasingly a <strong>Backend-For-Frontend (BFF)</strong>. Here's how the pieces fit and what each is responsible for.</p>
+    <pre class="diagram">
+                         +-------------------------+
+                         |        Auth0 (IdP)      |
+                         |  /authorize  /oauth/    |
+                         |  token  JWKS  /userinfo |
+                         +------------+------------+
+                                      ^  PKCE login (system browser)
+                                      |  + refresh (rotation)
+   +-------------+   deep link   +----+-------+
+   |  System     |&lt;------------- |  Native /  |
+   |  Browser    |-------------&gt; | React      |   stores tokens in
+   +-------------+   /authorize  | Native App |   Keychain/Keystore,
+                                 +-----+------+   biometric-gated
+                                       | Bearer access_token (JWT)
+                                       v
+                         +-------------------------+   verifies JWT
+                         |   Your Resource API     |   sig (JWKS) + iss
+                         |   (validates access tok)|   + aud + exp + scope
+                         +-------------------------+
+    </pre>
+    <h3>Two valid architectures</h3>
+    <table>
+      <thead><tr><th></th><th>Direct (app holds tokens)</th><th>BFF / Token Handler (server holds tokens)</th></tr></thead>
+      <tbody>
+        <tr><td>Where the refresh token lives</td><td>On the device (Keychain/Keystore)</td><td>On your server; device gets only a session cookie/short token</td></tr>
+        <tr><td>Access token reaches API</td><td>App sends Bearer directly</td><td>BFF attaches token server-side</td></tr>
+        <tr><td>Complexity</td><td>Lower — standard mobile pattern</td><td>Higher — extra service to run</td></tr>
+        <tr><td>Best when</td><td>Most mobile apps (native is a trusted-enough public client with secure storage + rotation)</td><td>Highest-risk apps; or to keep tokens entirely off the device</td></tr>
+      </tbody>
+    </table>
+    <p>For <strong>mobile specifically</strong>, the <em>direct</em> model is the standard and is considered safe because native apps have real hardware-backed storage (unlike browsers/SPAs, where the BFF pattern is now preferred). Use a BFF on mobile only when policy demands tokens never touch the device.</p>
+    <div class="callout tip"><span class="tag">Architecture tip</span><p>Always set an <code>audience</code> so you receive a JWT access token your API can verify <em>offline</em> against Auth0's JWKS. Your API should validate signature, <code>iss</code>, <code>aud</code>, <code>exp</code>, and required <code>scope</code>/permissions on every request — never trust the app to enforce authorization.</p></div>
+  </section>
+
+  <!-- 9 -->
+  <section id="security">
+    <h2>9. Security Analysis — The Threat Model of a Phone in an Attacker's Hand</h2>
+    <p>Reason about mobile security by enumerating the threats and the control that stops each.</p>
+    <table>
+      <thead><tr><th>Threat</th><th>What the attacker does</th><th>Control that stops it</th></tr></thead>
+      <tbody>
+        <tr><td>Authorization-code interception</td><td>Malicious app registers your custom scheme, grabs the <code>code</code> from the redirect</td><td><strong>PKCE</strong> — code is useless without the in-memory verifier; universal/app links make interception even harder</td></tr>
+        <tr><td>Credential theft / phishing</td><td>App or a fake page captures the user's password</td><td><strong>System browser</strong> (real URL bar, app can't read the page) instead of an embedded webview</td></tr>
+        <tr><td>Token theft from storage</td><td>Reads tokens off a lost/rooted/jailbroken device</td><td><strong>Keychain/Keystore</strong>, hardware-backed, <code>...ThisDeviceOnly</code>, biometric-gated</td></tr>
+        <tr><td>Refresh-token replay</td><td>Steals an RT and reuses it for long-term access</td><td><strong>Refresh token rotation</strong> + reuse detection → family revocation</td></tr>
+        <tr><td>Shoulder-surf / unattended unlock</td><td>Uses an already-unlocked phone</td><td><strong>Biometric unlock</strong> required to release tokens for sensitive actions</td></tr>
+        <tr><td>Token leakage in transit/logs</td><td>Sniffs traffic or reads logs</td><td>TLS everywhere; never log tokens; certificate pinning for highest-risk apps</td></tr>
+        <tr><td>CSRF / mix-up on the redirect</td><td>Injects a forged authorization response</td><td><code>state</code> parameter checked on return; <code>nonce</code> checked in the ID token</td></tr>
+      </tbody>
+    </table>
+    <div class="callout danger"><span class="tag">Danger</span><p><strong>Never use the Resource Owner Password (ROPG) grant in a mobile app.</strong> It makes your app handle the raw password, defeats SSO/social/MFA-by-redirect, and is deprecated. If you ever see <code>grant_type=password</code> in a mobile codebase, treat it as a finding.</p></div>
+    <div class="callout danger"><span class="tag">Danger</span><p><strong>Never store tokens in <code>AsyncStorage</code>, <code>UserDefaults</code>, <code>SharedPreferences</code>, plist files, or a JS variable that persists to disk.</strong> On a rooted/jailbroken device these are plaintext. Tokens belong only in the Keychain/Keystore.</p></div>
+    <div class="callout warn"><span class="tag">Defense in depth</span><p>Layer controls: PKCE + system browser + hardware storage + rotation + biometrics + short access-token lifetime + jailbreak/root detection for high-risk apps. No single control is sufficient; the combination is what survives a determined attacker with physical access.</p></div>
+  </section>
+
+  <!-- 10 -->
+  <section id="performance">
+    <h2>10. Performance &amp; UX Considerations</h2>
+    <p>On mobile, "performance" is mostly about <em>perceived</em> latency and battery, not raw throughput.</p>
+    <ul>
+      <li><strong>Silent refresh beats re-login.</strong> A short access-token lifetime (e.g., minutes) keeps blast radius small, but you don't want the user re-authenticating constantly. The refresh token lets the SDK renew the access token <em>silently</em> in the background — the user never sees a browser. Tune access-token TTL to balance security (shorter) vs. refresh frequency (longer).</li>
+      <li><strong>Refresh proactively, not reactively.</strong> Renew slightly <em>before</em> expiry (the SDK does this) so an API call never has to wait on a refresh round-trip. Reactive refresh (only after a 401) adds a visible stall.</li>
+      <li><strong>Cache the user profile locally.</strong> The decoded ID token already contains <code>name</code>, <code>email</code>, <code>picture</code>; render from it instead of calling <code>/userinfo</code> on every screen.</li>
+      <li><strong>Biometric prompts cost time and goodwill.</strong> Don't prompt on every screen. Gate <em>app open</em> and <em>sensitive actions</em> (payments, settings), not routine reads. Over-prompting trains users to tap through.</li>
+      <li><strong>Cold start.</strong> On launch, read tokens from secure storage and check expiry locally before any network call — instant "logged-in" UI, refresh in the background.</li>
+      <li><strong>Keep tokens small.</strong> Every API call ships the access token; bloated custom claims slow every request and can blow header size limits. Reference large data, don't embed it.</li>
+      <li><strong>Network resilience.</strong> The rotation grace window matters on flaky mobile networks — a dropped response shouldn't immediately trip reuse detection. The SDK handles retries; don't roll your own naive retry that double-spends a refresh token.</li>
+    </ul>
+    <div class="callout tip"><span class="tag">Tip</span><p>The ideal returning-user experience: app opens → Face ID → tokens released from Keychain → access token still valid (or silently refreshed) → home screen, no browser, sub-second. That flow is the gold standard reviewers look for.</p></div>
+  </section>
+
+  <!-- 11 -->
+  <section id="mistakes">
+    <h2>11. Common Mistakes</h2>
+    <div class="callout danger"><span class="tag">Mistake 1</span><p><strong>Using an embedded webview for login.</strong> Breaks SSO, enables phishing, and gets apps rejected from the App Store / Play Store. Always use <code>ASWebAuthenticationSession</code> (iOS) / Chrome Custom Tabs (Android) — which the SDK does for you.</p></div>
+    <div class="callout danger"><span class="tag">Mistake 2</span><p><strong>Using the Resource Owner Password grant</strong> to "keep it native." Your app should never see the raw password. Use the browser-based Authorization Code + PKCE flow.</p></div>
+    <div class="callout danger"><span class="tag">Mistake 3</span><p><strong>Storing tokens in AsyncStorage / plaintext.</strong> Use the Keychain/Keystore. The SDK's CredentialsManager already does; don't second-guess it by copying tokens elsewhere.</p></div>
+    <div class="callout warn"><span class="tag">Mistake 4</span><p><strong>Trying to embed a client secret in the app.</strong> Native apps are public clients — there is no secret to use. If a tutorial tells you to ship a secret, it's wrong for mobile.</p></div>
+    <div class="callout warn"><span class="tag">Mistake 5</span><p><strong>Forgetting <code>offline_access</code></strong>, then wondering why there's no refresh token and the user is logged out after the access token expires.</p></div>
+    <div class="callout warn"><span class="tag">Mistake 6</span><p><strong>Forgetting <code>audience</code></strong>, then receiving an opaque token that your own API can't validate as a JWT.</p></div>
+    <div class="callout warn"><span class="tag">Mistake 7</span><p><strong>Not registering the URL scheme / callback URL.</strong> Login works in the browser but never returns to the app. Check <code>Info.plist</code> / manifest placeholders <em>and</em> the dashboard's Allowed Callback URLs.</p></div>
+    <div class="callout warn"><span class="tag">Mistake 8</span><p><strong>Rolling your own refresh logic</strong> that races and double-spends a rotated token, tripping reuse detection and logging users out. Let the SDK serialize refreshes.</p></div>
+    <div class="callout warn"><span class="tag">Mistake 9</span><p><strong>Treating logout as "just delete the local token."</strong> That leaves the SSO session in the system browser, so the next login skips credentials. Call <code>clearSession()</code> to clear both.</p></div>
+  </section>
+
+  <!-- 12 -->
+  <section id="best-practices">
+    <h2>12. Best Practices</h2>
+    <ul>
+      <li><strong>Authorization Code + PKCE, always.</strong> It's the only correct grant for a public mobile client. Let the SDK generate verifier/challenge with S256.</li>
+      <li><strong>System browser only.</strong> Never embed a webview for login. This is also an App Store / Play Store compliance requirement for third-party identity.</li>
+      <li><strong>Request <code>offline_access</code> + an <code>audience</code></strong> so you get a refresh token and a verifiable JWT access token for your API.</li>
+      <li><strong>Store every token in the Keychain/Keystore</strong>, bound to <code>ThisDeviceOnly</code>, and gate release behind biometrics for app-open and sensitive actions.</li>
+      <li><strong>Enable refresh token rotation + reuse detection</strong> in the dashboard, with sensible absolute and inactivity lifetimes.</li>
+      <li><strong>Prefer universal links / app links</strong> over bare custom schemes in production for the strongest redirect binding.</li>
+      <li><strong>Keep access tokens short-lived</strong> and refresh proactively in the background; cache profile from the ID token to avoid extra calls.</li>
+      <li><strong>Validate on the API</strong> (signature/iss/aud/exp/scope) — never trust the client to enforce authorization.</li>
+      <li><strong>Log out via <code>clearSession()</code></strong> to clear both local tokens and the browser SSO session; revoke the refresh token server-side where appropriate.</li>
+      <li><strong>For high-risk apps</strong> add certificate pinning and jailbreak/root detection as defense in depth.</li>
+    </ul>
+  </section>
+
+  <!-- 13 -->
+  <section id="interview">
+    <h2>13. Interview Questions (with Model Answers)</h2>
+    <h4>Q1. Why can't a mobile app use a client secret, and what replaces it?</h4>
+    <p><strong>Model answer:</strong> A native app is a <em>public client</em> — its binary ships to every user, so any embedded secret can be extracted by decompiling. Therefore it can't prove its identity to the token endpoint with a secret. PKCE replaces the static secret with a fresh per-login proof: the app generates a random <code>code_verifier</code>, sends only <code>SHA-256(verifier)</code> (the challenge) in the front-channel <code>/authorize</code> request, and reveals the verifier when redeeming the code. The server hashes the verifier and matches it to the challenge, proving the redeemer started the flow — no permanent secret needed.</p>
+    <h4>Q2. Why must you use the system browser instead of an embedded webview?</h4>
+    <p><strong>Model answer:</strong> Three reasons. Security: an embedded webview has no address bar, so users can't tell a real IdP page from a phish, and the host app can read the page (including the password). SSO: the system browser shares a session cookie across apps, so the user gets single sign-on; a webview is isolated and breaks it. Compliance: Apple and Google reject apps that put third-party login in embedded webviews. The correct primitives are <code>ASWebAuthenticationSession</code> on iOS and Chrome Custom Tabs on Android.</p>
+    <h4>Q3. Walk me through how the redirect gets back into the app.</h4>
+    <p><strong>Model answer:</strong> The app registers a redirect URI — either a custom scheme (<code>com.app://callback</code>) or a verified universal/app link (<code>https://app.com/callback</code>). After authentication the browser issues a 302 to that URI. The OS matches the scheme/host and dispatches the URL into the registered app via a platform callback or Intent. For universal/app links the OS first verified domain ownership through an association file (<code>apple-app-site-association</code> / <code>assetlinks.json</code>), so only your app can receive it — that's why they're preferred over custom schemes.</p>
+    <h4>Q4. Where do you store tokens on mobile, and why not AsyncStorage?</h4>
+    <p><strong>Model answer:</strong> In the iOS Keychain and Android Keystore, which are hardware-backed (Secure Enclave / TEE / StrongBox), can be bound to the device, and gated behind biometrics. AsyncStorage / UserDefaults / SharedPreferences are effectively plaintext and are readable on a rooted or jailbroken device, so they must never hold tokens — especially the long-lived refresh token.</p>
+    <h4>Q5. Explain refresh token rotation and reuse detection.</h4>
+    <p><strong>Model answer:</strong> Each refresh token is single-use; redeeming it returns a new access token <em>and</em> a new refresh token, invalidating the old one. Tokens are linked in a family. If a previously-used (already-rotated) refresh token is presented again, Auth0 concludes it leaked and revokes the entire family, forcing a fresh interactive login. This turns a long-lived, replayable credential into a self-tripping alarm — a stolen-and-replayed token gets both the attacker and the victim logged out, surfacing the breach.</p>
+    <h4>Q6. How does biometric unlock relate to token security — does Face ID protect the token?</h4>
+    <p><strong>Model answer:</strong> Biometrics don't authenticate to Auth0; they gate <em>local</em> release of tokens from secure storage. The Keychain/Keystore item is bound to a biometric access-control policy, so the OS only decrypts and returns the token after a successful Face ID/Touch ID (or device credential) check. It protects against an attacker with physical access to an unlocked-but-not-biometrically-verified device, and adds a presence check before sensitive actions.</p>
+    <h4>Q7. Direct token storage on device vs. a BFF — when would you choose each on mobile?</h4>
+    <p><strong>Model answer:</strong> Direct is the standard for mobile because native apps have genuine hardware-backed secure storage plus rotation, so holding tokens on the device is acceptable. A BFF (token-handler) keeps the refresh token entirely off the device, giving the app only a session reference; you'd choose it for the highest-risk apps or strict policies that forbid tokens on the client, at the cost of running an extra service. (Note: for SPAs/browser apps the BFF pattern is now generally preferred precisely because browsers lack good secure storage.)</p>
+    <h4>Q8. A user reports login opens the browser, they sign in, but the app never comes back. Diagnose.</h4>
+    <p><strong>Model answer:</strong> The redirect isn't being routed back. Check (1) the URL scheme is registered in <code>Info.plist</code> / Android manifest placeholders, (2) the exact callback URL is in the Auth0 Application's Allowed Callback URLs, and (3) for universal/app links the association file is reachable and correct. Mismatches between the configured scheme/callback and what the SDK sends are the usual cause.</p>
+  </section>
+
+  <!-- 14 -->
+  <section id="cert-tips">
+    <h2>14. Certification Tips</h2>
+    <div class="callout note"><span class="tag">Exam focus</span><p>Mobile questions cluster tightly around grant choice, browser choice, and storage. Lock these in:</p></div>
+    <ul>
+      <li><strong>Native app = public client = Authorization Code + PKCE.</strong> If an answer mentions a client secret for a native app, it's wrong. If it mentions Implicit or ROPG for mobile, it's wrong.</li>
+      <li><strong>PKCE uses S256</strong> (SHA-256), with <code>code_challenge_method=S256</code>; "plain" exists but isn't recommended.</li>
+      <li><strong>System browser, not webview</strong> — know the names: <code>ASWebAuthenticationSession</code> (iOS), <code>SFSafariViewController</code> (older), Chrome <strong>Custom Tabs</strong> (Android). Webview = wrong answer.</li>
+      <li><strong>Application type in the dashboard must be "Native."</strong></li>
+      <li><strong><code>offline_access</code></strong> scope is required to receive a refresh token.</li>
+      <li><strong>Refresh token rotation</strong> is the recommended setting for public clients; know that reuse detection revokes the whole family.</li>
+      <li><strong>Secure storage</strong>: Keychain (iOS), Keystore (Android). Recognize these as the correct answer for "where to store tokens."</li>
+      <li><strong>Custom scheme vs. universal/app links</strong>: know that links require a domain-association file and provide stronger binding.</li>
+      <li>The SDKs to recognize: <code>react-native-auth0</code>, Auth0.swift, Auth0.Android.</li>
+    </ul>
+  </section>
+
+  <!-- 15 -->
+  <section id="exercises">
+    <h2>15. Hands-On Exercises</h2>
+    <ol>
+      <li><strong>Create a Native app + run login.</strong> Spin up a fresh React Native app, add <code>react-native-auth0</code>, create a <em>Native</em> Auth0 application, wire the callback URLs, and complete one login. Confirm the system browser (not a webview) opens.</li>
+      <li><strong>Compute PKCE by hand.</strong> Generate a random 64-char verifier, compute <code>BASE64URL(SHA-256(verifier))</code> with a CLI (<code>openssl</code>), and confirm you get a valid 43-char challenge. This makes §5.1 concrete.</li>
+      <li><strong>Inspect the /authorize URL.</strong> Use a proxy or device logs to capture the outbound <code>/authorize</code> request and verify it contains <code>code_challenge</code>, <code>code_challenge_method=S256</code>, <code>state</code>, <code>nonce</code>, and <em>no</em> secret.</li>
+      <li><strong>Break and fix the redirect.</strong> Temporarily change the URL scheme to something wrong, observe the "browser opens but app never returns" symptom, then fix it — so you'll recognize the failure instantly in the future.</li>
+      <li><strong>Add a biometric gate.</strong> Enable <code>requireLocalAuthentication</code> and confirm <code>getCredentials()</code> triggers Face ID / fingerprint before returning a token.</li>
+      <li><strong>Trip reuse detection (lab only).</strong> With rotation on, manually replay a previously-used refresh token against <code>/oauth/token</code> and observe the family revocation and forced re-login.</li>
+    </ol>
+  </section>
+
+  <!-- 16 -->
+  <section id="assignment">
+    <h2>16. Assignment</h2>
+    <div class="callout key"><span class="tag">Deliverable</span><p>Produce a <strong>"Mobile Auth Design &amp; Threat Doc"</strong> (2–3 pages) plus a working login screen for a fictional banking app <strong>"VaultGo."</strong></p></div>
+    <p>Your document must explicitly:</p>
+    <ol>
+      <li>State why VaultGo's mobile app is a public client and which grant it uses, with one sentence on why each alternative grant is rejected.</li>
+      <li>Diagram the full PKCE + deep-link flow (you may reuse the §3 style).</li>
+      <li>Choose custom scheme vs. universal/app links and justify it for a banking app.</li>
+      <li>Specify exact token storage: where each token lives, the access-control flags, and the biometric policy (app-open vs. per-transaction).</li>
+      <li>Define lifetimes: access-token TTL, refresh-token absolute + inactivity expiry, and rotation settings.</li>
+      <li>Fill in the §9 threat table for VaultGo, adding two banking-specific threats (e.g., transaction tampering) and their controls.</li>
+      <li>Decide direct-storage vs. BFF and justify the trade-off given banking risk.</li>
+    </ol>
+    <p>Grade yourself: no client secret anywhere, no webview, no plaintext storage, every token's lifetime and storage explicitly justified, and AuthN never conflated with the local biometric gate.</p>
+  </section>
+
+  <!-- 17 -->
+  <section id="mini-project">
+    <h2>17. Mini Project — "QuickAuth" React Native App</h2>
+    <p>Build a small but <em>correct</em> app that demonstrates the whole chapter: login via system browser with PKCE, silent refresh, biometric-gated token release, an authenticated API call, and proper logout.</p>
+    <h4>The core screen</h4>
+    <pre><code class="language-javascript">// QuickAuth.tsx
+import React from 'react';
+import { View, Text, Button, Alert } from 'react-native';
+import { useAuth0, Auth0Provider } from 'react-native-auth0';
+
+const API = 'https://api.quickauth.example.com';
+
+function Home() {
+  const { authorize, clearSession, getCredentials, user, isLoading } = useAuth0();
+
+  if (isLoading) return &lt;Text&gt;Loading…&lt;/Text&gt;;
+
+  const login = () =&gt;
+    authorize({
+      scope: 'openid profile email offline_access',  // refresh token
+      audience: API,                                  // JWT for our API
+    }).catch(e =&gt; Alert.alert('Login failed', String(e)));
+
+  const callApi = async () =&gt; {
+    try {
+      // Triggers biometric prompt (if configured), auto-refreshes if needed.
+      const { accessToken } = await getCredentials();
+      const res = await fetch(`${API}/me`, {
+        headers: { Authorization: `Bearer ${accessToken}` },
+      });
+      Alert.alert('API says', JSON.stringify(await res.json()));
+    } catch (e) {
+      Alert.alert('Call failed', String(e));
+    }
+  };
+
+  return (
+    &lt;View style={{ padding: 24, gap: 12 }}&gt;
+      {user ? (
+        &lt;&gt;
+          &lt;Text&gt;Hello, {user.name}&lt;/Text&gt;
+          &lt;Button title="Call protected API" onPress={callApi} /&gt;
+          &lt;Button title="Log out" onPress={() =&gt; clearSession()} /&gt;
+        &lt;/&gt;
+      ) : (
+        &lt;Button title="Log in" onPress={login} /&gt;
+      )}
+    &lt;/View&gt;
+  );
+}
+
+export default function App() {
+  return (
+    &lt;Auth0Provider domain="your-tenant.us.auth0.com" clientId="YOUR_NATIVE_CLIENT_ID"&gt;
+      &lt;Home /&gt;
+    &lt;/Auth0Provider&gt;
+  );
+}
+</code></pre>
+    <h4>Minimal API that validates the access token (Node/Express)</h4>
+    <pre><code class="language-javascript">import express from 'express';
+import { auth } from 'express-oauth2-jwt-bearer';   // validates JWT via JWKS
+
+const app = express();
+// Verifies signature (JWKS), iss, aud, exp on EVERY request.
+app.use(auth({
+  audience: 'https://api.quickauth.example.com',
+  issuerBaseURL: 'https://your-tenant.us.auth0.com/',
+}));
+
+app.get('/me', (req, res) =&gt; {
+  // req.auth.payload holds verified claims — trust these, not the client.
+  res.json({ sub: req.auth.payload.sub, scope: req.auth.payload.scope });
+});
+
+app.listen(3000);
+</code></pre>
+    <h4>Acceptance checklist</h4>
+    <ul>
+      <li>Login opens the <strong>system browser</strong> (verify the URL bar appears), not a webview.</li>
+      <li>A refresh token is issued (request includes <code>offline_access</code>) and stored in secure storage.</li>
+      <li><code>getCredentials()</code> triggers a biometric prompt and returns a valid token after expiry without a visible re-login.</li>
+      <li>The API rejects a request with no/expired/invalid token and accepts a valid one.</li>
+      <li><code>clearSession()</code> logs out of both the app and the browser SSO session.</li>
+    </ul>
+    <div class="callout warn"><span class="tag">Production note</span><p>This mini project uses defaults for clarity. Before shipping: enable refresh token rotation, set short access-token TTLs, configure biometric requirement on the CredentialsManager, prefer universal/app links, and validate required <em>scopes/permissions</em> per endpoint on the API.</p></div>
+  </section>
+
+  <!-- 18 -->
+  <section id="quiz">
+    <h2>18. Quiz — 24 Questions</h2>
+    <ol>
+      <li>Why is a native mobile app classified as a <em>public client</em>?</li>
+      <li>Which OAuth grant should a mobile app use, and why?</li>
+      <li>What does PKCE stand for and what problem does it solve on mobile?</li>
+      <li>Write the formula relating <code>code_verifier</code> and <code>code_challenge</code> (S256).</li>
+      <li>Why is <code>code_challenge_method=S256</code> preferred over <code>plain</code>?</li>
+      <li>Name two reasons you must use the system browser instead of an embedded webview.</li>
+      <li>Which iOS and Android primitives provide the system-browser login surface?</li>
+      <li>What is the difference between a custom URL scheme and a universal/app link?</li>
+      <li>Which files prove domain ownership for universal links and app links?</li>
+      <li>Why are universal/app links more secure than a bare custom scheme?</li>
+      <li>Where must tokens be stored on iOS and on Android?</li>
+      <li>Name three storage locations where tokens must <em>never</em> go.</li>
+      <li>What hardware backs the Keychain (iOS) and the Keystore (Android)?</li>
+      <li>What scope must you request to receive a refresh token?</li>
+      <li>What does the <code>audience</code> parameter change about the access token?</li>
+      <li>Explain refresh token rotation in one sentence.</li>
+      <li>What is reuse detection and what happens when it triggers?</li>
+      <li>Does biometric unlock authenticate the user to Auth0? What does it actually protect?</li>
+      <li>Why must logout call <code>clearSession()</code> rather than just deleting the local token?</li>
+      <li>Which two parameters protect against CSRF/mix-up on the redirect, and where is each checked?</li>
+      <li>Why is the Resource Owner Password grant inappropriate for mobile?</li>
+      <li>When would you choose a BFF over direct token storage on mobile?</li>
+      <li>A user logs in via the browser but the app never returns — list two likely causes.</li>
+      <li>Why should access tokens be short-lived, and how do you avoid constant re-logins?</li>
+    </ol>
+    <details>
+      <summary>Show answer key</summary>
+      <ol>
+        <li>Its full binary ships to every user, so any embedded secret can be extracted; it therefore cannot keep a client secret.</li>
+        <li>Authorization Code with PKCE — the correct, secure grant for a public client with no secret.</li>
+        <li>Proof Key for Code Exchange; it prevents authorization-code interception by requiring an in-memory proof (the verifier) that a thief of the code won't have.</li>
+        <li><code>code_challenge = BASE64URL(SHA-256(ASCII(code_verifier)))</code>.</li>
+        <li>S256 sends only a one-way hash in the front channel; <code>plain</code> sends the verifier itself, offering no protection if the redirect leaks.</li>
+        <li>Any two of: no address bar in a webview enables phishing; the host app can read the page/password; webviews break SSO (no shared cookie); store-policy rejection.</li>
+        <li>iOS: <code>ASWebAuthenticationSession</code> (older: <code>SFSafariViewController</code>). Android: Chrome Custom Tabs.</li>
+        <li>A custom scheme (<code>app://</code>) can be claimed by any app; a universal/app link uses a real <code>https://</code> URL whose ownership the OS verifies.</li>
+        <li>iOS: <code>/.well-known/apple-app-site-association</code>; Android: <code>/.well-known/assetlinks.json</code>.</li>
+        <li>The OS verifies the app owns the domain, so only your app can receive the redirect — no collision/interception by another app.</li>
+        <li>iOS Keychain; Android Keystore.</li>
+        <li>Any three of: AsyncStorage, UserDefaults, SharedPreferences, plist/files, persisted JS variables.</li>
+        <li>iOS: the Secure Enclave. Android: a Trusted Execution Environment (TEE) and/or StrongBox secure element.</li>
+        <li><code>offline_access</code>.</li>
+        <li>It makes Auth0 issue a JWT access token scoped to your API (verifiable offline) rather than an opaque token only usable at <code>/userinfo</code>.</li>
+        <li>Each refresh token is single-use; redeeming it returns a new access and refresh token and invalidates the old one.</li>
+        <li>Detecting that an already-rotated refresh token was presented again; Auth0 revokes the entire token family and forces re-login.</li>
+        <li>No — it gates <em>local</em> release of tokens from secure storage (a presence/possession check on the device); it doesn't authenticate to Auth0.</li>
+        <li>Deleting only the local token leaves the browser SSO session active, so the next login skips credentials; <code>clearSession()</code> clears both.</li>
+        <li><code>state</code> (checked on return to match the request) and <code>nonce</code> (checked inside the ID token to bind it to this login).</li>
+        <li>It forces the app to handle the raw password, defeating SSO/social/redirect-MFA and adding leak risk; it's deprecated.</li>
+        <li>When policy requires tokens never reside on the device (highest-risk apps); the BFF holds the refresh token server-side.</li>
+        <li>Any two of: URL scheme not registered in Info.plist/manifest; callback URL not in Allowed Callback URLs; broken universal/app-link association file; scheme mismatch.</li>
+        <li>Short TTL limits blast radius if stolen; the refresh token enables silent background renewal so users aren't prompted repeatedly.</li>
+      </ol>
+    </details>
+  </section>
+
+  <!-- 19 -->
+  <section id="cheatsheet">
+    <h2>19. Cheat Sheet</h2>
+    <pre class="diagram">
+  MOBILE AUTH QUICK REFERENCE
+  ------------------------------------------------------------------
+  Client type   Native app = PUBLIC client = NO client secret
+  Grant         Authorization Code + PKCE (S256)   &lt;- only correct choice
+  PKCE          verifier (random, in memory)
+                challenge = BASE64URL(SHA-256(verifier))
+                front-channel sends CHALLENGE; back-channel sends VERIFIER
+
+  Browser       USE system browser:
+                  iOS  -> ASWebAuthenticationSession
+                  And. -> Chrome Custom Tabs
+                NEVER an embedded WebView (phishing, no SSO, store reject)
+
+  Redirect      custom scheme  app://callback        (ok w/ PKCE)
+                universal/app link https://...        (preferred, verified)
+                files: apple-app-site-association / assetlinks.json
+                MUST register scheme (Info.plist / manifest placeholders)
+                MUST add callback URL in Auth0 dashboard
+
+  Storage       iOS Keychain / Android Keystore (hardware-backed)
+                NEVER AsyncStorage/UserDefaults/SharedPreferences
+                bind ...ThisDeviceOnly + biometric access control
+
+  Scopes        openid profile email offline_access   (offline_access = RT)
+  audience      set it -> JWT access token your API can verify (JWKS)
+
+  Refresh       rotation ON: single-use, family-linked
+                reuse detected -> revoke whole family -> re-login
+
+  Biometrics    gate LOCAL token release (app-open + sensitive actions)
+                NOT an Auth0 authentication; a device presence check
+
+  Logout        clearSession()  -> clears local tokens + browser SSO
+
+  SDKs          react-native-auth0 | Auth0.swift | Auth0.Android
+  ------------------------------------------------------------------
+    </pre>
+  </section>
+
+  <!-- 20 -->
+  <section id="takeaways">
+    <h2>20. Key Takeaways</h2>
+    <div class="callout key"><span class="tag">Key</span><p><strong>A native app is a public client with no secret.</strong> Everything else follows: use <strong>Authorization Code + PKCE (S256)</strong>, never a client secret, never the Implicit or password grants.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p><strong>Open the system browser, never an embedded webview.</strong> It prevents phishing, preserves SSO, and is required by App Store / Play Store policy. The SDK uses <code>ASWebAuthenticationSession</code> / Custom Tabs for you.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p><strong>The redirect comes home via a deep link.</strong> Register the URL scheme (and prefer verified universal/app links), and add the callback URL in the dashboard — or login opens but never returns.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p><strong>Tokens live only in the Keychain/Keystore</strong>, hardware-backed and biometric-gated. AsyncStorage and friends are plaintext on a rooted/jailbroken device and must never hold tokens.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p><strong>Refresh token rotation turns a long-lived credential into a tripwire.</strong> Single-use, family-linked, with reuse detection revoking the whole family — combined with short access-token TTL and silent refresh for a seamless, safe session.</p></div>
+    <div class="callout tip"><span class="tag">Next</span><p>In Chapter 26 we continue the integration projects, applying these patterns at the next layer of the stack. When you're ready, say "next."</p></div>
+  </section>
+
+  <nav class="pager">
+    <a class="prev" href="chapter-24.html">← Previous</a>
+    <a class="next" href="chapter-26.html">Next →</a>
+  </nav>
+</main>
+<footer class="site-footer">Master Auth0 End-to-End · Chapter 25 of 32</footer>
+</body>
+</html>

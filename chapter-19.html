@@ -1,0 +1,729 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 19 — Project 3 — Spring Boot Resource Server | Master Auth0</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">🔐 Master Auth0</a>
+  <nav class="topnav">
+    <a href="chapter-18.html">← Prev</a>
+    <a href="index.html">Contents</a>
+    <a href="chapter-20.html">Next →</a>
+  </nav>
+</header>
+<main class="container">
+  <div class="chapter-head">
+    <span class="phase">Phase 8 · Integration Projects</span>
+    <h1>Chapter 19 — Project 3 — Spring Boot Resource Server</h1>
+    <p class="lead">A login page is only half of identity. The other half lives on the server that actually holds your data — the API that must decide, on every single request, "is this caller who they claim to be, and are they allowed to do this?" In this project we build that server: a production-shaped <strong>Spring Boot 3</strong> API on <strong>Java 21</strong> that trusts <em>nothing</em> except a cryptographically signed Auth0 access token. We will derive, from first principles, why a "resource server" exists at all, how it validates a JWT without ever calling Auth0 on the hot path, why the <code>audience</code> claim is the line between a secure API and a confused-deputy disaster, and how to turn Auth0 permissions into Spring Security authorities you can enforce with <code>SecurityFilterChain</code> and <code>@PreAuthorize</code>. By the end you will have a real, runnable API you can hit with a real access token — and the mental model to defend every design choice in a senior interview.</p>
+  </div>
+
+  <!-- ============================================================= 1 -->
+  <section id="theory">
+    <h2>1. Theory — First Principles of a Resource Server</h2>
+
+    <p>OAuth 2.0 names four roles. You must be able to recite them and, more importantly, explain <em>why</em> each exists:</p>
+    <table>
+      <thead><tr><th>Role</th><th>Who it is in our project</th><th>Job</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Resource Owner</strong></td><td>The human user</td><td>Owns the data; consents to access</td></tr>
+        <tr><td><strong>Client</strong></td><td>The SPA / mobile / CLI app</td><td>Requests a token, then calls the API</td></tr>
+        <tr><td><strong>Authorization Server</strong></td><td>Auth0 (your tenant)</td><td>Authenticates the user, issues tokens</td></tr>
+        <tr><td><strong>Resource Server</strong></td><td><em>This Spring Boot app</em></td><td>Holds the protected data; validates tokens; enforces access</td></tr>
+      </tbody>
+    </table>
+
+    <p>The <strong>resource server</strong> is the API that owns the protected resources. Its single defining property is profound: <em>it never sees the user's password and it never runs the login flow.</em> All it ever receives is an HTTP request carrying an <code>Authorization: Bearer &lt;access_token&gt;</code> header. Its entire security posture reduces to one question repeated on every request — <strong>"Should I honour this token, and what does it let the caller do?"</strong></p>
+
+    <h3>Why separate the resource server from the authorization server?</h3>
+    <p>Because <em>authentication is hard and authorization is frequent.</em> Authenticating a human — passwords, MFA, social login, breached-password detection, bot detection — is a specialist, security-critical, constantly-attacked problem. You centralize it once, in Auth0, and never reimplement it. Authorization — "can this token call <code>DELETE /invoices/42</code>?" — happens millions of times a day, on every API, and must be <em>fast and local</em>. Splitting the two lets each scale and evolve independently, and lets ten different microservices all trust the same token without ten copies of login code. This is the architectural payoff of OAuth: <strong>one issuer, many resource servers.</strong></p>
+
+    <h3>The two ways to validate a token</h3>
+    <ul>
+      <li><strong>Introspection (RFC 7662):</strong> the resource server sends the token to the authorization server and asks "is this valid?" Simple, always-fresh, but adds a network round-trip and a hard dependency on Auth0 being up for <em>every</em> request. Used for opaque tokens.</li>
+      <li><strong>Local JWT validation:</strong> the token is a self-describing, signed JWT. The resource server verifies the signature with Auth0's <em>public</em> key (no secret needed) and reads the claims directly. No per-request network call. This is what we build, and what Auth0 issues by default.</li>
+    </ul>
+
+    <div class="callout key"><span class="tag">Key</span><p>A resource server is a <em>token consumer</em>, not a token issuer. It holds no passwords, runs no login, and stores no client secret for validation. Its security rests entirely on: (1) verifying the JWT signature against the issuer's public keys, (2) checking the standard claims (<code>iss</code>, <code>exp</code>, <code>aud</code>), and (3) mapping the token's permissions to local authorization decisions.</p></div>
+  </section>
+
+  <!-- ============================================================= 2 -->
+  <section id="story">
+    <h2>2. Story-Based Explanation — The Concert Wristband</h2>
+    <p>Imagine you run the backstage operations of a music festival. You have a <strong>box office</strong> (Auth0) far from the stage. Fans queue at the box office, prove who they are, pay, and walk away with a tamper-proof, holographic <strong>wristband</strong> (the access token). That wristband encodes — printed right on it — the wearer's tier (<em>General</em>, <em>VIP</em>, <em>Crew</em>) and which festival it is good for.</p>
+    <p>You, at the <strong>backstage gate</strong> (the resource server), are not the box office. You cannot check anyone's ID, you do not have the credit-card machine, and you absolutely do not phone the box office for every person who walks up — the line would never move. Instead you do three lightning-fast checks by looking at the wristband:</p>
+    <ol>
+      <li><strong>Is the hologram genuine?</strong> You hold a card of authentic hologram patterns (Auth0's public keys / JWKS). If the wristband's hologram matches, the box office really printed it. This is signature verification.</li>
+      <li><strong>Is it for <em>this</em> festival, and not expired?</strong> A genuine wristband from <em>last year's</em> festival, or a genuine wristband for the <em>food court</em> rather than backstage, must be refused. This is checking <code>iss</code>, <code>exp</code>, and — critically — <code>aud</code>.</li>
+      <li><strong>What tier does it show?</strong> "Crew" gets into the equipment area; "VIP" gets the lounge; "General" gets neither. This is mapping permissions to authorities.</li>
+    </ol>
+    <p>The genius of the wristband is that the gate is <em>autonomous</em>. Ten gates around the festival all trust the same holograms with zero coordination. The box office can be closed for the night and the gates still work. And nobody can forge a wristband, because forging the hologram requires the box office's secret press (Auth0's private signing key), which never leaves the box office. Our Spring Boot app is that backstage gate.</p>
+  </section>
+
+  <!-- ============================================================= 3 -->
+  <section id="diagrams">
+    <h2>3. ASCII Diagrams — The Token's Journey</h2>
+
+    <h3>End-to-end flow: client gets a token, then calls our API</h3>
+    <pre class="diagram">
+   ┌──────────┐                                     ┌──────────────────┐
+   │  CLIENT  │   1. login / authorize (PKCE)       │      AUTH0        │
+   │ (SPA/CLI)│ ──────────────────────────────────► │  Authorization   │
+   │          │ ◄────────────────────────────────── │     Server       │
+   └────┬─────┘   2. access_token (signed JWT)       └────────┬─────────┘
+        │                                                     │
+        │  3. GET /api/invoices                               │ publishes
+        │     Authorization: Bearer eyJ...                    │ public keys
+        ▼                                                     ▼
+   ┌─────────────────────────────────────────┐      ┌──────────────────┐
+   │        SPRING BOOT RESOURCE SERVER       │      │  JWKS endpoint   │
+   │                                          │ 4.   │ /.well-known/    │
+   │  ┌────────────────────────────────────┐ │ fetch│  jwks.json       │
+   │  │ BearerTokenAuthenticationFilter    │ │◄─────┤ (cached locally) │
+   │  │  → JwtDecoder verifies signature   │ │ keys └──────────────────┘
+   │  │  → validates iss, exp, aud         │ │
+   │  │  → maps permissions → authorities  │ │   NO per-request call to Auth0
+   │  └────────────────────────────────────┘ │   for the data path (4 is cached)
+   │  ┌────────────────────────────────────┐ │
+   │  │ SecurityFilterChain + @PreAuthorize│ │
+   │  └────────────────────────────────────┘ │
+   └─────────────────────────────────────────┘
+        │  5. 200 OK (data)  /  401 (bad token)  /  403 (insufficient scope)
+        ▼
+   ┌──────────┐
+   │  CLIENT  │
+   └──────────┘
+    </pre>
+
+    <h3>Inside the filter: how one request is decided</h3>
+    <pre class="diagram">
+  Incoming request ──► Is there a Bearer token?
+                          │ no                     │ yes
+                          ▼                        ▼
+                  Endpoint permitAll?        Decode + verify JWT
+                    │yes      │no            (signature via cached JWKS)
+                    ▼         ▼                     │
+                  serve     401                ┌────┴─────┐
+                                           valid?       invalid/expired
+                                               │              │
+                                               ▼              ▼
+                                   Validate claims          401
+                                   iss == issuer? ──no──►   401
+                                   not expired?   ──no──►   401
+                                   aud contains   ──no──►   401
+                                     API identifier?
+                                               │ yes
+                                               ▼
+                                   Build Authentication with
+                                   authorities = permissions/scopes
+                                               │
+                                               ▼
+                                   @PreAuthorize / hasAuthority?
+                                       │allow        │deny
+                                       ▼             ▼
+                                   run method      403
+    </pre>
+
+    <h3>Anatomy of an Auth0 access token (JWT)</h3>
+    <pre class="diagram">
+   HEADER.PAYLOAD.SIGNATURE  (three base64url parts joined by '.')
+
+   HEADER         { "alg":"RS256", "typ":"JWT", "kid":"abc123" }
+                                                   └─ which public key to use
+   PAYLOAD        { "iss":"https://YOUR.eu.auth0.com/",   ◄ who issued it
+                    "sub":"auth0|650f...",                ◄ the user id
+                    "aud":["https://api.helios.com"],     ◄ WHO IS IT FOR
+                    "iat":1718800000, "exp":1718886400,   ◄ time window
+                    "scope":"openid profile read:invoices",
+                    "permissions":["read:invoices","delete:invoices"] }
+   SIGNATURE      RSASHA256( base64url(HEADER) + "." + base64url(PAYLOAD),
+                            Auth0_PRIVATE_KEY )
+                  └─ verified locally with Auth0_PUBLIC_KEY (from JWKS)
+    </pre>
+  </section>
+
+  <!-- ============================================================= 4 -->
+  <section id="analogy">
+    <h2>4. Real-World Analogy — The Passport and the Border Officer</h2>
+    <p>A passport is the closest everyday object to a JWT, and the analogy is precise enough to reason with:</p>
+    <table>
+      <thead><tr><th>Passport world</th><th>JWT / resource-server world</th></tr></thead>
+      <tbody>
+        <tr><td>The passport office issues passports</td><td>Auth0 issues access tokens</td></tr>
+        <tr><td>Tamper-proof printing &amp; holograms</td><td>RS256 signature with Auth0's private key</td></tr>
+        <tr><td>Border officer checks it is genuine without phoning the office</td><td>Resource server verifies signature with the public key</td></tr>
+        <tr><td>"Issued by" country on the cover</td><td><code>iss</code> claim</td></tr>
+        <tr><td>Expiry date</td><td><code>exp</code> claim</td></tr>
+        <tr><td>Visa stamp: valid for <em>this</em> country</td><td><code>aud</code> claim (the API identifier)</td></tr>
+        <tr><td>Visa type: tourist vs. work permit</td><td><code>permissions</code> / <code>scope</code></td></tr>
+      </tbody>
+    </table>
+    <p>The decisive insight: a passenger could hold a <em>perfectly genuine, unexpired passport</em> and still be turned away — because the visa is for the wrong country. A genuine token signed by Auth0 for the <em>analytics</em> API must not be honoured by the <em>billing</em> API. That "wrong country" check is the <code>aud</code> claim, and skipping it is the most dangerous mistake a resource server can make. We give it its own validator in step 6.</p>
+  </section>
+
+  <!-- ============================================================= 5 -->
+  <section id="internal">
+    <h2>5. Internal Working — What Spring Security Actually Does</h2>
+    <p>When you add <code>spring-boot-starter-oauth2-resource-server</code> and set an <code>issuer-uri</code>, Spring Boot's auto-configuration wires a precise chain of objects. Knowing them by name is what separates "I copied a tutorial" from "I can debug this in production."</p>
+    <ol>
+      <li><strong><code>BearerTokenAuthenticationFilter</code></strong> sits in the servlet filter chain. It extracts the token from the <code>Authorization: Bearer</code> header (via <code>DefaultBearerTokenResolver</code>) and hands it to the authentication manager.</li>
+      <li><strong><code>JwtAuthenticationProvider</code></strong> receives the raw token and delegates decoding to a <code>JwtDecoder</code>.</li>
+      <li><strong><code>NimbusJwtDecoder</code></strong> is the workhorse. On first use it calls Auth0's <code>/.well-known/openid-configuration</code> to discover the JWKS URI, then fetches the public keys (JWKS) and <em>caches them in memory</em>. It selects the key by the token header's <code>kid</code>, verifies the RS256 signature, and parses the claims.</li>
+      <li><strong><code>OAuth2TokenValidator</code> chain</strong> runs after signature verification. By default it includes a timestamp validator (<code>exp</code>/<code>nbf</code>) and, because we used <code>issuer-uri</code>, an issuer validator (<code>iss</code>). <em>This is where we plug in our custom audience validator.</em></li>
+      <li><strong><code>JwtAuthenticationConverter</code></strong> turns the validated <code>Jwt</code> into an <code>AbstractAuthenticationToken</code> whose <code>getAuthorities()</code> Spring uses for access control. By default it reads the <code>scope</code>/<code>scp</code> claim and prefixes each with <code>SCOPE_</code>. <em>We override this to also read Auth0's <code>permissions</code> claim.</em></li>
+      <li>The resulting <code>Authentication</code> is placed in the <code>SecurityContextHolder</code>, where <code>SecurityFilterChain</code> rules and <code>@PreAuthorize</code> expressions can read it.</li>
+    </ol>
+
+    <h3>How signature verification works without a shared secret</h3>
+    <p>RS256 is <em>asymmetric</em>. Auth0 signs with a private key that never leaves Auth0. Verification needs only the matching <strong>public</strong> key, which Auth0 publishes openly at the JWKS endpoint. This is why a resource server stores <em>no secret</em> for validation — and why you should never use the symmetric HS256 algorithm for Auth0 APIs (it would force every resource server to hold the shared secret, multiplying the blast radius of a leak).</p>
+
+    <div class="callout note"><span class="tag">Note</span><p>The JWKS is cached, but Auth0 can <strong>rotate</strong> signing keys. Nimbus handles this: if it sees a token with an unknown <code>kid</code>, it re-fetches the JWKS (rate-limited) and tries again. That is why rotation is a non-event for a correctly configured resource server.</p></div>
+  </section>
+
+  <!-- ============================================================= 6 -->
+  <section id="walkthrough">
+    <h2>6. Code Walkthrough — Building the Resource Server</h2>
+
+    <h3>6.1 Dependencies (Maven)</h3>
+    <pre><code class="language-xml">&lt;!-- pom.xml --&gt;
+&lt;parent&gt;
+  &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+  &lt;artifactId&gt;spring-boot-starter-parent&lt;/artifactId&gt;
+  &lt;version&gt;3.3.0&lt;/version&gt;
+&lt;/parent&gt;
+
+&lt;properties&gt;
+  &lt;java.version&gt;21&lt;/java.version&gt;
+&lt;/properties&gt;
+
+&lt;dependencies&gt;
+  &lt;dependency&gt;
+    &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+    &lt;artifactId&gt;spring-boot-starter-web&lt;/artifactId&gt;
+  &lt;/dependency&gt;
+  &lt;!-- THE key starter: brings in spring-security + the JWT/Nimbus stack --&gt;
+  &lt;dependency&gt;
+    &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+    &lt;artifactId&gt;spring-boot-starter-oauth2-resource-server&lt;/artifactId&gt;
+  &lt;/dependency&gt;
+  &lt;dependency&gt;
+    &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+    &lt;artifactId&gt;spring-boot-starter-test&lt;/artifactId&gt;
+    &lt;scope&gt;test&lt;/scope&gt;
+  &lt;/dependency&gt;
+  &lt;dependency&gt;
+    &lt;groupId&gt;org.springframework.security&lt;/groupId&gt;
+    &lt;artifactId&gt;spring-security-test&lt;/artifactId&gt;
+    &lt;scope&gt;test&lt;/scope&gt;
+  &lt;/dependency&gt;
+&lt;/dependencies&gt;</code></pre>
+
+    <h3>6.2 Dependencies (Gradle — Kotlin DSL, equivalent)</h3>
+    <pre><code class="language-kotlin">// build.gradle.kts
+plugins {
+    java
+    id("org.springframework.boot") version "3.3.0"
+    id("io.spring.dependency-management") version "1.1.5"
+}
+
+java { toolchain { languageVersion = JavaLanguageVersion.of(21) } }
+
+dependencies {
+    implementation("org.springframework.boot:spring-boot-starter-web")
+    implementation("org.springframework.boot:spring-boot-starter-oauth2-resource-server")
+    testImplementation("org.springframework.boot:spring-boot-starter-test")
+    testImplementation("org.springframework.security:spring-security-test")
+}</code></pre>
+
+    <h3>6.3 Configuration — <code>application.yml</code></h3>
+    <pre><code class="language-yaml">server:
+  port: 8080
+
+spring:
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          # Trailing slash matters — it must EXACTLY match the token's iss claim.
+          issuer-uri: https://YOUR-TENANT.eu.auth0.com/
+          # Optional: Spring derives jwk-set-uri from the issuer's discovery doc,
+          # but you may pin it explicitly:
+          # jwk-set-uri: https://YOUR-TENANT.eu.auth0.com/.well-known/jwks.json
+
+# Our own custom property: the API Identifier you set in the Auth0 dashboard.
+auth0:
+  audience: https://api.helios.com</code></pre>
+    <div class="callout warn"><span class="tag">Warn</span><p>Setting <code>issuer-uri</code> alone gives you signature + <code>iss</code> + <code>exp</code> validation — but <strong>not</strong> audience validation. Auth0 explicitly requires you to validate <code>aud</code> yourself. That is the entire reason for step 6.5.</p></div>
+
+    <h3>6.4 The audience validator — first principles</h3>
+    <p>An <code>OAuth2TokenValidator&lt;Jwt&gt;</code> is a function "given a decoded JWT, return success or a list of errors." We implement one that fails unless the <code>aud</code> claim contains our API identifier. <em>Why this matters:</em> Auth0 may issue a perfectly valid token to a client for a <em>different</em> API. Without this check, that token would be accepted here — a classic "confused deputy," letting a token minted for API-A act on API-B.</p>
+    <pre><code class="language-java">package com.helios.api.security;
+
+import org.springframework.security.oauth2.core.OAuth2Error;
+import org.springframework.security.oauth2.core.OAuth2TokenValidator;
+import org.springframework.security.oauth2.core.OAuth2TokenValidatorResult;
+import org.springframework.security.oauth2.jwt.Jwt;
+
+public final class AudienceValidator implements OAuth2TokenValidator&lt;Jwt&gt; {
+
+    private final String requiredAudience;
+
+    public AudienceValidator(String requiredAudience) {
+        this.requiredAudience = requiredAudience;
+    }
+
+    @Override
+    public OAuth2TokenValidatorResult validate(Jwt jwt) {
+        // aud is an array in Auth0 tokens; getAudience() returns List&lt;String&gt;.
+        if (jwt.getAudience().contains(requiredAudience)) {
+            return OAuth2TokenValidatorResult.success();
+        }
+        OAuth2Error error = new OAuth2Error(
+                "invalid_token",
+                "The required audience '" + requiredAudience + "' is missing",
+                null);
+        return OAuth2TokenValidatorResult.failure(error);
+    }
+}</code></pre>
+
+    <h3>6.5 Mapping Auth0 permissions to Spring authorities</h3>
+    <p>Spring's default converter only reads the <code>scope</code> claim and prefixes entries with <code>SCOPE_</code>. Auth0, when you enable <em>RBAC</em> with "Add Permissions in the Access Token," also emits a <code>permissions</code> array (e.g. <code>["read:invoices","delete:invoices"]</code>). We merge both into authorities so we can author rules against either.</p>
+    <pre><code class="language-java">package com.helios.api.security;
+
+import org.springframework.core.convert.converter.Converter;
+import org.springframework.security.authentication.AbstractAuthenticationToken;
+import org.springframework.security.core.GrantedAuthority;
+import org.springframework.security.core.authority.SimpleGrantedAuthority;
+import org.springframework.security.oauth2.jwt.Jwt;
+import org.springframework.security.oauth2.server.resource.authentication.*;
+
+import java.util.*;
+import java.util.stream.*;
+
+public final class Auth0AuthoritiesConverter
+        implements Converter&lt;Jwt, AbstractAuthenticationToken&gt; {
+
+    private final JwtGrantedAuthoritiesConverter scopes =
+            new JwtGrantedAuthoritiesConverter(); // emits SCOPE_xxx from "scope"
+
+    @Override
+    public AbstractAuthenticationToken convert(Jwt jwt) {
+        Collection&lt;GrantedAuthority&gt; authorities = new HashSet&lt;&gt;(scopes.convert(jwt));
+
+        // Auth0 RBAC "permissions" claim -> authorities (no prefix, so we can
+        // write hasAuthority('read:invoices') directly).
+        List&lt;String&gt; perms = jwt.getClaimAsStringList("permissions");
+        if (perms != null) {
+            perms.stream()
+                 .map(SimpleGrantedAuthority::new)
+                 .forEach(authorities::add);
+        }
+        return new JwtAuthenticationToken(jwt, authorities, jwt.getSubject());
+    }
+}</code></pre>
+
+    <h3>6.6 The <code>SecurityConfig</code> — tying it together</h3>
+    <pre><code class="language-java">package com.helios.api.security;
+
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.context.annotation.*;
+import org.springframework.http.HttpMethod;
+import org.springframework.security.config.Customizer;
+import org.springframework.security.config.annotation.method.configuration.EnableMethodSecurity;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.config.http.SessionCreationPolicy;
+import org.springframework.security.oauth2.core.*;
+import org.springframework.security.oauth2.jwt.*;
+import org.springframework.security.web.SecurityFilterChain;
+
+@Configuration
+@EnableMethodSecurity            // turns on @PreAuthorize / @PostAuthorize
+public class SecurityConfig {
+
+    @Value("${spring.security.oauth2.resourceserver.jwt.issuer-uri}")
+    private String issuer;
+
+    @Value("${auth0.audience}")
+    private String audience;
+
+    @Bean
+    SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+        http
+            // An API has no browser session and no forms -> stateless, no CSRF.
+            .csrf(csrf -&gt; csrf.disable())
+            .sessionManagement(s -&gt; s.sessionCreationPolicy(SessionCreationPolicy.STATELESS))
+            .authorizeHttpRequests(auth -&gt; auth
+                .requestMatchers("/api/public/**").permitAll()
+                // URL-level rule: GET invoices needs the read scope/permission.
+                .requestMatchers(HttpMethod.GET, "/api/invoices/**")
+                    .hasAuthority("read:invoices")
+                .anyRequest().authenticated())
+            .oauth2ResourceServer(oauth2 -&gt; oauth2
+                .jwt(jwt -&gt; jwt
+                    .decoder(jwtDecoder())
+                    .jwtAuthenticationConverter(new Auth0AuthoritiesConverter())));
+        return http.build();
+    }
+
+    @Bean
+    JwtDecoder jwtDecoder() {
+        // Builds a NimbusJwtDecoder from the issuer's discovery doc (fetches JWKS).
+        NimbusJwtDecoder decoder = JwtDecoders.fromIssuerLocation(issuer);
+
+        OAuth2TokenValidator&lt;Jwt&gt; withIssuer =
+                JwtValidators.createDefaultWithIssuer(issuer); // exp + iss
+        OAuth2TokenValidator&lt;Jwt&gt; withAudience =
+                new DelegatingOAuth2TokenValidator&lt;&gt;(
+                        withIssuer, new AudienceValidator(audience));
+
+        decoder.setJwtValidator(withAudience);
+        return decoder;
+    }
+}</code></pre>
+    <div class="callout tip"><span class="tag">Tip</span><p>We deliberately build the <code>JwtDecoder</code> as an explicit bean instead of relying purely on auto-config, because we need to attach our custom validator chain. <code>JwtValidators.createDefaultWithIssuer</code> already includes the timestamp + issuer checks, so we only <em>add</em> the audience validator rather than re-implementing the defaults.</p></div>
+  </section>
+
+  <!-- ============================================================= 7 -->
+  <section id="practical">
+    <h2>7. Practical Implementation — The Controller &amp; Method Security</h2>
+    <p>Two complementary places enforce access: <strong>URL-level</strong> rules in the filter chain (coarse, fast, declared centrally) and <strong>method-level</strong> rules with <code>@PreAuthorize</code> (fine-grained, close to the business logic, can reference method arguments and the principal).</p>
+
+    <pre><code class="language-java">package com.helios.api.web;
+
+import org.springframework.security.access.prepost.PreAuthorize;
+import org.springframework.security.core.annotation.AuthenticationPrincipal;
+import org.springframework.security.oauth2.jwt.Jwt;
+import org.springframework.web.bind.annotation.*;
+
+import java.util.*;
+
+@RestController
+@RequestMapping("/api")
+public class InvoiceController {
+
+    // No annotation needed: permitAll in SecurityConfig.
+    @GetMapping("/public/health")
+    public Map&lt;String, String&gt; health() {
+        return Map.of("status", "up");
+    }
+
+    // Method-level check; equivalent to the URL rule, shown for teaching.
+    @GetMapping("/invoices")
+    @PreAuthorize("hasAuthority('read:invoices')")
+    public List&lt;String&gt; list(@AuthenticationPrincipal Jwt jwt) {
+        // jwt.getSubject() is the Auth0 user id (sub claim).
+        return List.of("INV-001 owned-by " + jwt.getSubject(), "INV-002");
+    }
+
+    // Requires the delete permission AND demonstrates SpEL on arguments.
+    @DeleteMapping("/invoices/{id}")
+    @PreAuthorize("hasAuthority('delete:invoices')")
+    public Map&lt;String, Object&gt; delete(@PathVariable String id,
+                                      @AuthenticationPrincipal Jwt jwt) {
+        return Map.of("deleted", id, "by", jwt.getSubject());
+    }
+
+    // Combine permission + business rule: a manager OR the resource owner.
+    @GetMapping("/invoices/{id}")
+    @PreAuthorize("hasAuthority('read:invoices') and " +
+                  "(hasAuthority('manage:all') or #ownerSub == authentication.name)")
+    public Map&lt;String, String&gt; getOne(@PathVariable String id,
+                                      @RequestParam String ownerSub) {
+        return Map.of("id", id, "owner", ownerSub);
+    }
+}</code></pre>
+
+    <p>To run it against Auth0, perform these dashboard steps once:</p>
+    <ol>
+      <li><strong>APIs → Create API.</strong> Set the <em>Identifier</em> to <code>https://api.helios.com</code> (this becomes the token's <code>aud</code>) and signing algorithm <strong>RS256</strong>.</li>
+      <li>On the API, toggle <strong>Enable RBAC</strong> and <strong>Add Permissions in the Access Token</strong> so the <code>permissions</code> claim is emitted.</li>
+      <li>Define permissions <code>read:invoices</code>, <code>delete:invoices</code>, <code>manage:all</code> and assign them to roles/users.</li>
+    </ol>
+  </section>
+
+  <!-- ============================================================= 8 -->
+  <section id="architecture">
+    <h2>8. Production Architecture</h2>
+    <pre class="diagram">
+                          Internet
+                             │
+                    ┌────────▼─────────┐
+                    │   API Gateway /  │  TLS termination, rate limiting,
+                    │   Load Balancer  │  WAF, request logging
+                    └────────┬─────────┘
+              ┌──────────────┼───────────────┐
+              ▼              ▼                ▼
+        ┌──────────┐  ┌──────────┐     ┌──────────┐
+        │ RS pod 1 │  │ RS pod 2 │ ... │ RS pod N │  Spring Boot resource
+        │ (JWKS    │  │ (JWKS    │     │ (JWKS    │  servers, horizontally
+        │  cached) │  │  cached) │     │  cached) │  scaled, STATELESS
+        └────┬─────┘  └────┬─────┘     └────┬─────┘
+             └─────────────┼────────────────┘
+                           │ first-call + key rotation only
+                           ▼
+                  ┌──────────────────┐        ┌─────────────┐
+                  │  AUTH0 (JWKS /    │        │   Database  │
+                  │  discovery doc)   │        │  / services │
+                  └──────────────────┘        └─────────────┘
+    </pre>
+    <p>Because each pod validates tokens locally, the resource servers are <strong>stateless</strong> — any pod can serve any request, so horizontal scaling is trivial and there is no session store to share. Auth0 is touched only on cold start and key rotation, not per request, so it is not in the critical latency path. Put TLS, rate limiting, and a WAF at the edge; never expose the resource server directly. The same token works across all microservices that share the issuer, which is the whole point of a centralized authorization server.</p>
+    <div class="callout note"><span class="tag">Note</span><p>For multiple APIs behind the gateway, each Spring service validates its <em>own</em> audience. A token minted for <code>api.billing</code> is rejected by <code>api.analytics</code> — the audience validator is what enforces that isolation between services.</p></div>
+  </section>
+
+  <!-- ============================================================= 9 -->
+  <section id="security">
+    <h2>9. Security Analysis</h2>
+    <table>
+      <thead><tr><th>Threat</th><th>Mitigation in this design</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Forged token</strong></td><td>RS256 signature verified against Auth0's public key; forgery requires Auth0's private key.</td></tr>
+        <tr><td><strong>Expired/replayed old token</strong></td><td><code>exp</code> validated; keep token TTL short (e.g. 15 min). Use short-lived access + refresh tokens at the client.</td></tr>
+        <tr><td><strong>Confused deputy (token for another API)</strong></td><td><code>AudienceValidator</code> rejects tokens whose <code>aud</code> lacks this API's identifier.</td></tr>
+        <tr><td><strong>Wrong issuer / rogue tenant</strong></td><td><code>iss</code> validated against the configured issuer-uri.</td></tr>
+        <tr><td><strong>Algorithm confusion (alg:none / HS256 swap)</strong></td><td>Nimbus pins RS256 from the JWKS; symmetric/none algorithms are rejected.</td></tr>
+        <tr><td><strong>Token leakage in transit</strong></td><td>Enforce TLS everywhere; never log the <code>Authorization</code> header.</td></tr>
+        <tr><td><strong>Over-broad access</strong></td><td>Least privilege via fine-grained permissions + <code>@PreAuthorize</code>; deny by default (<code>anyRequest().authenticated()</code>).</td></tr>
+        <tr><td><strong>Stolen token used everywhere</strong></td><td>Audience + scopes constrain blast radius; consider Sender-Constrained tokens (DPoP/mTLS) for high-value APIs.</td></tr>
+      </tbody>
+    </table>
+    <div class="callout danger"><span class="tag">Danger</span><p>The single most common production vulnerability in Spring resource servers is configuring <code>issuer-uri</code> and assuming you are done. You are <em>not</em> — without the audience validator, any valid Auth0 token from your tenant (including one minted for a totally different, lower-trust API) is accepted. Always validate <code>aud</code>.</p></div>
+  </section>
+
+  <!-- ============================================================= 10 -->
+  <section id="performance">
+    <h2>10. Performance Considerations</h2>
+    <ul>
+      <li><strong>Local validation is the win.</strong> JWT signature verification is a single RSA public-key operation — microseconds — with no network call on the hot path. This is why local JWT validation scales far better than per-request introspection.</li>
+      <li><strong>JWKS caching.</strong> Nimbus caches keys in memory with a refresh window. The cost of fetching JWKS is paid once per pod, plus on rare key rotation, not per request.</li>
+      <li><strong>Cold start.</strong> The first request after boot triggers JWKS discovery. Mitigate with a readiness probe that warms the decoder, or accept a tiny first-request penalty.</li>
+      <li><strong>Token size.</strong> Large <code>permissions</code> arrays bloat every request header. Prefer coarse scopes for routing and reserve fine permissions for sensitive operations; or resolve detailed permissions from your DB keyed by <code>sub</code> when the list is large.</li>
+      <li><strong>Clock skew.</strong> The timestamp validator allows ~60s skew by default. Keep server clocks NTP-synced to avoid spurious <code>exp</code>/<code>nbf</code> failures.</li>
+      <li><strong>Avoid blocking on Auth0.</strong> Never call the Auth0 Management API synchronously inside a request to "enrich" the token — that re-introduces the network dependency you eliminated. Cache or use token claims.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================= 11 -->
+  <section id="mistakes">
+    <h2>11. Common Mistakes</h2>
+    <ol>
+      <li><strong>Skipping the audience validator.</strong> The flagship mistake. See step 9.</li>
+      <li><strong>Issuer-uri mismatch.</strong> Auth0's <code>iss</code> ends with a trailing slash (<code>https://tenant.auth0.com/</code>). Omit it and validation fails with a confusing "issuer mismatch."</li>
+      <li><strong>Expecting <code>permissions</code> without enabling RBAC.</strong> If RBAC + "Add Permissions in the Access Token" are off in the dashboard, the claim is absent and every <code>hasAuthority('read:invoices')</code> returns 403.</li>
+      <li><strong>Confusing <code>SCOPE_</code> prefix vs raw permissions.</strong> <code>hasAuthority('SCOPE_read:invoices')</code> matches the <code>scope</code> claim; <code>hasAuthority('read:invoices')</code> matches our mapped <code>permissions</code>. Mixing them silently denies access.</li>
+      <li><strong>Leaving CSRF on for a stateless API.</strong> A bearer-token API has no cookies/session; CSRF protection just breaks non-GET requests. Disable it (and keep it stateless).</li>
+      <li><strong>Forgetting <code>@EnableMethodSecurity</code>.</strong> Without it, <code>@PreAuthorize</code> is silently ignored — endpoints you think are protected are wide open.</li>
+      <li><strong>Validating the ID token instead of the access token.</strong> ID tokens are for the client to learn about the user; resource servers must validate the <em>access</em> token, whose <code>aud</code> is the API.</li>
+      <li><strong>Using HS256.</strong> Forces sharing a secret with every resource server. Use RS256.</li>
+    </ol>
+  </section>
+
+  <!-- ============================================================= 12 -->
+  <section id="bestpractices">
+    <h2>12. Best Practices</h2>
+    <ul>
+      <li>Validate <strong>all four</strong>: signature, <code>iss</code>, <code>exp</code>, and <code>aud</code>. Treat audience validation as non-negotiable.</li>
+      <li>Deny by default: end the chain with <code>anyRequest().authenticated()</code>, never <code>permitAll()</code>.</li>
+      <li>Keep the API stateless and disable CSRF; let the gateway handle TLS, rate limiting, and WAF.</li>
+      <li>Externalize <code>issuer-uri</code> and <code>audience</code> to config/secrets, not hard-coded constants — they differ per environment.</li>
+      <li>Use fine-grained, verb:noun permissions (<code>read:invoices</code>) and enforce them as close to the data as possible with <code>@PreAuthorize</code>.</li>
+      <li>Customize the <code>AccessDeniedHandler</code>/<code>AuthenticationEntryPoint</code> to return clean RFC 6750 <code>WWW-Authenticate</code> error responses (401 vs 403 distinction).</li>
+      <li>Never log tokens; redact the <code>Authorization</code> header in access logs.</li>
+      <li>Write integration tests with <code>jwt()</code> request post-processors so security is part of CI, not an afterthought.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================= 13 -->
+  <section id="interview">
+    <h2>13. Interview Questions (with Model Answers)</h2>
+
+    <h3>Q1. What is a resource server and how does it differ from the authorization server?</h3>
+    <p><strong>Model answer:</strong> The authorization server (Auth0) authenticates users and issues tokens; it owns credentials and login flows. The resource server is the API that holds protected data and only <em>consumes</em> tokens — it validates the access token on each request and enforces authorization, but never sees passwords or runs login. Separating them lets one issuer serve many APIs and keeps authentication centralized while authorization stays fast and local.</p>
+
+    <h3>Q2. Walk me through validating an Auth0 JWT in Spring Boot.</h3>
+    <p><strong>Model answer:</strong> Add <code>spring-boot-starter-oauth2-resource-server</code>, set <code>issuer-uri</code>. On first request, <code>NimbusJwtDecoder</code> discovers the JWKS and caches the public keys. For each token it selects the key by <code>kid</code>, verifies the RS256 signature, then runs a validator chain: timestamp (<code>exp</code>/<code>nbf</code>), issuer (<code>iss</code>), and a custom audience validator. A converter then maps claims to authorities and stores the <code>Authentication</code> in the security context.</p>
+
+    <h3>Q3. Why must you validate the audience claim?</h3>
+    <p><strong>Model answer:</strong> Because a token genuinely signed by your tenant might have been issued for a <em>different</em> API. If you only check signature and issuer, that token would be accepted — a confused-deputy attack where a token scoped for API-A is replayed against API-B. The <code>aud</code> claim is the boundary between services; validating it ensures the token was minted specifically for this API.</p>
+
+    <h3>Q4. Difference between scopes and permissions in Auth0?</h3>
+    <p><strong>Model answer:</strong> Scopes (<code>scope</code> claim) are what the client requested and the user consented to; they describe delegated access. Permissions (<code>permissions</code> claim, emitted when RBAC is enabled) are granted to the user via roles, independent of what was requested. In Spring, default conversion prefixes scopes with <code>SCOPE_</code>; we add a converter to map permissions to bare authorities for <code>hasAuthority</code>.</p>
+
+    <h3>Q5. URL-level vs method-level security — when to use each?</h3>
+    <p><strong>Model answer:</strong> URL rules in the filter chain are coarse, central, and run before the controller — great for broad gating and performance. <code>@PreAuthorize</code> is fine-grained, lives next to business logic, and can reference method arguments and the principal via SpEL — great for ownership and contextual rules. Production systems use both: coarse gate at the edge, precise checks at the method.</p>
+
+    <h3>Q6. How does key rotation not break your API?</h3>
+    <p><strong>Model answer:</strong> The decoder caches JWKS but keys carry a <code>kid</code>. When Auth0 rotates and a token arrives with an unknown <code>kid</code>, Nimbus re-fetches the JWKS (rate-limited) and finds the new key. No deploy or restart required.</p>
+
+    <h3>Q7. Why is local JWT validation preferred over introspection?</h3>
+    <p><strong>Model answer:</strong> Local validation needs no per-request network call — just an in-memory RSA verification — so it is faster and removes a runtime dependency on Auth0 in the hot path. Introspection is fresher (handles revocation immediately) but costs a round-trip per request. Most systems pick local validation with short token lifetimes to bound the revocation window.</p>
+  </section>
+
+  <!-- ============================================================= 14 -->
+  <section id="certification">
+    <h2>14. Certification Tips</h2>
+    <ul>
+      <li>Know the four OAuth roles cold and which one a Spring API plays (resource server). The exam loves role-mapping questions.</li>
+      <li>Memorize that <strong>access tokens</strong> (not ID tokens) are sent to APIs, and that the API Identifier you set in Auth0 becomes the token <code>aud</code>.</li>
+      <li>Remember the validation quartet: signature, <code>iss</code>, <code>exp</code>, <code>aud</code>. Auth0's own quickstarts add the audience validator manually — expect a question on <em>why</em>.</li>
+      <li>RS256 vs HS256: RS256 (asymmetric) is the Auth0 default for APIs; HS256 requires a shared secret and is discouraged.</li>
+      <li>RBAC settings: "Enable RBAC" + "Add Permissions in the Access Token" control the <code>permissions</code> claim.</li>
+      <li>JWKS endpoint location: <code>/.well-known/jwks.json</code>; discovery at <code>/.well-known/openid-configuration</code>.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================= 15 -->
+  <section id="handson">
+    <h2>15. Hands-On Exercises</h2>
+    <ol>
+      <li>Scaffold the project (Spring Initializr: Web + OAuth2 Resource Server, Java 21) and add the three classes from step 6.</li>
+      <li>Create the Auth0 API with identifier <code>https://api.helios.com</code>, enable RBAC, and define <code>read:invoices</code> and <code>delete:invoices</code>.</li>
+      <li>Mint a test token from the Auth0 dashboard's API → Test tab (client-credentials) and decode it at jwt.io to confirm <code>aud</code>, <code>iss</code>, and <code>permissions</code>.</li>
+      <li>Temporarily change <code>auth0.audience</code> to a wrong value and confirm you now get <code>401</code> — proving the validator works.</li>
+      <li>Remove <code>@EnableMethodSecurity</code> and observe that <code>@PreAuthorize</code> is silently ignored (the endpoint serves without the permission). Restore it.</li>
+    </ol>
+  </section>
+
+  <!-- ============================================================= 16 -->
+  <section id="assignment">
+    <h2>16. Assignment</h2>
+    <p>Extend the API with an <code>/api/invoices</code> resource backed by an in-memory list where each invoice records an <code>ownerSub</code>. Implement these rules and write integration tests for each:</p>
+    <ul>
+      <li><code>GET /api/invoices</code> — any caller with <code>read:invoices</code> sees only their own invoices, unless they have <code>manage:all</code> (then they see all).</li>
+      <li><code>DELETE /api/invoices/{id}</code> — requires <code>delete:invoices</code> <em>and</em> ownership, or <code>manage:all</code>. Enforce with <code>@PreAuthorize</code> SpEL.</li>
+      <li>Add a custom <code>AuthenticationEntryPoint</code> that returns a JSON body and a proper <code>WWW-Authenticate</code> header on 401.</li>
+      <li>Document, in a short README, exactly which of the four validations protects against which threat.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================= 17 -->
+  <section id="miniproject">
+    <h2>17. Mini Project — "Helios Billing API"</h2>
+    <p>Build a two-service system that proves the centralized-issuer model:</p>
+    <ol>
+      <li><strong>Service A — Billing API</strong> (audience <code>https://api.billing.helios.com</code>), permissions <code>read:invoices</code>, <code>delete:invoices</code>.</li>
+      <li><strong>Service B — Analytics API</strong> (audience <code>https://api.analytics.helios.com</code>), permission <code>read:reports</code>.</li>
+      <li>Both validate the <em>same</em> issuer but <em>different</em> audiences. Demonstrate that a token minted for Billing is rejected by Analytics and vice-versa — the audience validator in action.</li>
+      <li>Add a <code>GET /me</code> on each that echoes <code>sub</code>, <code>scope</code>, and <code>permissions</code> for debugging.</li>
+      <li>Containerize both and place them behind a single reverse proxy; show that one client can call both with the right audiences while one wrong-audience token fails. Capture the 200/401 responses in your write-up.</li>
+    </ol>
+  </section>
+
+  <!-- ============================================================= 18 -->
+  <section id="quiz">
+    <h2>18. Quiz (20+ Questions)</h2>
+    <ol>
+      <li>Which OAuth role does a Spring Boot API play?</li>
+      <li>What header carries the access token, and in what format?</li>
+      <li>Which dependency turns a Spring Boot app into a resource server?</li>
+      <li>Setting only <code>issuer-uri</code> validates which claims automatically?</li>
+      <li>Which claim must you validate <em>manually</em>, and why?</li>
+      <li>What signing algorithm does Auth0 use by default for APIs, and why is it preferred over HS256?</li>
+      <li>What is the JWKS endpoint, and what does it contain?</li>
+      <li>How does a resource server verify a signature without a shared secret?</li>
+      <li>What does the <code>kid</code> header field do?</li>
+      <li>How is key rotation handled transparently?</li>
+      <li>What is the difference between the <code>scope</code> and <code>permissions</code> claims?</li>
+      <li>What prefix does Spring's default converter add to scopes?</li>
+      <li>Which annotation enables <code>@PreAuthorize</code>?</li>
+      <li>Why disable CSRF on this API?</li>
+      <li>Why set session creation policy to STATELESS?</li>
+      <li>Difference between URL-level and method-level security?</li>
+      <li>What does an audience mismatch return — 401 or 403 — and why?</li>
+      <li>What does an insufficient permission return — 401 or 403 — and why?</li>
+      <li>Which token (ID or access) does a resource server validate?</li>
+      <li>What is a "confused deputy" attack and which validation prevents it?</li>
+      <li>Why is local validation faster than introspection?</li>
+      <li>What Auth0 dashboard settings cause the <code>permissions</code> claim to be emitted?</li>
+      <li>What is the consequence of forgetting the trailing slash on <code>issuer-uri</code>?</li>
+      <li>Name three things you should never do with a bearer token in logs or transit.</li>
+    </ol>
+
+    <details>
+      <summary>Show answer key</summary>
+      <ol>
+        <li>The <strong>resource server</strong>.</li>
+        <li><code>Authorization: Bearer &lt;token&gt;</code> — an RS256-signed JWT.</li>
+        <li><code>spring-boot-starter-oauth2-resource-server</code>.</li>
+        <li>Signature, issuer (<code>iss</code>), and timestamp (<code>exp</code>/<code>nbf</code>).</li>
+        <li>The <strong>audience</strong> (<code>aud</code>) — to ensure the token was minted for <em>this</em> API and prevent confused-deputy misuse.</li>
+        <li><strong>RS256</strong> (asymmetric); preferred because the resource server needs only the public key — no shared secret to leak.</li>
+        <li><code>/.well-known/jwks.json</code> — Auth0's public signing keys (JSON Web Key Set).</li>
+        <li>It fetches the issuer's <em>public</em> key from JWKS and verifies the RSA signature locally.</li>
+        <li>Identifies which key in the JWKS was used to sign the token.</li>
+        <li>On an unknown <code>kid</code>, Nimbus re-fetches the JWKS (rate-limited) and finds the new key — no restart.</li>
+        <li><code>scope</code> = delegated access the client requested/consented; <code>permissions</code> = RBAC grants from the user's roles.</li>
+        <li><code>SCOPE_</code>.</li>
+        <li><code>@EnableMethodSecurity</code>.</li>
+        <li>It is a stateless, cookie-less bearer-token API — CSRF protection adds no value and breaks non-GET requests.</li>
+        <li>So no server-side session is created; any pod can serve any request, enabling trivial horizontal scaling.</li>
+        <li>URL-level is coarse/central in the filter chain; method-level is fine-grained, near business logic, can use method args via SpEL.</li>
+        <li><strong>401</strong> — the token itself is not valid for this API (authentication failure).</li>
+        <li><strong>403</strong> — the token is valid but lacks the required authority (authorization failure).</li>
+        <li>The <strong>access token</strong>.</li>
+        <li>Accepting a token issued for a different API/recipient; the <strong>audience validator</strong> prevents it.</li>
+        <li>It verifies a signature locally (microseconds) with no per-request network round-trip to Auth0.</li>
+        <li>"Enable RBAC" and "Add Permissions in the Access Token" on the API.</li>
+        <li>The <code>iss</code> claim won't match (Auth0's issuer ends in <code>/</code>), so validation fails with an issuer mismatch.</li>
+        <li>Never log the <code>Authorization</code> header; never transmit over plain HTTP; never store tokens in insecure/client-readable locations.</li>
+      </ol>
+    </details>
+  </section>
+
+  <!-- ============================================================= 19 -->
+  <section id="cheatsheet">
+    <h2>19. Cheat Sheet</h2>
+    <pre><code class="language-text">DEPENDENCY        spring-boot-starter-oauth2-resource-server
+CONFIG            spring.security.oauth2.resourceserver.jwt.issuer-uri=https://TENANT/
+                  auth0.audience=https://api.helios.com   (custom prop)
+
+VALIDATION QUARTET  signature (RS256/JWKS) + iss + exp + aud
+                    issuer-uri gives you: signature + iss + exp
+                    YOU add manually:     aud (AudienceValidator)
+
+CLAIMS            iss  issuer (trailing slash!)   sub  user id
+                  aud  API identifier             exp  expiry
+                  scope "read:x ..." -> SCOPE_x   permissions [..] (RBAC)
+
+AUTHORITIES       default: SCOPE_&lt;scope&gt;
+                  custom converter: bare permissions for hasAuthority('read:x')
+
+ENFORCE
+  URL    http.authorizeHttpRequests(a -> a
+            .requestMatchers(GET,"/api/invoices/**").hasAuthority("read:invoices")
+            .anyRequest().authenticated())
+  METHOD @EnableMethodSecurity  +  @PreAuthorize("hasAuthority('delete:invoices')")
+
+STATELESS API     csrf.disable() ; SessionCreationPolicy.STATELESS
+
+RESULT CODES      401 = bad/missing/expired/wrong-aud token (authN)
+                  403 = valid token, missing permission     (authZ)
+
+DASHBOARD         APIs -> Create (RS256) -> Enable RBAC + Add Permissions in token
+                  Define verb:noun permissions; assign via roles
+
+TEST              MockMvc + jwt().jwt(j -> j.claim("permissions", List.of("read:invoices")))
+                  or hit it with a real token from API -> Test tab</code></pre>
+  </section>
+
+  <!-- ============================================================= 20 -->
+  <section id="takeaways">
+    <h2>20. Key Takeaways</h2>
+    <div class="callout key"><span class="tag">Key</span><p>A resource server <em>consumes</em> tokens; it never issues them, holds no passwords, and runs no login. Its job is validate-then-authorize, on every request, locally.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p>Security rests on the <strong>validation quartet</strong>: signature, <code>iss</code>, <code>exp</code>, and <code>aud</code>. Spring's <code>issuer-uri</code> gives you the first three for free — <strong>you must add the audience validator yourself.</strong></p></div>
+    <div class="callout key"><span class="tag">Key</span><p>RS256 + JWKS means validation is local and secret-free: Auth0 signs with a private key, you verify with the public key. No per-request call to Auth0, so resource servers stay stateless and scale horizontally.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p>Map Auth0 <code>permissions</code> to bare Spring authorities, then enforce with coarse URL rules <em>and</em> fine-grained <code>@PreAuthorize</code> (remember <code>@EnableMethodSecurity</code>). Deny by default; <code>401</code> = bad token, <code>403</code> = insufficient permission.</p></div>
+    <div class="callout tip"><span class="tag">Test</span><p>Prove it end-to-end with a real access token from the Auth0 dashboard's API Test tab — decode it at jwt.io, confirm <code>aud</code>/<code>iss</code>/<code>permissions</code>, then watch a wrong-audience token correctly fail with 401.</p></div>
+  </section>
+
+  <nav class="pager">
+    <a class="prev" href="chapter-18.html">← Previous</a>
+    <a class="next" href="chapter-20.html">Next →</a>
+  </nav>
+</main>
+<footer class="site-footer">Master Auth0 End-to-End · Chapter 19 of 32</footer>
+</body>
+</html>

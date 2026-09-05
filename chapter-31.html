@@ -1,0 +1,801 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 31 — Advanced Auth0 Internals | Master Auth0</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">🔐 Master Auth0</a>
+  <nav class="topnav">
+    <a href="chapter-30.html">← Prev</a>
+    <a href="index.html">Contents</a>
+    <a href="chapter-32.html">Next →</a>
+  </nav>
+</header>
+<main class="container">
+  <div class="chapter-head">
+    <span class="phase">Phase 13 · Advanced Internals</span>
+    <h1>Chapter 31 — Advanced Auth0 Internals</h1>
+    <p class="lead">Until now you have used Auth0 as a black box: you send a user to <code>/authorize</code>, magic happens, and a signed token comes back. This chapter pries the lid off that box. We will trace a single login transaction from the first byte of the HTTP request to the last byte of the issued <code>id_token</code>, naming every internal stage it passes through — the identity pipeline, the Actions runtime, session creation, the token-minting service, and the JWKS publisher. Then we zoom out to the platform: how Auth0 isolates 100,000 tenants on shared infrastructure, how rate limiting actually counts your requests, how log streaming fans out events without losing them, and how a globally-distributed authentication service stays available when a whole region fails. Auth0's exact source is proprietary, so where we cannot <em>know</em> we will <em>reason from first principles</em> — and label clearly which is which. By the end you will be able to debug subtle production issues, answer the hardest system-design interview questions, and design your own miniature identity platform.</p>
+  </div>
+
+  <!-- ============================================================= 1 -->
+  <section id="theory">
+    <h2>1. Theory — What "Internals" Means and Why You Must Care</h2>
+
+    <p>An identity provider is, at heart, a very specialized <strong>state machine and signing service</strong>. Strip away the marketing and Auth0 does three irreducible things:</p>
+    <ol>
+      <li><strong>Authenticate</strong> — accept a credential (password, social token, passkey, magic link), verify it against a stored secret or a federated upstream, and decide "this request belongs to user <code>U</code>."</li>
+      <li><strong>Decide &amp; enrich</strong> — run your customizable logic (Actions) to allow/deny the login and shape what claims go into the token.</li>
+      <li><strong>Issue &amp; remember</strong> — mint cryptographically-signed tokens that downstream APIs can verify <em>without calling Auth0 again</em>, and create a server-side session so the user need not re-enter credentials.</li>
+    </ol>
+
+    <p>Everything else — dashboards, connections, organizations, logs — exists to support those three. Why learn the internals if the box works? Three first-principles reasons:</p>
+
+    <table>
+      <thead><tr><th>Reason</th><th>What it unlocks</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Debugging</strong></td><td>"Why did my Action run twice?" "Why is my token missing a claim?" "Why did login slow down at 50k users?" You cannot debug a pipeline you cannot see.</td></tr>
+        <tr><td><strong>Correctness</strong></td><td>Knowing the <em>execution order</em> of Actions, when sessions are created, and how JWKS caching works prevents whole classes of bugs (race conditions, stale keys, replay).</td></tr>
+        <tr><td><strong>System design</strong></td><td>Senior interviews ask "design an auth service." The patterns Auth0 uses — stateless tokens, key rotation, tenant isolation, multi-region failover — are the canonical answers.</td></tr>
+        <tr><td><strong>Cost &amp; scale</strong></td><td>Rate limits, token TTLs, and refresh-token strategy directly drive your bill and your latency. You optimize what you understand.</td></tr>
+      </tbody>
+    </table>
+
+    <h3>The two foundational design choices</h3>
+    <p>Two decisions ripple through everything in this chapter, so internalize them now:</p>
+    <p><strong>(a) Tokens are stateless; sessions are stateful.</strong> An <em>access token</em> (JWT) is a self-contained, signed claim — an API verifies it with a public key and never phones home. This is why Auth0 scales: token <em>verification</em> happens entirely inside your API, not at Auth0. By contrast, the <em>SSO session</em> Auth0 keeps in a cookie at <code>tenant.auth0.com</code> is server-side state, because revocation and "silent re-login" require remembering who is logged in.</p>
+    <p><strong>(b) Multi-tenancy is the organizing principle of the whole platform.</strong> Every record, every rate-limit counter, every signing key, every log line is scoped to a <code>tenant</code>. Tenant isolation is not a feature bolted on top — it is the dimension along which Auth0 partitions data, enforces limits, and routes traffic.</p>
+
+    <div class="callout key"><span class="tag">Key</span><p>Memorize the spine of this chapter: <strong>Request → Identity Pipeline → Actions → Session → Token Mint → JWKS</strong>. Login is "create state + sign a claim"; verification is "check the signature." Everything Auth0 does is a variation on those two sentences, multiplied across thousands of isolated tenants.</p></div>
+  </section>
+
+  <!-- ============================================================= 2 -->
+  <section id="story">
+    <h2>2. Story-Based Explanation — A Day in the Life of One Login</h2>
+
+    <p>Meet <strong>Priya</strong>, an employee at <em>NorthWind Logistics</em>, opening her company's shipping dashboard at 9:01 a.m. She has no idea she is about to trigger a dozen internal subsystems. Let's narrate it like a relay race, where a baton (her request context) is passed from runner to runner.</p>
+
+    <p><strong>Runner 1 — The Front Door (Edge).</strong> Priya's browser hits <code>https://login.northwind.com/authorize?...</code>. This is a vanity domain (custom domain) that resolves, through a CDN/edge layer, to Auth0's regional cluster. The edge node does TLS termination, basic DDoS filtering, and — crucially — looks at the host header to figure out <em>which tenant</em> this is. The baton now carries a <code>tenant_id</code>.</p>
+
+    <p><strong>Runner 2 — The Authorization Server.</strong> It validates the OAuth request: is <code>client_id</code> a real application in this tenant? Is the <code>redirect_uri</code> on the allowlist? Is <code>response_type</code> supported? If anything is wrong, the race ends here with an error — <em>before</em> any credential is touched. A new <strong>login transaction</strong> record is created (a short-lived server-side object holding the request parameters), and Priya is shown the Universal Login page.</p>
+
+    <p><strong>Runner 3 — Credential Collection.</strong> Priya's company uses Microsoft Entra ID, so she's redirected upstream, authenticates with her corporate password + MFA, and comes back with a SAML assertion. Auth0's <strong>connection handler</strong> validates that assertion's signature against Entra's metadata, extracts her email, and now knows <em>which human</em> this is.</p>
+
+    <p><strong>Runner 4 — The Identity Pipeline.</strong> Now the interesting work begins. Auth0 finds or creates Priya's user profile, then runs the <strong>Actions</strong> NorthWind configured for the <em>Login</em> flow: one Action checks she's in an allowed organization, another fetches her warehouse permissions from an external API and stamps them as custom claims, a third enforces step-up MFA for the "finance" role. Each Action runs in order, sharing an <code>event</code>/<code>api</code> object — the baton itself.</p>
+
+    <p><strong>Runner 5 — Session Creation.</strong> The pipeline approved the login. Auth0 writes an <strong>SSO session</strong> server-side and sets an encrypted cookie on <code>login.northwind.com</code>. Tomorrow, when Priya returns, Runner 3 can be skipped entirely — the cookie proves she's still logged in (this is SSO / silent auth).</p>
+
+    <p><strong>Runner 6 — The Token Mint.</strong> Auth0 assembles the claims (standard ones like <code>sub</code>, <code>iss</code>, <code>exp</code>, plus the custom claims the Actions added), serializes them to JSON, base64url-encodes them, and signs the result with the tenant's current private RSA/ECDSA key. Out comes an <code>id_token</code> (and, if an API audience was requested, an <code>access_token</code>). Priya's browser is redirected back to the dashboard with these tokens.</p>
+
+    <p><strong>Runner 7 — The Verifier (in NorthWind's API).</strong> The dashboard calls its backend with the access token. The backend fetches Auth0's <strong>public keys</strong> from <code>/.well-known/jwks.json</code> (once, then cached), verifies the signature, checks <code>exp</code>/<code>aud</code>/<code>iss</code>, and — without ever contacting Auth0 again — serves Priya's shipments. Total elapsed time: under a second. Total subsystems touched: every one we'll dissect below.</p>
+
+    <div class="callout note"><span class="tag">Note</span><p>Notice that Auth0 was only "in the loop" for runners 1–6, which happen <em>once</em> per login. Runner 7, which happens on <em>every API call</em> for the next hour, never touches Auth0. That asymmetry is the entire performance story of OAuth: pay the auth cost once, verify cheaply forever.</p></div>
+  </section>
+
+  <!-- ============================================================= 3 -->
+  <section id="diagrams">
+    <h2>3. ASCII Diagrams — The Internal Machinery</h2>
+
+    <h3>3.1 The end-to-end login transaction</h3>
+    <pre class="diagram">
+   BROWSER                 AUTH0 (tenant cluster)                UPSTREAM IdP        YOUR API
+      │                            │                                  │                 │
+  (1) │  GET /authorize            │                                  │                 │
+      ├───────────────────────────►│ validate client_id,             │                 │
+      │                            │ redirect_uri, scopes             │                 │
+      │                            │ create LOGIN TRANSACTION ──┐     │                 │
+      │  302 Universal Login       │                            │     │                 │
+      │◄───────────────────────────┤                            │     │                 │
+  (2) │  credentials / redirect    │  (federated connection)    │     │                 │
+      ├───────────────────────────►├──────────────────────────────────►│ authenticate  │
+      │                            │   SAML/OIDC assertion        │     │  + MFA        │
+      │                            │◄──────────────────────────────────┤               │
+      │                            │ verify signature, map user   │     │                 │
+      │                            ▼                              │     │                 │
+      │                   ┌─────────────────────┐                │     │                 │
+      │                   │  IDENTITY PIPELINE   │                │     │                 │
+      │                   │  find/create user    │                │     │                 │
+      │                   │  run ACTIONS (order) │                │     │                 │
+      │                   │  allow / deny / MFA  │                │     │                 │
+      │                   └──────────┬──────────┘                │     │                 │
+      │                            create SSO SESSION + Set-Cookie│     │                 │
+      │                            ▼                              │     │                 │
+      │                   ┌─────────────────────┐                │     │                 │
+      │                   │     TOKEN MINT       │                │     │                 │
+      │                   │  build claims        │                │     │                 │
+      │                   │  sign w/ private key │                │     │                 │
+      │                   └──────────┬──────────┘                │     │                 │
+  (3) │  302 redirect_uri#id_token=… │                            │     │                 │
+      │◄───────────────────────────┤                            │     │                 │
+  (4) │  call API w/ access_token   │                            │     │                 │
+      ├──────────────────────────────────────────────────────────────────────────────►│
+      │                            │   GET /.well-known/jwks.json (cached) ◄────────────┤
+      │                            │   public keys ────────────────────────────────────►│
+      │                            │                              │     │  verify sig    │
+      │  200 data                  │                              │     │  (no Auth0!)   │
+      │◄──────────────────────────────────────────────────────────────────────────────┤
+    </pre>
+
+    <h3>3.2 The token generation pipeline (zoom-in)</h3>
+    <pre class="diagram">
+  Authenticated user + approved login
+            │
+            ▼
+  ┌───────────────────────────────────────────────────────────────┐
+  │ 1. GATHER  base profile claims  (sub, email, name, ...)         │
+  │ 2. APPLY   scopes/audience → which claims are allowed           │
+  │ 3. MERGE   custom claims added by Actions (namespaced URIs)     │
+  │ 4. STAMP   standard claims: iss, aud, iat, exp, nbf, azp, jti   │
+  │ 5. SELECT  active signing key  (kid → current private key)      │
+  │ 6. CANON   header {alg:RS256, typ:JWT, kid}  + payload → JSON   │
+  │ 7. ENCODE  base64url(header) . base64url(payload)               │
+  │ 8. SIGN    RSASSA-PKCS1-v1_5 over the two encoded parts         │
+  │ 9. APPEND  . base64url(signature)   → the final JWT             │
+  └───────────────────────────────────────────────────────────────┘
+            │
+            ▼
+   eyJhbGciOiJSUzI1NiIsImtpZCI6Ik5UQk...  .  eyJzdWIiOiJhdXRoMHwx...  .  Pq9f3...signature
+   └────────── header ──────────┘            └──── payload ────┘          └ signature ┘
+    </pre>
+
+    <h3>3.3 JWKS caching: the trust handshake</h3>
+    <pre class="diagram">
+   AUTH0                                   YOUR API (resource server)
+   ─────                                   ──────────────────────────
+   private key (kid=ABC) ── signs JWT       receives JWT, reads header.kid = ABC
+                                                      │
+   GET /.well-known/jwks.json                         │  kid in cache?
+   { keys:[ {kid:ABC,n,e}, {kid:XYZ,n,e} ] } ◄────────┤  no → fetch JWKS
+                                            ────────► │  cache {ABC:key, XYZ:key} (TTL ~10m)
+                                                      │  verify signature with key[ABC]
+   KEY ROTATION over time:                            │
+   t0: sign with ABC, publish {ABC, XYZ_next}         │  next request: kid=ABC in cache → reuse
+   t1: rotate → sign with XYZ, still publish ABC      │  unknown kid? → refetch (rate-limited)
+   t2: retire ABC after grace period                  │  ABC tokens still verify until exp
+    </pre>
+
+    <h3>3.4 Tenant isolation at the storage layer (reasoned)</h3>
+    <pre class="diagram">
+        ┌──────────────────────── Shared Auth0 region ────────────────────────┐
+        │   API gateway / authorization servers (stateless, autoscaled)        │
+        │        │                │                │                            │
+        │   ┌────▼────┐      ┌────▼────┐      ┌────▼────┐                       │
+        │   │ tenant  │      │ tenant  │      │ tenant  │   every query carries │
+        │   │  A      │      │  B      │      │  C      │   WHERE tenant_id = ?  │
+        │   └────┬────┘      └────┬────┘      └────┬────┘                       │
+        │        └───────┬────────┴───────┬────────┘                           │
+        │            ┌───▼───┐        ┌────▼────┐                               │
+        │            │ DB    │        │  cache  │   logical isolation:          │
+        │            │shards │        │ (Redis) │   tenant_id partition key     │
+        │            └───────┘        └─────────┘   + per-tenant signing keys   │
+        └──────────────────────────────────────────────────────────────────────┘
+         Private/Enterprise deployments → DEDICATED cluster (physical isolation)
+    </pre>
+  </section>
+
+  <!-- ============================================================= 4 -->
+  <section id="analogy">
+    <h2>4. Real-World Analogy — The Embassy and the Visa</h2>
+
+    <p>Think of Auth0 as a <strong>passport-and-visa office</strong>, and your API as a <strong>border guard</strong> at a country far away.</p>
+
+    <ul>
+      <li><strong>The login transaction = applying for a visa.</strong> You show up at the embassy (the authorization server), prove who you are (credentials), and an officer runs your application through a series of <em>checks in a fixed order</em> (the Actions pipeline): criminal record, sponsorship, vaccination. Any check can reject you.</li>
+      <li><strong>The token = the visa stamped in your passport.</strong> It is a tamper-proof document with an <em>expiry date</em> (<code>exp</code>), the <em>issuing country</em> (<code>iss</code>), <em>who it's valid for</em> (<code>aud</code>), and an <em>official seal</em> (the signature). Critically, the visa is self-contained.</li>
+      <li><strong>JWKS = the registry of official seals.</strong> The border guard doesn't phone the embassy for every traveler. Instead, every embassy publishes its official seal designs (public keys) to an international registry. The guard downloads the seal catalog once, caches it, and checks each visa's seal against it. When the embassy changes its seal (key rotation), it publishes the new design <em>before</em> using it, and keeps the old one valid until the last old visa expires.</li>
+      <li><strong>The session cookie = a frequent-traveler card</strong> at the embassy. Next time you apply, you skip the long interview because the embassy remembers you (SSO). Burn the card (logout) and you start over.</li>
+      <li><strong>Tenant isolation = separate embassies per country.</strong> The France embassy and the Japan embassy share the same building (infrastructure) and front desk, but each has its own filing cabinet (data partition), its own seal (signing key), and its own quota of applications per hour (rate limit). A clerk who pulls the wrong cabinet would be a catastrophic isolation bug — so every file folder is stamped with the country code (<code>tenant_id</code>) and queries are physically incapable of crossing.</li>
+    </ul>
+
+    <div class="callout tip"><span class="tag">Tip</span><p>The analogy also explains <em>why revocation is hard</em>. Once a visa (JWT) is in your passport, the embassy can't reach into your pocket and cross it out — it's valid until it expires. That's why access tokens are short-lived and real-time revocation requires either very short TTLs or an extra "is this still valid?" check (token introspection / a denylist). Stateless speed costs you instant revocation.</p></div>
+  </section>
+
+  <!-- ============================================================= 5 -->
+  <section id="internals">
+    <h2>5. Internal Working — Subsystem by Subsystem</h2>
+
+    <h3>5.1 The login transaction object</h3>
+    <p>When <code>/authorize</code> is hit, Auth0 creates a short-lived server-side object — the <strong>login transaction (also called the authentication session/state)</strong>. It stores the original OAuth parameters (<code>client_id</code>, <code>redirect_uri</code>, <code>scope</code>, <code>nonce</code>, <code>state</code>, PKCE <code>code_challenge</code>, requested <code>audience</code>, <code>prompt</code>, <code>max_age</code>). It is keyed by a transaction id stored in a cookie on the Auth0 domain. This object exists so that after the user bounces through Universal Login and possibly an external IdP, Auth0 can <em>resume</em> the exact request. It expires in minutes; that's why an idle login page eventually throws "invalid state."</p>
+
+    <h3>5.2 The identity pipeline &amp; Actions execution order</h3>
+    <p>This is the most exam-relevant internal. After authentication succeeds, Auth0 runs your logic in a sandboxed Node.js runtime. The order is deterministic:</p>
+    <ol>
+      <li><strong>Within one flow, Actions run in the order shown in the dashboard, top to bottom.</strong> They are sequential, not parallel. Action 2 sees mutations Action 1 made via <code>api.user.setAppMetadata()</code> only after that data persists; for in-request data, Actions communicate by writing to the token via <code>api.idToken.setCustomClaim()</code> and reading <code>event</code>.</li>
+      <li><strong>Different triggers are different pipelines.</strong> <code>post-login</code>, <code>credentials-exchange</code> (M2M / refresh), <code>pre-user-registration</code>, <code>post-user-registration</code>, <code>send-phone-message</code>, etc. each have their own ordered list. A refresh-token call runs <code>credentials-exchange</code>, <strong>not</strong> <code>post-login</code> — a classic gotcha.</li>
+      <li><strong>Token shaping happens here.</strong> Custom claims must be added during the pipeline because the Token Mint runs <em>after</em> the pipeline finishes. Once minted, the token is immutable.</li>
+      <li><strong>Control flow:</strong> <code>api.access.deny()</code> aborts the login; <code>api.redirect.sendUserTo()</code> pauses the pipeline, sends the user to your URL (e.g., custom consent), and resumes in a <em>second</em> execution after they return — meaning a redirect Action effectively runs twice.</li>
+    </ol>
+
+    <h3>5.3 Session creation &amp; persistence</h3>
+    <p>Auth0 maintains up to three layers of "logged-in" state, and confusing them causes most SSO bugs:</p>
+    <table>
+      <thead><tr><th>Layer</th><th>Where it lives</th><th>Purpose</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Auth0 SSO session</strong></td><td>Server-side, referenced by an encrypted cookie on the Auth0/custom domain</td><td>Lets multiple apps in the tenant log in silently; enables <code>prompt=none</code></td></tr>
+        <tr><td><strong>Application session</strong></td><td>Your app's own cookie/JWT</td><td>Keeps the user logged into <em>your</em> app between API calls</td></tr>
+        <tr><td><strong>IdP session</strong></td><td>Upstream (Google, Entra)</td><td>Why "logout" from your app may still auto-login via Google</td></tr>
+      </tbody>
+    </table>
+    <p>The SSO session has idle and absolute lifetimes. On each interactive auth it may be <em>rolled</em> (idle timer reset). Logout endpoints clear the SSO session; whether the upstream IdP session clears depends on federated logout configuration.</p>
+
+    <h3>5.4 JWKS caching internals</h3>
+    <p>Auth0 holds the tenant's private signing keys; it never exposes them. It publishes only the <em>public</em> halves at <code>/.well-known/jwks.json</code>. Each key has a <code>kid</code> (key id). Every JWT header carries the <code>kid</code> used to sign it. Verification is a lookup: read <code>kid</code> → find the matching public key → verify. Resource servers must cache the JWKS (it changes rarely) but refetch when they see an unknown <code>kid</code> (signals rotation) — guarded by a rate limiter so a flood of bad tokens can't DDoS the JWKS endpoint. Rotation is overlap-based: the next key is published <em>before</em> it's used, so verifiers can prefetch it.</p>
+
+    <h3>5.5 Rate-limiting internals</h3>
+    <p>Rate limits are almost always <strong>token-bucket</strong> or sliding-window counters keyed by <code>(tenant_id, endpoint_class, [client_id or IP])</code>, stored in a fast shared store (e.g., Redis). Each request decrements a bucket that refills at a fixed rate. When empty, you get <code>429 Too Many Requests</code> with <code>X-RateLimit-Limit</code>, <code>X-RateLimit-Remaining</code>, and <code>X-RateLimit-Reset</code> headers (and sometimes <code>Retry-After</code>). Limits differ by endpoint class — the Management API, the Authentication API, and anomaly-detection counters are separate buckets. Because counters are per-tenant, a noisy neighbor cannot exhaust your quota.</p>
+
+    <h3>5.6 Log streaming internals</h3>
+    <p>Every meaningful event (login success/fail, token issued, rate-limit hit, Action error) is written to an append-only per-tenant log. <strong>Log streams</strong> are a publish/subscribe fan-out: the event is enqueued, then delivery workers POST batches to your sinks (Datadog, Splunk, an HTTP webhook, AWS EventBridge). Delivery is <em>at-least-once</em> with retries and exponential backoff; if your sink is down past the retry window, events can be dropped, so streams are for observability, not as a system of record (use the tenant log API for backfill). Order is best-effort, so design consumers to be idempotent.</p>
+
+    <h3>5.7 Tenant isolation &amp; multi-tenancy at scale</h3>
+    <p>On the shared cloud, isolation is <strong>logical</strong>: a single set of stateless authorization servers serves all tenants, and every storage operation is partitioned by <code>tenant_id</code>. Each tenant gets its own signing keys, its own connections, its own rate-limit counters, and its own configuration. Private Cloud / dedicated deployments add <strong>physical</strong> isolation (separate infrastructure). The genius of logical isolation is elasticity — one big pool absorbs spikes — while the risk is that an isolation bug leaks data across tenants, which is why <code>tenant_id</code> scoping is enforced at the lowest possible layer.</p>
+
+    <h3>5.8 A reasoned data model (entities, fields &amp; relationships)</h3>
+    <p>Auth0's real schema is proprietary, so the following is <strong>reasoned from first principles</strong> — the model any competent team would arrive at given the behavior we observe through the APIs. It is the model you would defend in a system-design interview. <strong>Every</strong> table carries a <code>tenant_id</code> as the leading element of its partition key (see §5.7); it is omitted from the field lists below only to avoid repeating it ten times. Two structural truths shape the whole design: (1) the platform is multi-tenant, so <code>tenant_id</code> is in every key; (2) some entities are <em>configuration</em> (read-heavy, small, cacheable — connections, roles, secrets) while others are <em>operational</em> (write-heavy, high-volume, often append-only — sessions, refresh tokens, logs). Those two classes typically live in different storage engines tuned for their access pattern.</p>
+
+    <table>
+      <thead><tr><th>Entity</th><th>Key fields (beyond <code>tenant_id</code>)</th><th>Notes &amp; relationships</th></tr></thead>
+      <tbody>
+        <tr><td><strong>tenant</strong></td><td><code>tenant_id</code> (PK), name, region, plan, settings, flags</td><td>The root of the partition tree. Everything below hangs off it. Region drives data residency.</td></tr>
+        <tr><td><strong>user</strong></td><td><code>user_id</code> (e.g. <code>auth0|abc</code>, PK), email, email_verified, password_hash (DB conns only), <code>user_metadata</code>, <code>app_metadata</code>, identities[], created_at, last_login</td><td>The <code>user_id</code> encodes its connection (<code>auth0|</code>, <code>google-oauth2|</code>, …). <code>identities[]</code> links linked accounts. <strong>Many users → one connection.</strong> Indexed by email for lookup; uniqueness of email is per-connection, not global.</td></tr>
+        <tr><td><strong>connection</strong></td><td><code>connection_id</code> (PK), name, strategy (<code>auth0</code>/<code>google-oauth2</code>/<code>samlp</code>/<code>oidc</code>…), options (client id/secret, metadata URL, attribute map), enabled_clients[]</td><td>Configuration data: small, read-heavy, cached. Defines <em>how</em> a credential is verified. <strong>One connection → many users.</strong> Linked many-to-many to applications via <code>enabled_clients</code>.</td></tr>
+        <tr><td><strong>organization</strong></td><td><code>org_id</code> (PK), name, display_name, branding, metadata, enabled_connections[]</td><td>A B2B grouping of users. <strong>Many-to-many with users</strong> through a membership join (a user can belong to several orgs). Carries its own enabled connections and role grants.</td></tr>
+        <tr><td><strong>org_member</strong> (join)</td><td>(<code>org_id</code>, <code>user_id</code>) composite PK, roles[]</td><td>Resolves the user↔organization many-to-many and stores the user's roles <em>within that org</em> (the same user can be admin in org A, viewer in org B).</td></tr>
+        <tr><td><strong>role</strong></td><td><code>role_id</code> (PK), name, description, permissions[]</td><td>A named bundle of permissions. <strong>Many-to-many with users</strong> (and with org members). Configuration data.</td></tr>
+        <tr><td><strong>permission</strong></td><td>(<code>resource_server_id</code>, <code>value</code>) e.g. <code>read:shipments</code></td><td>Belongs to a <strong>resource server (API)</strong>, identified by its audience. Permissions are granted to roles and/or directly to users; the union is resolved at login and emitted as scopes/claims.</td></tr>
+        <tr><td><strong>session</strong></td><td><code>session_id</code> (PK), user_id, created_at, idle_expires_at, absolute_expires_at, authenticated_clients[], device/UA, last_seen</td><td><strong>Operational, write-heavy.</strong> The server-side SSO session of §5.3, referenced by the encrypted cookie. One user → many active sessions (multiple devices). TTL-evicted; powers silent auth and global logout.</td></tr>
+        <tr><td><strong>refresh_token</strong></td><td><code>token_id</code> (PK), user_id, client_id, session_id, <code>token_hash</code>, <code>rotation_family_id</code>, parent_id, scopes, issued_at, expires_at, revoked</td><td><strong>Stored hashed, never plaintext.</strong> Rotation chains a family via <code>rotation_family_id</code>/<code>parent_id</code>; reuse of a rotated token revokes the whole family (reuse detection). Linked to a session so session logout can cascade-revoke.</td></tr>
+        <tr><td><strong>signing_key</strong></td><td><code>kid</code> (PK), public_jwk, key_state (next/current/previous/retired), created_at, rotated_at</td><td>Per-tenant. The <em>private</em> half lives in a KMS/HSM, never in this row (§8). Drives JWKS publishing and the overlap-based rotation of §5.4.</td></tr>
+        <tr><td><strong>secret</strong></td><td><code>secret_id</code> (PK), scope (action/connection), name, <code>ciphertext</code> (envelope-encrypted), version</td><td>Action secrets, connection client-secrets, etc. <strong>Encrypted at rest</strong> under a per-tenant data key wrapped by a master KMS key. Decrypted only into the sandbox that needs them.</td></tr>
+        <tr><td><strong>log</strong></td><td>(<code>tenant_id</code>, time-ordered <code>log_id</code>) PK, type, user_id, client_id, ip, description, details</td><td><strong>Append-only, high-volume, time-series.</strong> Stored with a short retention window and time-bucketed partition key for cheap range scans. The source for the log-streaming fan-out of §5.6.</td></tr>
+      </tbody>
+    </table>
+
+    <pre class="diagram">
+   ENTITY RELATIONSHIPS (every box is implicitly scoped by tenant_id)
+
+                              ┌──────────┐
+                              │  TENANT  │  (region, plan, settings)
+                              └────┬─────┘
+        ┌───────────┬─────────────┼──────────────┬───────────────┬───────────┐
+        │           │             │              │               │           │
+   ┌────▼────┐ ┌────▼─────┐  ┌────▼─────┐   ┌────▼─────┐    ┌─────▼────┐ ┌────▼───┐
+   │CONNECTION│ │   ROLE   │  │   USER   │   │   ORG    │    │SIGNING_KEY│ │ SECRET │
+   └────┬─────┘ └────┬─────┘  └────┬─────┘   └────┬─────┘    └──────────┘ └────────┘
+        │ 1        M │ ╲          │ M  ╲ M       │ M
+        │            │  ╲ (user_role) ╲ (org_member: roles[]) │
+        └──► M USER  │   ╲──────────► USER ◄──────────────────┘
+                     │       permissions[] ──► PERMISSION ──► (resource server / API)
+                     │
+        ┌────────────┼──────────── per USER (operational) ───────────────┐
+        │       ┌────▼─────┐         ┌──────────────┐        ┌──────────┐ │
+        │       │ SESSION  │ 1 ──► M │ REFRESH_TOKEN│        │   LOG    │ │
+        │       └──────────┘         │ (rotation     │       │(append-  │ │
+        │        idle/abs TTL        │  family chain)│       │  only)   │ │
+        │                            └──────────────┘        └──────────┘ │
+        └───────────────────────────────────────────────────────────────┘
+
+   Cardinalities:  connection 1─M user │ user M─M role │ user M─M org (via org_member)
+                   role M─M permission │ user 1─M session │ session 1─M refresh_token
+                   user 1─M log        │ tenant 1─M signing_key / secret / everything
+    </pre>
+
+    <p><strong>Why split storage by access pattern?</strong> Configuration entities (tenant, connection, role, permission, signing_key) are small, change rarely, and are read on every login — perfect for a strongly-consistent relational store fronted by an aggressive cache. Operational entities (session, refresh_token, log) are written constantly and queried by recent time or by user — better served by stores tuned for high write throughput and TTL eviction. Logs especially are append-only time-series with short retention. Getting this split right is exactly what lets one platform serve a tiny tenant and a 10-million-user tenant on the same fleet.</p>
+
+    <div class="callout warn"><span class="tag">Warn</span><p>The single most common mental-model error: believing the <code>access_token</code> is "checked by Auth0" on every request. It is not. Your API verifies it offline using cached public keys. That means a token revoked in the Auth0 dashboard <em>still works</em> until it expires, unless your API explicitly checks a denylist or uses introspection. Plan revocation around this fact.</p></div>
+  </section>
+
+  <!-- ============================================================= 6 -->
+  <section id="walkthrough">
+    <h2>6. Code Walkthrough — Seeing the Internals From the Outside</h2>
+
+    <h3>6.1 An Action: where the identity pipeline becomes your code (Node.js)</h3>
+    <p>This <code>post-login</code> Action shows pipeline ordering, custom claims (token shaping), denial, and redirect — all the control-flow primitives from §5.2.</p>
+<pre><code class="language-javascript">/**
+ * post-login Action. Runs AFTER authentication, BEFORE the token is minted.
+ * Auth0 calls exports.onExecutePostLogin once per login (twice if you redirect).
+ */
+exports.onExecutePostLogin = async (event, api) =&gt; {
+  const ns = "https://northwind.com/"; // namespace custom claims to avoid OIDC collisions
+
+  // (1) DENY: abort the whole login transaction. Token is never minted.
+  if (event.user.email_verified !== true) {
+    return api.access.deny("Please verify your email before signing in.");
+  }
+
+  // (2) ENRICH: fetch external permissions and stamp them as a custom claim.
+  //     This MUST happen in the pipeline — after mint, the token is immutable.
+  const roles = (event.authorization &amp;&amp; event.authorization.roles) || [];
+  api.idToken.setCustomClaim(ns + "roles", roles);
+  api.accessToken.setCustomClaim(ns + "roles", roles); // APIs read the access token
+
+  // (3) STEP-UP MFA conditionally (control flow inside the pipeline).
+  if (roles.includes("finance") &amp;&amp; !event.authentication?.methods.some(m =&gt; m.name === "mfa")) {
+    return api.authentication.challengeWithAny([{ type: "otp" }]);
+  }
+
+  // (4) REDIRECT: pause pipeline, send user out, resume in a SECOND execution.
+  if (event.user.app_metadata?.needs_tos_accept) {
+    api.redirect.sendUserTo("https://northwind.com/accept-tos");
+    // Execution ends here; onContinue (below) runs when the user returns.
+  }
+};
+
+// Resume handler — proof that a redirect Action runs TWICE.
+exports.onContinuePostLogin = async (event, api) =&gt; {
+  // validate the signed state you returned with, then continue the login
+};
+</code></pre>
+
+    <h3>6.2 Verifying a token the way your API does (FastAPI / Python)</h3>
+    <p>This is Runner 7 from the story — JWKS fetch, cache, signature verification, no call to Auth0.</p>
+<pre><code class="language-python">import time, httpx
+from jose import jwt
+from fastapi import FastAPI, Depends, HTTPException, Header
+
+AUTH0_DOMAIN = "northwind.us.auth0.com"
+API_AUDIENCE = "https://api.northwind.com"
+ISSUER = f"https://{AUTH0_DOMAIN}/"
+ALGS = ["RS256"]
+
+app = FastAPI()
+_jwks_cache = {"keys": None, "fetched_at": 0}
+_TTL = 600  # 10 min — JWKS changes rarely; refetch on unknown kid or TTL expiry
+
+async def get_jwks():
+    if _jwks_cache["keys"] and time.time() - _jwks_cache["fetched_at"] &lt; _TTL:
+        return _jwks_cache["keys"]
+    async with httpx.AsyncClient() as c:
+        r = await c.get(f"https://{AUTH0_DOMAIN}/.well-known/jwks.json", timeout=5)
+        r.raise_for_status()
+    _jwks_cache.update(keys=r.json()["keys"], fetched_at=time.time())
+    return _jwks_cache["keys"]
+
+async def verify(authorization: str = Header(None)):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(401, "Missing bearer token")
+    token = authorization.split(" ", 1)[1]
+    header = jwt.get_unverified_header(token)          # read kid WITHOUT trusting it yet
+    keys = await get_jwks()
+    key = next((k for k in keys if k["kid"] == header["kid"]), None)
+    if key is None:                                    # unknown kid → rotation: refetch once
+        _jwks_cache["fetched_at"] = 0
+        keys = await get_jwks()
+        key = next((k for k in keys if k["kid"] == header["kid"]), None)
+    if key is None:
+        raise HTTPException(401, "Unknown signing key")
+    try:
+        return jwt.decode(token, key, algorithms=ALGS,   # checks sig + exp + nbf
+                          audience=API_AUDIENCE, issuer=ISSUER)
+    except Exception as e:
+        raise HTTPException(401, f"Invalid token: {e}")
+
+@app.get("/shipments")
+async def shipments(claims: dict = Depends(verify)):
+    roles = claims.get("https://northwind.com/roles", [])
+    if "viewer" not in roles and "finance" not in roles:
+        raise HTTPException(403, "Insufficient scope")
+    return {"sub": claims["sub"], "shipments": ["BL-1001", "BL-1002"]}
+</code></pre>
+
+    <h3>6.3 The same verification, idiomatic in Spring Boot (Java)</h3>
+<pre><code class="language-java">// application.yml: spring.security.oauth2.resourceserver.jwt.issuer-uri
+//   = https://northwind.us.auth0.com/   (Spring auto-discovers JWKS from this)
+@Configuration
+@EnableWebSecurity
+public class SecurityConfig {
+  @Bean
+  SecurityFilterChain chain(HttpSecurity http) throws Exception {
+    http.authorizeHttpRequests(a -&gt; a
+        .requestMatchers("/shipments").hasAuthority("SCOPE_read:shipments")
+        .anyRequest().authenticated())
+      // Spring's JwtDecoder fetches /.well-known/jwks.json once and caches it,
+      // refreshing on unknown kid — the JWKS internals of §5.4, handled for you.
+      .oauth2ResourceServer(o -&gt; o.jwt(j -&gt; j.jwtAuthenticationConverter(conv())));
+    return http.build();
+  }
+  private JwtAuthenticationConverter conv() {
+    var c = new JwtAuthenticationConverter();
+    var scopes = new JwtGrantedAuthoritiesConverter(); // maps "scope" claim → SCOPE_*
+    c.setJwtGrantedAuthoritiesConverter(scopes);
+    return c;
+  }
+}
+</code></pre>
+
+    <h3>6.4 Watching the internals from the CLI</h3>
+<pre><code class="language-bash"># See the published public keys (the JWKS the verifier caches)
+curl -s https://northwind.us.auth0.com/.well-known/jwks.json | jq '.keys[] | {kid, alg, use}'
+
+# See the issuer metadata that drives discovery (jwks_uri, token_endpoint, ...)
+curl -s https://northwind.us.auth0.com/.well-known/openid-configuration | jq '{issuer, jwks_uri, token_endpoint}'
+
+# Trigger a token mint (client-credentials → runs the credentials-exchange pipeline)
+curl -s --request POST https://northwind.us.auth0.com/oauth/token \
+  --header 'content-type: application/json' \
+  --data '{"grant_type":"client_credentials","client_id":"ABC","client_secret":"S3CR3T","audience":"https://api.northwind.com"}'
+
+# Observe rate-limit internals: headers reveal the bucket state
+curl -sD - -o /dev/null https://northwind.us.auth0.com/api/v2/users \
+  -H "Authorization: Bearer $MGMT_TOKEN" | grep -i 'x-ratelimit'
+# x-ratelimit-limit: 50  /  x-ratelimit-remaining: 49  /  x-ratelimit-reset: 1718790000
+</code></pre>
+
+    <div class="callout note"><span class="tag">Note · Postman</span><p>To explore the same flow in Postman: create a request to <code>POST {{domain}}/oauth/token</code>, then in the <em>Tests</em> tab paste <code>const j = pm.response.json(); const p = JSON.parse(atob(j.access_token.split('.')[1])); console.log(p);</code> to decode and print the minted claims. Add the <code>jwks.json</code> request and inspect the response headers to watch the rate-limit bucket drain across repeated sends.</p></div>
+  </section>
+
+  <!-- ============================================================= 7 -->
+  <section id="implementation">
+    <h2>7. Practical Implementation — Instrumenting the Pipeline</h2>
+
+    <p>Knowing the internals lets you build production-grade instrumentation. Here is a React SPA that logs in, decodes the minted token to <em>prove</em> which Actions stamped which claims, and shows the silent-auth (SSO session) path.</p>
+
+<pre><code class="language-jsx">import { Auth0Provider, useAuth0 } from "@auth0/auth0-react";
+
+function App() {
+  return (
+    &lt;Auth0Provider
+      domain="northwind.us.auth0.com"
+      clientId="SPA_CLIENT_ID"
+      authorizationParams={{
+        redirect_uri: window.location.origin,
+        audience: "https://api.northwind.com",   // ask for an access_token, not just id_token
+        scope: "openid profile read:shipments",
+      }}
+      useRefreshTokens={true}        // refresh-token rotation → credentials-exchange pipeline
+      cacheLocation="localstorage"&gt;
+      &lt;Dashboard /&gt;
+    &lt;/Auth0Provider&gt;
+  );
+}
+
+function Dashboard() {
+  const { loginWithRedirect, getAccessTokenSilently, isAuthenticated } = useAuth0();
+  if (!isAuthenticated) return &lt;button onClick={() =&gt; loginWithRedirect()}&gt;Log in&lt;/button&gt;;
+
+  async function inspect() {
+    // getAccessTokenSilently uses the Auth0 SSO SESSION (cookie) to mint a fresh
+    // token WITHOUT a full login — this is the silent-auth / prompt=none path of §5.3.
+    const token = await getAccessTokenSilently();
+    const payload = JSON.parse(atob(token.split(".")[1]));
+    console.log("claims stamped by the pipeline:", payload);
+    console.log("kid that signed this token:",
+      JSON.parse(atob(token.split(".")[0])).kid);   // matches a key in JWKS
+  }
+  return &lt;button onClick={inspect}&gt;Inspect minted token&lt;/button&gt;;
+}
+</code></pre>
+
+    <p>And a Next.js (App Router) route handler that consumes the token server-side, demonstrating that verification needs only the public JWKS:</p>
+<pre><code class="language-typescript">// app/api/shipments/route.ts
+import { NextRequest, NextResponse } from "next/server";
+import { createRemoteJWKSet, jwtVerify } from "jose";
+
+// createRemoteJWKSet builds the SAME cache described in §5.4: fetch once,
+// reuse by kid, refetch on rotation — all handled by the library.
+const JWKS = createRemoteJWKSet(
+  new URL("https://northwind.us.auth0.com/.well-known/jwks.json")
+);
+
+export async function GET(req: NextRequest) {
+  const auth = req.headers.get("authorization") ?? "";
+  const token = auth.startsWith("Bearer ") ? auth.slice(7) : null;
+  if (!token) return NextResponse.json({ error: "no token" }, { status: 401 });
+  try {
+    const { payload } = await jwtVerify(token, JWKS, {
+      issuer: "https://northwind.us.auth0.com/",
+      audience: "https://api.northwind.com",
+    });
+    return NextResponse.json({ sub: payload.sub, shipments: ["BL-1001"] });
+  } catch {
+    return NextResponse.json({ error: "invalid token" }, { status: 401 });
+  }
+}
+</code></pre>
+  </section>
+
+  <!-- ============================================================= 8 -->
+  <section id="architecture">
+    <h2>8. Production Architecture — A Globally Distributed Auth Service</h2>
+
+    <p>Reasoning from first principles (not Auth0 source), here is how a planet-scale identity platform is laid out, and why each piece exists.</p>
+
+    <pre class="diagram">
+                         ┌──────────── GLOBAL ANYCAST / GeoDNS ────────────┐
+                         │  routes user to nearest healthy region          │
+                         └───────────┬───────────────────────┬────────────┘
+                  ┌──────────────────▼────────┐   ┌───────────▼─────────────────┐
+                  │  REGION us (primary)       │   │  REGION eu (active)         │
+                  │  ┌──────────────────────┐  │   │  ┌──────────────────────┐   │
+   stateless ───► │  │ Authorization servers│  │   │  │ Authorization servers│   │
+   autoscaled     │  │ (no local state)     │  │   │  │ (no local state)     │   │
+                  │  └─────────┬────────────┘  │   │  └─────────┬────────────┘   │
+                  │   ┌────────▼─────────┐      │   │   ┌────────▼─────────┐      │
+                  │   │ session/cache    │◄─────┼───┼──►│ session/cache    │      │
+                  │   │ (Redis, per-tenant)     │   │   │ (Redis)          │      │
+                  │   └────────┬─────────┘      │   │   └────────┬─────────┘      │
+                  │   ┌────────▼─────────┐      │   │   ┌────────▼─────────┐      │
+                  │   │ primary DB       │──repl┼───┼──►│ replica / regional DB   │
+                  │   │ (sharded by tenant)     │   │   │                  │      │
+                  │   └──────────────────┘      │   │   └──────────────────┘      │
+                  │   KMS/HSM: signing keys     │   │   KMS/HSM: signing keys     │
+                  └────────────────────────────┘   └─────────────────────────────┘
+                         │                                   │
+                         └──────► async LOG PIPELINE (queue → stream workers) ──► your sinks
+    </pre>
+
+    <ul>
+      <li><strong>Stateless authorization servers</strong> let any node serve any request — the prerequisite for autoscaling and zero-downtime deploys. State lives in the cache/DB tiers, not the app tier.</li>
+      <li><strong>Per-tenant DB sharding</strong> spreads load and blast radius; a hot tenant or a corrupted shard affects a subset, not everyone.</li>
+      <li><strong>Signing keys in KMS/HSM</strong> means private keys never live in application memory in plaintext; signing is delegated to hardware-backed services and keys can be rotated centrally.</li>
+      <li><strong>Region pinning</strong> keeps a tenant's data in its chosen geography (data residency for GDPR), while GeoDNS routes users to the nearest healthy region.</li>
+      <li><strong>Async log pipeline</strong> decouples user-facing latency from observability fan-out — slow sinks never slow logins.</li>
+    </ul>
+
+    <div class="callout tip"><span class="tag">Tip</span><p>For <em>your</em> production app, the architectural takeaway is twofold: (1) cache the JWKS and token verification so you never make Auth0 a hot dependency on the request path; (2) treat Auth0 as a region-pinned service and design graceful degradation (cached sessions, clear error pages) for the rare event that its region is unreachable.</p></div>
+  </section>
+
+  <!-- ============================================================= 9 -->
+  <section id="security">
+    <h2>9. Security Analysis — Attack Surface of the Internals</h2>
+
+    <table>
+      <thead><tr><th>Threat</th><th>Why the internals matter</th><th>Mitigation</th></tr></thead>
+      <tbody>
+        <tr><td><code>alg: none</code> / algorithm confusion</td><td>A naive verifier that trusts the JWT header could be tricked into skipping signature checks or treating an RSA public key as an HMAC secret.</td><td>Pin <code>algorithms=["RS256"]</code> in the verifier; never let the token choose the algorithm.</td></tr>
+        <tr><td>Key-rotation gaps</td><td>If a verifier hard-codes one key or never refetches JWKS, a legitimate rotation breaks all logins.</td><td>Cache by <code>kid</code>, refetch on unknown <code>kid</code> with rate limiting.</td></tr>
+        <tr><td>Token replay after revocation</td><td>Stateless tokens stay valid until <code>exp</code> even after dashboard revocation (§5.4 warning).</td><td>Short access-token TTLs; refresh-token rotation; denylist/introspection for high-risk actions.</td></tr>
+        <tr><td>Session fixation / CSRF on login</td><td>The login transaction and SSO cookie are state; a hijacked transaction id or missing <code>state</code> enables CSRF.</td><td>Always validate <code>state</code> and <code>nonce</code>; use PKCE; rely on Auth0's encrypted, <code>SameSite</code> cookies.</td></tr>
+        <tr><td>Tenant isolation breach</td><td>A query missing the <code>tenant_id</code> predicate could read another tenant's users.</td><td>Enforce tenant scoping at the data layer; for highest assurance use a dedicated/Private Cloud deployment.</td></tr>
+        <tr><td>Action supply chain / secrets</td><td>Actions run your code with access to <code>event</code> + secrets; a leaked npm dependency or logged secret is an exfiltration path.</td><td>Store secrets in the Action's secret store (never inline); pin dependencies; never <code>console.log</code> tokens or secrets.</td></tr>
+        <tr><td>JWKS endpoint abuse</td><td>An attacker flooding requests with unknown <code>kid</code>s tries to force constant JWKS refetches.</td><td>Rate-limit refetch on the verifier side; the publisher caches/CDN-fronts JWKS.</td></tr>
+      </tbody>
+    </table>
+
+    <div class="callout danger"><span class="tag">Danger</span><p>Never verify a token by base64-decoding the payload and trusting it (e.g., <code>atob(token.split('.')[1])</code>) on the server for authorization decisions. That reads claims <em>without checking the signature</em> — anyone can forge such a token. Decoding-without-verifying is fine for display/debugging only. Authorization must always go through full signature + <code>iss</code> + <code>aud</code> + <code>exp</code> verification.</p></div>
+  </section>
+
+  <!-- ============================================================= 10 -->
+  <section id="performance">
+    <h2>10. Performance Considerations</h2>
+
+    <ul>
+      <li><strong>Verify offline, always.</strong> The whole point of JWTs is that verification is a CPU-bound signature check (~microseconds) with no network hop. If your API calls <code>/userinfo</code> or introspection on every request, you have re-coupled to Auth0 and added tens of milliseconds plus a rate-limit risk. Reserve introspection for revocation-sensitive paths.</li>
+      <li><strong>Cache JWKS aggressively.</strong> One fetch per process per ~10 minutes is plenty. Refetch only on unknown <code>kid</code>. A library like <code>jose</code>'s <code>createRemoteJWKSet</code> or Spring's <code>NimbusJwtDecoder</code> does this correctly out of the box.</li>
+      <li><strong>Keep Actions fast.</strong> Each Action adds to login latency because they run sequentially in the pipeline. An Action that calls a slow external API delays <em>every</em> login. Cache external lookups, set tight timeouts, and prefer storing computed data in <code>app_metadata</code> over recomputing per login.</li>
+      <li><strong>Token size discipline.</strong> Every custom claim and every role inflates the JWT. Large tokens bloat every request header, can exceed proxy/header limits, and slow TLS. Put coarse roles in the token; fetch fine-grained permissions server-side when needed.</li>
+      <li><strong>Right-size TTLs.</strong> Longer access-token TTLs reduce token-mint traffic but widen the revocation window. Refresh-token rotation gives you long sessions with short access tokens — the best of both.</li>
+      <li><strong>Mind the rate-limit buckets.</strong> Batch Management API calls, cache results, and back off on <code>429</code> using <code>Retry-After</code>. Bulk operations (imports/exports) belong on jobs endpoints, not loops of single calls.</li>
+    </ul>
+
+    <div class="callout key"><span class="tag">Key</span><p>The performance golden rule of OAuth: <strong>do the expensive thing once (login + mint), do the cheap thing forever (offline verify)</strong>. Every performance problem in an Auth0 integration traces back to violating this — usually by making Auth0 a synchronous dependency on the hot path.</p></div>
+  </section>
+
+  <!-- ============================================================= 11 -->
+  <section id="mistakes">
+    <h2>11. Common Mistakes</h2>
+    <ul>
+      <li><strong>Expecting <code>post-login</code> to run on token refresh.</strong> Refresh tokens hit the <code>credentials-exchange</code> pipeline. Claims you add only in <code>post-login</code> silently vanish on the refreshed token.</li>
+      <li><strong>Adding custom claims without a namespace.</strong> Non-namespaced custom claims are dropped (OIDC reserves the bare namespace). Use a URI like <code>https://yourapp.com/roles</code>.</li>
+      <li><strong>Assuming the dashboard "revoke" instantly kills access.</strong> The access token lives until <code>exp</code>. Revocation affects refresh tokens and sessions, not already-issued JWTs.</li>
+      <li><strong>Hard-coding a single signing key.</strong> Breaks the moment Auth0 rotates keys. Always resolve by <code>kid</code> from JWKS.</li>
+      <li><strong>Calling Auth0 on every API request.</strong> Treating <code>/userinfo</code> as a per-request validation step destroys latency and burns rate limit.</li>
+      <li><strong>Logging tokens/secrets in Actions.</strong> They land in tenant logs and any connected log stream — a real breach vector.</li>
+      <li><strong>Forgetting redirect Actions execute twice.</strong> Non-idempotent side effects (charging a card, sending an email) duplicate.</li>
+      <li><strong>Ignoring 429 handling.</strong> No backoff means cascading failures under load. Honor <code>Retry-After</code>.</li>
+      <li><strong>Confusing the three session layers.</strong> "Logout" that only clears the app session leaves the SSO/IdP session, auto-logging the user back in.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================= 12 -->
+  <section id="best-practices">
+    <h2>12. Best Practices</h2>
+    <ul>
+      <li><strong>Verify locally, cache JWKS, pin algorithms.</strong> Use a battle-tested library; never roll your own JWT verifier.</li>
+      <li><strong>Namespace every custom claim</strong> and add them to <em>both</em> the access token (for APIs) and id token (for the client) as appropriate.</li>
+      <li><strong>Make Actions idempotent and fast,</strong> with timeouts on external calls and secrets in the secret store.</li>
+      <li><strong>Use refresh-token rotation</strong> with short access-token TTLs for the best security/UX balance.</li>
+      <li><strong>Configure log streams</strong> to a SIEM and alert on rate-limit hits, Action errors, and failed-login spikes.</li>
+      <li><strong>Treat Auth0 as region-pinned;</strong> design graceful degradation and clear retry UX for outages.</li>
+      <li><strong>Test the refresh path explicitly</strong> — verify claims survive <code>credentials-exchange</code>, not just initial login.</li>
+      <li><strong>Use custom domains</strong> so cookies, issuer, and JWKS all live on your brand and tokens carry a stable issuer.</li>
+      <li><strong>Right-size token contents:</strong> coarse claims in tokens, fine-grained authz server-side.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================= 13 -->
+  <section id="interview">
+    <h2>13. Interview Questions (with Model Answers)</h2>
+
+    <h3>Q1. Walk me through what happens internally when a user logs in with Auth0.</h3>
+    <p><strong>Model answer:</strong> The browser hits <code>/authorize</code>; the authorization server validates <code>client_id</code>/<code>redirect_uri</code>/scopes and creates a short-lived login transaction. Credentials are collected (locally or via a federated IdP whose assertion is signature-verified). The identity pipeline finds/creates the user and runs <code>post-login</code> Actions in order — these can deny, challenge for MFA, redirect, and add namespaced custom claims. On approval, Auth0 creates a server-side SSO session and sets an encrypted cookie. The token mint assembles standard + custom claims and signs them with the tenant's private key (selected by <code>kid</code>), producing the id/access tokens. The browser is redirected back; the API later verifies the token offline using the public JWKS. Login cost is paid once; verification is cheap forever.</p>
+
+    <h3>Q2. Why can a revoked access token still work? How do you fix it?</h3>
+    <p><strong>Model answer:</strong> Access tokens are stateless JWTs verified offline against public keys; nothing checks Auth0 at verification time, so the token is valid until <code>exp</code>. Mitigations: short TTLs, refresh-token rotation (revoking the refresh token stops renewal), and for high-risk operations a denylist or token introspection. It's a deliberate trade of instant revocation for scalability.</p>
+
+    <h3>Q3. How does JWKS key rotation work without breaking live sessions?</h3>
+    <p><strong>Model answer:</strong> Auth0 publishes the next public key <em>before</em> signing with it. Each JWT carries the signing <code>kid</code>. Verifiers cache keys by <code>kid</code> and refetch when they encounter an unknown one. During the overlap, old tokens still verify against the still-published old key until they expire; then the old key is retired. No downtime.</p>
+
+    <h3>Q4. In what order do Actions run, and what's a refresh-token gotcha?</h3>
+    <p><strong>Model answer:</strong> Within a trigger, top-to-bottom in dashboard order, sequentially. Different triggers are separate pipelines. The gotcha: refresh-token exchanges run <code>credentials-exchange</code>, not <code>post-login</code>, so claims added only in <code>post-login</code> disappear on refresh — add them in both or store them so both can read them.</p>
+
+    <h3>Q5. How would you design a multi-tenant auth service to isolate tenants at scale?</h3>
+    <p><strong>Model answer:</strong> Stateless authorization servers, all data partitioned by <code>tenant_id</code> (sharded DB), per-tenant signing keys in a KMS/HSM, per-tenant rate-limit counters in a shared fast store, and tenant scoping enforced at the lowest data layer. Logical isolation gives elasticity; offer dedicated infrastructure for customers needing physical isolation and data residency.</p>
+
+    <h3>Q6. How does Auth0 rate limiting work and how should a client behave?</h3>
+    <p><strong>Model answer:</strong> Per-tenant (and often per-endpoint-class) token-bucket counters in a shared store; exceeding them returns <code>429</code> with <code>X-RateLimit-*</code> and sometimes <code>Retry-After</code>. Clients should read those headers, back off exponentially, cache results, and use bulk/jobs endpoints instead of tight loops.</p>
+
+    <h3>Q7. Why is verifying tokens offline both a feature and a risk?</h3>
+    <p><strong>Model answer:</strong> Feature: no network hop, massive scalability, Auth0 isn't on the hot path. Risk: no real-time revocation and a dependence on correct verification (algorithm pinning, <code>aud</code>/<code>iss</code>/<code>exp</code> checks, JWKS freshness). You mitigate with short TTLs, rotation, and disciplined verifier code.</p>
+  </section>
+
+  <!-- ============================================================= 14 -->
+  <section id="certification">
+    <h2>14. Certification Tips</h2>
+    <ul>
+      <li><strong>Know the trigger names cold:</strong> <code>post-login</code>, <code>credentials-exchange</code>, <code>pre-user-registration</code>, <code>post-user-registration</code>, <code>send-phone-message</code>, <code>post-change-password</code>. Exam questions hinge on which one runs when.</li>
+      <li><strong>Actions run sequentially in dashboard order</strong> within a trigger — a frequently tested fact.</li>
+      <li><strong>Custom claims must be namespaced</strong> or they're dropped — almost guaranteed to appear.</li>
+      <li><strong>Access tokens are verified with JWKS public keys;</strong> the private key never leaves Auth0. Distinguish id token (for the client) vs access token (for APIs).</li>
+      <li><strong>Three session layers</strong> (Auth0 SSO, application, IdP) and what each logout clears.</li>
+      <li><strong>Rate limits are per-tenant;</strong> <code>429</code> + <code>X-RateLimit-*</code> headers; the Management vs Authentication API have separate limits.</li>
+      <li><strong>Revocation:</strong> revoking sessions/refresh tokens ≠ invalidating already-issued access tokens.</li>
+      <li><strong>Custom domain</strong> changes the issuer and where JWKS/cookies live — know its effects.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================= 15 -->
+  <section id="exercises">
+    <h2>15. Hands-On Exercises</h2>
+    <ol>
+      <li><strong>Decode a real token.</strong> Log into any Auth0-protected app, grab the access token, and decode all three parts. Identify the <code>kid</code> in the header and find the matching key in <code>/.well-known/jwks.json</code>.</li>
+      <li><strong>Prove offline verification.</strong> Run the FastAPI verifier from §6.2 locally, point it at your tenant, and confirm it accepts a valid token and rejects an expired one — all with your network to Auth0 blocked after the first JWKS fetch.</li>
+      <li><strong>Observe rotation.</strong> Inspect your JWKS; note how many keys are published. Reason about why there's often more than one.</li>
+      <li><strong>Trace the pipeline.</strong> Write a <code>post-login</code> Action that adds a namespaced claim and logs <code>event.transaction</code>. Log in and verify the claim appears in the token and the log line appears in the tenant logs.</li>
+      <li><strong>Break and fix the refresh gotcha.</strong> Add a claim only in <code>post-login</code>, enable refresh tokens in your SPA, refresh, and confirm the claim is missing. Then add it to <code>credentials-exchange</code> and confirm it returns.</li>
+      <li><strong>Hit a rate limit on purpose.</strong> Loop Management API calls until you get a <code>429</code>; print the <code>X-RateLimit-*</code> headers and implement exponential backoff that respects <code>Retry-After</code>.</li>
+    </ol>
+  </section>
+
+  <!-- ============================================================= 16 -->
+  <section id="assignment">
+    <h2>16. Assignment</h2>
+    <p>Build a small "Auth0 Internals Explorer" service (any stack from this course) that, given a JWT, returns a structured report:</p>
+    <ul>
+      <li>The decoded header and payload, with <strong>which claims are standard vs custom (namespaced)</strong>.</li>
+      <li>The <code>kid</code> and a confirmation that it matches a key currently in the tenant JWKS.</li>
+      <li>A full verification result (signature, <code>iss</code>, <code>aud</code>, <code>exp</code>, <code>nbf</code>), with a clear pass/fail per check.</li>
+      <li>The token's remaining lifetime and a warning if it exceeds your recommended TTL.</li>
+      <li>A JWKS cache that refetches only on unknown <code>kid</code> or TTL expiry, with a counter of how many times it actually fetched (to prove caching works).</li>
+    </ul>
+    <p>Deliverables: the service, a short README explaining each internal stage your tool surfaces, and tests for the expired-token and rotated-key cases. Bonus: add a mode that <em>intentionally</em> skips signature verification and prints a loud warning, to demonstrate the §9 "Danger" anti-pattern.</p>
+  </section>
+
+  <!-- ============================================================= 17 -->
+  <section id="mini-project">
+    <h2>17. Mini Project — "TinyAuth": Reimplement the Core Internals</h2>
+    <p>To truly understand Auth0, build a 200-line mini identity provider that mirrors the spine of this chapter. Scope:</p>
+    <ol>
+      <li><strong>Token mint:</strong> an endpoint that, given a username/password, verifies against a hashed store and mints an RS256 JWT with a <code>kid</code> in the header. Generate an RSA keypair on boot.</li>
+      <li><strong>JWKS publisher:</strong> a <code>/.well-known/jwks.json</code> endpoint exposing your public key(s) in JWK format.</li>
+      <li><strong>Pipeline:</strong> an ordered array of "actions" (functions) that run before mint and can deny or add claims — replicating §5.2.</li>
+      <li><strong>Session:</strong> set a server-side session + cookie, and a <code>/silent</code> endpoint that mints a new token if the session is valid (your <code>prompt=none</code>).</li>
+      <li><strong>Rotation:</strong> a command that adds a second key, starts signing with it, and keeps the old one in JWKS until a timer expires — then watch a separate verifier service keep working across the rotation.</li>
+      <li><strong>Rate limit:</strong> a token-bucket middleware keyed by client IP that returns <code>429</code> + <code>X-RateLimit-*</code> headers.</li>
+    </ol>
+    <p>Then write a <em>separate</em> verifier service (different process) that consumes TinyAuth tokens using only the JWKS — proving the stateless-verification model end to end. When your verifier survives a key rotation without a restart, you have internalized §5.4 forever.</p>
+    <div class="callout tip"><span class="tag">Tip</span><p>Use <code>jose</code> (Node/Python) for keypair generation, JWK export, signing, and verifying — exactly the primitives Auth0 wraps. Resist adding a database; an in-memory map keeps the focus on the <em>pipeline</em> and <em>signing</em> internals.</p></div>
+  </section>
+
+  <!-- ============================================================= 18 -->
+  <section id="quiz">
+    <h2>18. Quiz — 22 Questions</h2>
+    <ol>
+      <li>Name the six internal stages of a login transaction in order.</li>
+      <li>Why is an access token "stateless," and what is the consequence for revocation?</li>
+      <li>Which pipeline runs on a refresh-token exchange?</li>
+      <li>In what order do Actions within one trigger execute?</li>
+      <li>What is the purpose of the login transaction object, and why does it expire?</li>
+      <li>What does the <code>kid</code> in a JWT header point to?</li>
+      <li>Why must a resource server refetch JWKS when it sees an unknown <code>kid</code>?</li>
+      <li>How does key rotation avoid breaking live tokens?</li>
+      <li>Why must custom claims be namespaced?</li>
+      <li>Name the three session layers and what each is for.</li>
+      <li>What HTTP status and headers indicate rate limiting?</li>
+      <li>Are rate-limit counters shared across tenants? Why does that matter?</li>
+      <li>What delivery guarantee do log streams provide, and what design rule does that impose on consumers?</li>
+      <li>Why are authorization servers designed to be stateless?</li>
+      <li>What does logical tenant isolation mean, and how is it enforced at the data layer?</li>
+      <li>Why does a redirect Action effectively run twice?</li>
+      <li>Where are signing private keys kept, and why never in app memory plaintext?</li>
+      <li>Why is calling <code>/userinfo</code> on every API request an anti-pattern?</li>
+      <li>What two standard claims must a verifier check besides the signature and <code>exp</code>?</li>
+      <li>Why is decoding a token's payload without verifying its signature dangerous for authorization?</li>
+      <li>What is the performance golden rule of OAuth phrased in this chapter?</li>
+      <li>How does refresh-token rotation give both long sessions and fast revocation?</li>
+    </ol>
+
+    <details>
+      <summary>Show answer key</summary>
+      <ol>
+        <li>Request validation → identity pipeline (find/create user) → Actions → session creation → token mint → JWKS-based verification by the API.</li>
+        <li>It's a self-contained signed JWT verified offline; nothing checks Auth0 at verify time, so it stays valid until <code>exp</code> even after revocation.</li>
+        <li><code>credentials-exchange</code>, not <code>post-login</code>.</li>
+        <li>Sequentially, top-to-bottom in dashboard order.</li>
+        <li>It stores the original OAuth parameters so the request can resume after Universal Login / IdP redirects; it expires for security and to bound state (causing "invalid state" if idle).</li>
+        <li>The public key (by key id) in the JWKS used to verify the signature.</li>
+        <li>An unknown <code>kid</code> signals key rotation; refetching gets the newly published public key so new tokens verify.</li>
+        <li>The next key is published before it's used; old tokens verify against the still-published old key until they expire, then the old key is retired.</li>
+        <li>OIDC reserves the bare claim namespace; non-namespaced custom claims are dropped from tokens.</li>
+        <li>Auth0 SSO session (silent auth across tenant apps), application session (your app), IdP session (upstream provider).</li>
+        <li><code>429 Too Many Requests</code> with <code>X-RateLimit-Limit/Remaining/Reset</code> and sometimes <code>Retry-After</code>.</li>
+        <li>No — they're per-tenant, so a noisy neighbor can't exhaust your quota.</li>
+        <li>At-least-once delivery with retries; consumers must be idempotent (and tolerate best-effort ordering).</li>
+        <li>So any node can serve any request, enabling autoscaling and zero-downtime deploys; state lives in cache/DB tiers.</li>
+        <li>Shared infrastructure with all data partitioned by <code>tenant_id</code>; enforced by mandatory tenant scoping at the lowest data-access layer.</li>
+        <li>It pauses the pipeline, sends the user out, and resumes in a second execution when they return (<code>onContinuePostLogin</code>).</li>
+        <li>In a KMS/HSM; keeping plaintext keys in app memory risks exfiltration via memory dumps or compromised processes.</li>
+        <li>It adds a network hop and rate-limit cost to every request, recoupling your API to Auth0 on the hot path; verify offline instead.</li>
+        <li><code>iss</code> (issuer) and <code>aud</code> (audience).</li>
+        <li>Anyone can forge an unsigned payload; without signature verification you'd trust attacker-controlled claims.</li>
+        <li>"Do the expensive thing once (login + mint), do the cheap thing forever (offline verify)."</li>
+        <li>Short access-token TTLs keep the revocation window small; rotating refresh tokens give long-lived sessions while letting you cut off renewal instantly by revoking the refresh token.</li>
+      </ol>
+    </details>
+  </section>
+
+  <!-- ============================================================= 19 -->
+  <section id="cheatsheet">
+    <h2>19. Cheat Sheet</h2>
+<pre><code class="language-text">LOGIN SPINE      Request → Identity Pipeline → Actions → Session → Token Mint → JWKS verify
+TWO TRUTHS       Tokens = stateless &amp; signed (verify offline) | Sessions = stateful (server-side)
+
+PIPELINE         Sequential, dashboard order, per-trigger.
+TRIGGERS         post-login | credentials-exchange (refresh/M2M) | pre/post-user-registration
+                 send-phone-message | post-change-password
+ACTIONS API      api.access.deny() | api.idToken.setCustomClaim(ns+k, v)
+                 api.accessToken.setCustomClaim(...) | api.redirect.sendUserTo() (runs twice!)
+CLAIMS           Namespace custom claims: https://yourapp.com/roles  (bare = dropped)
+
+JWT              header{alg:RS256, kid} . payload{iss,aud,sub,exp,iat,...} . signature
+VERIFY           pin alg RS256 | check sig + iss + aud + exp/nbf | NEVER trust unverified payload
+JWKS             /.well-known/jwks.json | cache by kid | refetch on unknown kid | rotation = overlap
+
+SESSIONS         Auth0 SSO (cookie, silent auth) | App session | IdP session
+REVOCATION       Revoke session/refresh ≠ kill issued access token (valid until exp)
+
+RATE LIMIT       per-tenant token bucket | 429 + X-RateLimit-Limit/Remaining/Reset | honor Retry-After
+LOG STREAMS      async fan-out | at-least-once + retries | make consumers idempotent
+TENANCY          logical isolation, WHERE tenant_id=? everywhere | per-tenant keys &amp; counters
+
+PERF RULE        Expensive once (login+mint), cheap forever (offline verify). Never put Auth0 on hot path.
+ENDPOINTS        /authorize  /oauth/token  /userinfo  /.well-known/openid-configuration  /.well-known/jwks.json</code></pre>
+  </section>
+
+  <!-- ============================================================= 20 -->
+  <section id="takeaways">
+    <h2>20. Key Takeaways</h2>
+    <ul>
+      <li><strong>Login is "create state + sign a claim"; verification is "check the signature."</strong> Every internal subsystem is a variation on those two sentences.</li>
+      <li><strong>The pipeline is yours.</strong> Actions run sequentially per trigger, before the mint; they're where you deny, challenge, redirect, and shape namespaced claims. Know which trigger fires when — especially that refresh uses <code>credentials-exchange</code>.</li>
+      <li><strong>Tokens are stateless and verified offline</strong> via JWKS public keys — fast and scalable, but valid until <code>exp</code>, so revocation needs short TTLs, refresh rotation, or introspection.</li>
+      <li><strong>JWKS caching + overlap-based rotation</strong> let keys change with zero downtime — cache by <code>kid</code>, refetch on the unknown.</li>
+      <li><strong>Sessions are stateful</strong> across three layers; logout must target the right one(s).</li>
+      <li><strong>Multi-tenancy is the organizing principle:</strong> per-tenant data partitioning, signing keys, and rate-limit buckets, on stateless autoscaled servers across regions.</li>
+      <li><strong>The performance golden rule:</strong> pay the auth cost once, verify cheaply forever — never make Auth0 a synchronous dependency on the request path.</li>
+      <li><strong>You can prove all of this yourself</strong> by decoding real tokens, watching JWKS, and building TinyAuth. Internalize the internals and you can debug, design, and ship Auth0 like an expert.</li>
+    </ul>
+  </section>
+
+  <nav class="pager">
+    <a class="prev" href="chapter-30.html">← Previous</a>
+    <a class="next" href="chapter-32.html">Next →</a>
+  </nav>
+</main>
+<footer class="site-footer">Master Auth0 End-to-End · Chapter 31 of 32</footer>
+</body>
+</html>

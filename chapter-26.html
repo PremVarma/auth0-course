@@ -1,0 +1,775 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 26 — Project 10 — Capstone: Cinema Booking Platform | Master Auth0</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">🔐 Master Auth0</a>
+  <nav class="topnav">
+    <a href="chapter-25.html">← Prev</a>
+    <a href="index.html">Contents</a>
+    <a href="chapter-27.html">Next →</a>
+  </nav>
+</header>
+<main class="container">
+  <div class="chapter-head">
+    <span class="phase">Phase 8 · Integration Projects</span>
+    <h1>Chapter 26 — Project 10 — Capstone: Cinema Booking Platform</h1>
+    <p class="lead">This is the chapter where everything you have learned stops being a list of features and becomes a <em>system</em>. We are going to design and build <strong>CineVerse</strong>, a real cinema booking platform: customers browse showtimes and book seats from a Next.js app, staff scan tickets at the door from a mobile-friendly React app, admins manage screens and pricing from a back-office, and behind the gateway a polyglot fleet of microservices — Spring Boot, Node, and FastAPI — quietly talk to one another over HTTP and Kafka. The hard part is never "show a login button." The hard part is making <strong>one</strong> identity flow correctly across three front-ends, an API gateway, six services, a Kafka bus, and a Redis cache — with the right person allowed to do the right thing, every token verified, every seat locked exactly once, and every event carrying proof of <em>who</em> caused it. Auth0 sits at the center of all of it. By the end you will be able to draw this architecture on a whiteboard in an interview and defend every arrow.</p>
+  </div>
+
+  <!-- ============================================================= 1 -->
+  <section id="theory">
+    <h2>1. Theory — First Principles of a Multi-App, Multi-Service Identity System</h2>
+
+    <p>Up to now you have integrated Auth0 into <em>single</em> applications. A capstone is different in kind, not just degree. The moment you have more than one front-end and more than one back-end service, three new questions appear that a single app never forces you to answer:</p>
+    <ol>
+      <li><strong>Where does identity live?</strong> Each app cannot have its own user database — then "Jane" is three different people. Identity must be <em>centralized</em> in one authority (Auth0) and <em>referenced</em> everywhere by a stable identifier (the <code>sub</code> claim).</li>
+      <li><strong>How does proof of identity travel?</strong> A user authenticates once in the browser, but the <em>booking service</em> needs to know who they are, and so does the <em>payment service</em> that booking calls. Proof must propagate — as an access token on the wire, and as identity metadata on async events.</li>
+      <li><strong>Who is allowed to do what, and who decides?</strong> A customer may book a seat; only staff may mark a ticket "used"; only an admin may change prices. The decision must be expressible (RBAC permissions), enforceable at every hop (the gateway and each service), and impossible to forge (signed tokens).</li>
+    </ol>
+
+    <p>The foundational principle is the <strong>token boundary</strong>. There are exactly two kinds of token in OAuth 2.0 / OIDC, and confusing them is the most common architecture bug in junior designs:</p>
+
+    <table>
+      <thead><tr><th>Token</th><th>Format</th><th>Audience</th><th>Purpose</th><th>Who validates it</th></tr></thead>
+      <tbody>
+        <tr><td><strong>ID token</strong></td><td>JWT (OIDC)</td><td>the <em>client app</em></td><td>"who is the user" — proves a login happened</td><td>the front-end / SDK</td></tr>
+        <tr><td><strong>Access token</strong></td><td>JWT (Auth0 default)</td><td>an <em>API</em> (the <code>aud</code> claim)</td><td>"this bearer may call this API" — authorizes a request</td><td>every back-end service</td></tr>
+      </tbody>
+    </table>
+
+    <p>Rule, memorize it: <strong>ID tokens never leave the client; access tokens never decide UI.</strong> A front-end uses the ID token to render "Hi, Jane" and the access token to call the API. A back-end ignores ID tokens entirely and validates only access tokens. Every service in CineVerse is an <em>OAuth 2.0 resource server</em>: it does nothing but verify the signature, issuer, audience, expiry, and scopes/permissions of the access token it receives.</p>
+
+    <h3>The two flavors of trust</h3>
+    <p>There are two distinct trust relationships in the system, and they use two different OAuth grants:</p>
+    <ul>
+      <li><strong>User-to-service (delegated):</strong> a human logs in via the <strong>Authorization Code flow + PKCE</strong>. The token says "acting on behalf of user <code>auth0|abc</code>."</li>
+      <li><strong>Service-to-service (autonomous):</strong> the booking service calls the payment service with no human present. It uses the <strong>Client Credentials grant</strong> (M2M). The token says "I am the booking service" — there is no user.</li>
+    </ul>
+
+    <div class="callout key"><span class="tag">Key</span><p>A capstone is the discipline of keeping <em>one</em> identity (Auth0) authoritative while it flows through <em>many</em> trust boundaries. Every boundary either re-validates the token it received or mints a new token appropriate to the next hop. There is no "trusted internal network" — we assume zero trust, so even service-to-service calls carry and verify tokens.</p></div>
+  </section>
+
+  <!-- ============================================================= 2 -->
+  <section id="story">
+    <h2>2. Story-Based Explanation — A Friday Night at CineVerse</h2>
+
+    <p>It is 7:42 p.m. on a Friday. <strong>Maya</strong> opens the CineVerse customer app on her phone to book three seats for the 8:15 showing of a blockbuster. She is one of forty people doing the exact same thing this minute. Follow her identity through the system and you will understand the whole architecture.</p>
+
+    <ol>
+      <li>Maya taps <em>Log in</em>. The Next.js app redirects her to Auth0's Universal Login. She authenticates (she has an account; if not, she'd sign up here). Auth0 redirects back with an authorization code; the app exchanges it for an <strong>ID token</strong> (to greet her) and an <strong>access token</strong> scoped to the CineVerse API.</li>
+      <li>She picks seats H4, H5, H6 and taps <em>Hold</em>. The app sends the access token to the <strong>API gateway</strong>. The gateway checks the token is valid and forwards to the <strong>Booking Service</strong> (Spring Boot).</li>
+      <li>Booking calls <strong>Redis</strong>: <code>SET seat:screen3:H4 maya-lock NX EX 120</code> — "lock this seat for Maya, but only if nobody else holds it, and auto-expire in 120 seconds." Two of her three seats lock; H6 was grabbed half a second earlier by someone else. She sees H6 turn red instantly. This is the seat-lock race, and Redis settles it atomically.</li>
+      <li>Maya re-picks H7 and pays. Booking, with <em>no</em> user in the loop now, fetches an <strong>M2M token</strong> and calls the <strong>Payment Service</strong> (Node). It also publishes a Kafka event <code>booking.confirmed</code> stamped with Maya's <code>sub</code>, so downstream services know <em>whose</em> booking it was.</li>
+      <li>The <strong>Notification Service</strong> (FastAPI) consumes that event, reads the <code>sub</code>, looks up her email, and sends her tickets — each a QR code containing a signed ticket ID.</li>
+      <li>At 8:09 Maya reaches the door. <strong>Raj</strong>, an usher, logs into the <em>staff</em> app (he has the <code>staff</code> role) and scans her QR. The staff app calls Booking's <code>POST /tickets/{id}/redeem</code>. Booking checks Raj's token carries <code>redeem:tickets</code>, flips the ticket to <em>used</em>, and publishes <code>ticket.redeemed</code>. If Raj's friend tries the same QR, it's already used — denied.</li>
+      <li>Meanwhile the cinema manager, <strong>Dana</strong> (the <code>admin</code> role), is in the back-office adjusting Saturday's pricing. Her token carries <code>write:pricing</code>, which Maya's and Raj's tokens do not. Same Auth0 tenant, same login UI — three completely different sets of powers.</li>
+    </ol>
+
+    <p>One identity provider. One Maya. Six services. Three apps. Every action gated by a token, every token signed by Auth0, every event traceable to a human or a service. That is the whole game.</p>
+
+    <div class="callout note"><span class="tag">Note</span><p>Notice the two seams where things go wrong in real systems: the <em>seat race</em> (concurrency, solved by Redis) and the <em>identity-on-events</em> problem (async, solved by stamping the <code>sub</code> into the Kafka message). We will spend real time on both.</p></div>
+  </section>
+
+  <!-- ============================================================= 3 -->
+  <section id="diagrams">
+    <h2>3. ASCII Diagrams — The CineVerse Architecture</h2>
+
+    <h3>3.1 The whole system, one picture</h3>
+    <pre class="diagram">
+                         ┌──────────────────────────────────────┐
+                         │              AUTH0 TENANT             │
+                         │  Universal Login · JWKS · RBAC ·      │
+                         │  Actions · M2M apps · Organizations   │
+                         └───▲──────────▲──────────▲─────────────┘
+            login (OIDC+PKCE)│          │          │ client-credentials (M2M)
+        ┌────────────────────┘          │          └──────────────────┐
+        │                               │                             │
+ ┌──────┴──────┐  ┌────────────────┐  ┌─┴───────────┐                 │
+ │  CUSTOMER   │  │   STAFF (scan)  │  │   ADMIN     │   (browsers)    │
+ │  Next.js    │  │   React PWA     │  │   React     │                 │
+ └──────┬──────┘  └────────┬────────┘  └──────┬──────┘                 │
+        │ access token (Bearer)               │                       │
+        └─────────────┬───────────────────────┘                       │
+                      ▼                                                │
+            ┌───────────────────────┐  validates JWT (RS256)          │
+            │     API GATEWAY       │◀── JWKS from Auth0              │
+            │  authN + coarse authZ │                                 │
+            └───┬─────────┬─────────┘                                 │
+                │         │                                           │
+   ┌────────────┘   ┌─────┴──────┐   ┌─────────────┐                  │
+   ▼                ▼            ▼    ▼             ▼                  │
+┌────────┐  ┌─────────────┐  ┌─────────┐  ┌──────────────┐            │
+│Catalog │  │  Booking    │  │ Payment │  │ Notification │            │
+│FastAPI │  │ Spring Boot │  │  Node   │  │   FastAPI    │            │
+└────────┘  └──┬───────┬──┘  └────▲────┘  └──────▲───────┘            │
+               │       │M2M ──────┘              │                    │
+        Redis  │       └──────────────────────────────────────────────┘
+       (locks) ▼              KAFKA BUS  (events carry user `sub`)
+            ┌────────┐   booking.confirmed ─▶ ─▶ ─▶ ─▶ ┐
+            │ REDIS  │   ticket.redeemed   ─▶ ─▶ ─▶ ─▶ ┘
+            └────────┘
+    </pre>
+
+    <h3>3.2 The delegated (user) login flow — Authorization Code + PKCE</h3>
+    <pre class="diagram">
+ Browser (Next.js)      Auth0                 API Gateway      Booking
+      │                   │                        │              │
+      │  1. /authorize ──▶│                        │              │
+      │   (PKCE challenge) │                        │              │
+      │◀── login UI ───────│                        │              │
+      │  2. credentials ──▶│                        │              │
+      │◀── 3. code ────────│                        │              │
+      │  4. code+verifier ▶│                        │              │
+      │◀ 5. id+access tok ─│                        │              │
+      │                    │                        │              │
+      │  6. POST /bookings  Authorization: Bearer <access> ───────▶│
+      │                    │   7. verify sig via JWKS ──▶│         │
+      │                    │   8. check aud/iss/exp/perms │        │
+      │◀──────────────── 9. 201 Created ───────────────────────────│
+    </pre>
+
+    <h3>3.3 The autonomous (M2M) call — Client Credentials</h3>
+    <pre class="diagram">
+   Booking Service            Auth0 (token endpoint)        Payment Service
+        │                            │                            │
+        │ 1. POST /oauth/token       │                            │
+        │   grant=client_credentials │                            │
+        │   client_id+secret         │                            │
+        │   audience=payment-api ────▶│                            │
+        │◀──── 2. access token ───────│   (no user, sub=client)    │
+        │                            │                            │
+        │ 3. POST /charge  Bearer <m2m token> ──────────────────▶ │
+        │                            │   4. verify scope charge:create
+        │◀──────────────── 5. 200 paid ────────────────────────── │
+    </pre>
+
+    <h3>3.4 The seat-lock race in Redis</h3>
+    <pre class="diagram">
+   Maya                Booking            Redis              Other user
+    │  hold H6 ─────────▶ │                  │                    │
+    │                     │ SET seat:H6 maya │                    │
+    │                     │   NX EX 120 ────▶│                    │
+    │                     │◀── nil (taken) ──│  ◀── SET ...bob NX  │ (won 0.5s ago)
+    │◀── H6 unavailable ──│                  │                    │
+    │  hold H7 ─────────▶ │ SET seat:H7 maya │                    │
+    │                     │   NX EX 120 ────▶│                    │
+    │                     │◀── OK ───────────│                    │
+    │◀── H7 held 120s ────│                  │                    │
+    </pre>
+  </section>
+
+  <!-- ============================================================= 4 -->
+  <section id="analogy">
+    <h2>4. Real-World Analogy — The Cinema as a Building</h2>
+    <p>Forget code for a moment and picture a physical multiplex, because the architecture maps onto it one-to-one.</p>
+    <ul>
+      <li><strong>Auth0 is the box office that issues wristbands.</strong> You show ID once at one window. They give you a tamper-evident wristband (the token) printed with what you're entitled to: a customer's plain band, a staff member's "all-doors" band, a manager's master band. Nobody inside the building re-checks your ID — they check your <em>wristband</em>, because forging it is infeasible (it's cryptographically signed).</li>
+      <li><strong>The API gateway is the turnstile at the entrance.</strong> It does a fast, coarse check: is this a real wristband, not expired, issued by <em>our</em> box office? If yes, you're in the building. It does not decide which specific screen you may enter.</li>
+      <li><strong>Each microservice is a specific door</strong> (Screen 3, the projection booth, the manager's office). The door checks not just that your wristband is real, but that it grants <em>this</em> door specifically (the fine-grained permission).</li>
+      <li><strong>The Redis seat-lock is the velvet rope a host throws over a seat</strong> the instant you say "I'll take it" — held for two minutes, then released if you don't show your ticket.</li>
+      <li><strong>Kafka is the staff radio network.</strong> When a booking confirms, a message goes out over the radio — "row H, screen 3, booked by guest #4471" — and every relevant department (concessions, ushers, the email desk) hears it. The radio call always says <em>who</em> it's about, so departments don't have to ask.</li>
+      <li><strong>M2M tokens are the internal staff keycards.</strong> When the booking desk phones the payment desk, the payment desk doesn't ask "which customer?" — it verifies the <em>caller is the booking desk</em> via its keycard.</li>
+    </ul>
+    <p>The whole reason this building works at scale is that <em>identity is established once at the door and trusted everywhere via an unforgeable token</em>. That is exactly what Auth0 gives a distributed system.</p>
+  </section>
+
+  <!-- ============================================================= 5 -->
+  <section id="internal">
+    <h2>5. Internal Working — How a Request Is Actually Authorized</h2>
+
+    <p>Let's trace, mechanically, what happens when a service receives <code>Authorization: Bearer eyJ...</code>. There is no magic; it is five deterministic checks.</p>
+
+    <h3>5.1 Anatomy of the access token</h3>
+    <pre><code class="language-json">// Decoded payload of a CineVerse access token (RS256-signed JWT)
+{
+  "iss": "https://cineverse.eu.auth0.com/",   // issuer — must be OUR tenant
+  "sub": "auth0|6612ab...",                     // the stable user id
+  "aud": ["https://api.cineverse.com"],         // audience — must be OUR api
+  "iat": 1718800000,
+  "exp": 1718803600,                            // expiry — must be in the future
+  "azp": "Cust0merAppClientId",                 // authorized party (the client)
+  "scope": "openid profile book:seats",
+  "permissions": ["book:seats", "read:bookings"], // RBAC permissions (Auth0)
+  "https://cineverse.com/roles": ["customer"]   // custom claim added by an Action
+}</code></pre>
+
+    <h3>5.2 The five validation steps every service performs</h3>
+    <pre class="diagram">
+   incoming JWT
+        │
+        ▼
+   ┌──────────────────────────────────────────────────────────┐
+   │ 1. SIGNATURE  fetch JWKS (cached), pick key by `kid`,     │
+   │               verify RS256 signature → not forged         │
+   │ 2. ISSUER     iss == https://cineverse.eu.auth0.com/      │
+   │ 3. AUDIENCE   aud contains https://api.cineverse.com      │
+   │ 4. EXPIRY     exp > now  (and nbf <= now if present)       │
+   │ 5. AUTHZ      required permission ∈ token.permissions      │
+   └──────────────────────────────────────────────────────────┘
+        │ all pass                       │ any fail
+        ▼                                ▼
+   handle request (sub is trusted)   401 (1-4) / 403 (5)
+    </pre>
+
+    <p>Steps 1–4 are <strong>authentication</strong> (is this a genuine, current token for us?). Step 5 is <strong>authorization</strong> (may this specific token do this specific thing?). A failure in 1–4 is a <code>401 Unauthorized</code>; a failure in 5 is a <code>403 Forbidden</code>. Getting that distinction right is a classic interview tell.</p>
+
+    <h3>5.3 Why JWKS instead of a shared secret?</h3>
+    <p>Auth0 signs tokens with an RSA <em>private</em> key it never shares. Services verify with the matching <em>public</em> key, published at <code>https://your-tenant/.well-known/jwks.json</code>. This is asymmetric (RS256), and it's the right choice for a distributed system: a leaked verification key cannot mint tokens, and key rotation is automatic (services pick the new key by its <code>kid</code> header). Never use HS256 (shared secret) across multiple services — one compromised service can then forge tokens for all of them.</p>
+
+    <div class="callout warn"><span class="tag">Warn</span><p>Always pin both <code>iss</code> <em>and</em> <code>aud</code>. A token validly signed by your tenant but minted for a <em>different</em> API (different <code>aud</code>) must be rejected — otherwise a token meant for your low-privilege analytics API could be replayed against your high-privilege booking API. This is the "confused deputy" / audience-confusion attack.</p></div>
+  </section>
+
+  <!-- ============================================================= 6 -->
+  <section id="walkthrough">
+    <h2>6. Code Walkthrough — Identity End to End</h2>
+
+    <h3>6.1 Customer front-end — Next.js App Router</h3>
+    <pre><code class="language-bash"># .env.local — the customer app
+AUTH0_SECRET=&lt;openssl rand -hex 32&gt;
+AUTH0_BASE_URL=https://app.cineverse.com
+AUTH0_ISSUER_BASE_URL=https://cineverse.eu.auth0.com
+AUTH0_CLIENT_ID=Cust0merAppClientId
+AUTH0_CLIENT_SECRET=&lt;secret&gt;
+AUTH0_AUDIENCE=https://api.cineverse.com        # so we get an API access token
+AUTH0_SCOPE="openid profile email book:seats read:bookings"</code></pre>
+
+    <pre><code class="language-ts">// app/api/bookings/route.ts — server route that calls the gateway WITH the token
+import { getAccessToken } from '@auth0/nextjs-auth0';
+
+export async function POST(req: Request) {
+  // getAccessToken returns the API access token (aud = cineverse api),
+  // refreshing it via the refresh token if it has expired.
+  const { accessToken } = await getAccessToken({
+    authorizationParams: { audience: process.env.AUTH0_AUDIENCE },
+  });
+
+  const body = await req.json();
+  const res = await fetch('https://gw.cineverse.com/bookings', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${accessToken}`,   // delegated user token
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(body),
+  });
+  return new Response(await res.text(), { status: res.status });
+}</code></pre>
+
+    <div class="callout tip"><span class="tag">Tip</span><p>The access token is obtained and attached on the <em>server</em> side of Next.js, never exposed to the browser JavaScript. The browser holds only an encrypted, http-only session cookie. This is the single most important front-end security decision: tokens never touch <code>localStorage</code>.</p></div>
+
+    <h3>6.2 Booking Service — Spring Boot resource server</h3>
+    <pre><code class="language-yaml"># application.yml — Spring Security validates the JWT for us
+spring:
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: https://cineverse.eu.auth0.com/
+          audiences: https://api.cineverse.com    # enforce aud (Spring Boot 3.4+)</code></pre>
+
+    <pre><code class="language-java">// SecurityConfig.java — map Auth0 "permissions" claim to Spring authorities
+@Configuration
+@EnableMethodSecurity   // turns on @PreAuthorize
+public class SecurityConfig {
+
+  @Bean
+  SecurityFilterChain api(HttpSecurity http) throws Exception {
+    http.authorizeHttpRequests(a -> a.anyRequest().authenticated())
+        .oauth2ResourceServer(o -> o.jwt(j ->
+            j.jwtAuthenticationConverter(converter())));
+    return http.build();
+  }
+
+  // Auth0 puts RBAC in a "permissions" array, not "scope". Map it.
+  private JwtAuthenticationConverter converter() {
+    var perms = new JwtGrantedAuthoritiesConverter();
+    perms.setAuthoritiesClaimName("permissions");
+    perms.setAuthorityPrefix("");                 // use raw "book:seats"
+    var conv = new JwtAuthenticationConverter();
+    conv.setJwtGrantedAuthoritiesConverter(perms);
+    return conv;
+  }
+}</code></pre>
+
+    <pre><code class="language-java">// BookingController.java — fine-grained authz + identity from the token
+@RestController
+@RequestMapping("/bookings")
+public class BookingController {
+
+  private final BookingService bookings;
+  BookingController(BookingService b) { this.bookings = b; }
+
+  @PostMapping
+  @PreAuthorize("hasAuthority('book:seats')")     // step 5: RBAC
+  public ResponseEntity&lt;BookingDto&gt; create(
+        @AuthenticationPrincipal Jwt jwt,          // the verified token
+        @RequestBody BookSeatsRequest req) {
+
+    String userSub = jwt.getSubject();             // trusted: "auth0|6612ab"
+    BookingDto dto = bookings.book(userSub, req);  // sub is the owner
+    return ResponseEntity.status(201).body(dto);
+  }
+
+  @PostMapping("/tickets/{id}/redeem")
+  @PreAuthorize("hasAuthority('redeem:tickets')")  // ONLY staff have this
+  public TicketDto redeem(@PathVariable String id,
+                          @AuthenticationPrincipal Jwt jwt) {
+    return bookings.redeem(id, jwt.getSubject());
+  }
+}</code></pre>
+
+    <h3>6.3 The Redis seat lock (atomic, expiring)</h3>
+    <pre><code class="language-java">// SeatLockService.java — one atomic SET NX EX per seat
+@Service
+public class SeatLockService {
+  private final StringRedisTemplate redis;
+  SeatLockService(StringRedisTemplate r) { this.redis = r; }
+
+  /** returns true only if WE won the lock for this seat */
+  public boolean tryLock(String screen, String seat, String userSub) {
+    String key = "seat:" + screen + ":" + seat;
+    Boolean won = redis.opsForValue()
+        .setIfAbsent(key, userSub, Duration.ofSeconds(120)); // SET k v NX EX 120
+    return Boolean.TRUE.equals(won);
+  }
+
+  /** release only if WE still own it — Lua makes check+del atomic */
+  private static final String UNLOCK =
+    "if redis.call('get',KEYS[1])==ARGV[1] then return redis.call('del',KEYS[1]) else return 0 end";
+
+  public void release(String screen, String seat, String userSub) {
+    redis.execute(new DefaultRedisScript&lt;&gt;(UNLOCK, Long.class),
+        List.of("seat:" + screen + ":" + seat), userSub);
+  }
+}</code></pre>
+
+    <h3>6.4 M2M call — Booking → Payment (Client Credentials)</h3>
+    <pre><code class="language-java">// PaymentClient.java — fetch an M2M token, cache it, call Payment
+@Component
+public class PaymentClient {
+  private final WebClient http = WebClient.create();
+  private volatile String cachedToken; private volatile Instant expiry = Instant.MIN;
+
+  private synchronized String token() {
+    if (Instant.now().isBefore(expiry.minusSeconds(60))) return cachedToken; // reuse
+    var resp = http.post().uri("https://cineverse.eu.auth0.com/oauth/token")
+       .bodyValue(Map.of(
+          "grant_type", "client_credentials",
+          "client_id", System.getenv("M2M_CLIENT_ID"),
+          "client_secret", System.getenv("M2M_CLIENT_SECRET"),
+          "audience", "https://payments.cineverse.com"))    // Payment's audience
+       .retrieve().bodyToMono(TokenResp.class).block();
+    cachedToken = resp.access_token();
+    expiry = Instant.now().plusSeconds(resp.expires_in());
+    return cachedToken;
+  }
+
+  public ChargeResult charge(String bookingId, long amountCents) {
+    return http.post().uri("https://payments.cineverse.com/charge")
+       .header("Authorization", "Bearer " + token())          // M2M, no user
+       .bodyValue(Map.of("bookingId", bookingId, "amount", amountCents))
+       .retrieve().bodyToMono(ChargeResult.class).block();
+  }
+}</code></pre>
+
+    <h3>6.5 Payment Service — Node (Express) resource server</h3>
+    <pre><code class="language-js">// payment/index.js — validate the M2M token, require scope charge:create
+import express from 'express';
+import { auth, requiredScopes } from 'express-oauth2-jwt-bearer';
+
+const app = express();
+app.use(express.json());
+
+const checkJwt = auth({
+  issuerBaseURL: 'https://cineverse.eu.auth0.com/',
+  audience: 'https://payments.cineverse.com',   // THIS api's audience
+});
+
+app.post('/charge', checkJwt, requiredScopes('charge:create'), (req, res) => {
+  // req.auth.payload.sub here is the BOOKING SERVICE's client id, not a user.
+  const charge = chargeCard(req.body.bookingId, req.body.amount);
+  res.json(charge);
+});
+
+app.listen(8082);</code></pre>
+
+    <h3>6.6 Notification Service — FastAPI consumer reading identity off the event</h3>
+    <pre><code class="language-python"># notify/consumer.py — Kafka consumer; identity rides on the message
+from aiokafka import AIOKafkaConsumer
+import json, asyncio
+
+async def run():
+    consumer = AIOKafkaConsumer(
+        "booking.confirmed",
+        bootstrap_servers="kafka:9092",
+        group_id="notification-service",
+        value_deserializer=lambda b: json.loads(b.decode()),
+    )
+    await consumer.start()
+    try:
+        async for msg in consumer:
+            evt = msg.value
+            user_sub = evt["actor"]["sub"]      # WHO caused this (propagated)
+            email = await lookup_email(user_sub)  # Auth0 Mgmt API or local cache
+            await send_tickets(email, evt["bookingId"], evt["seats"])
+    finally:
+        await consumer.stop()</code></pre>
+
+    <h3>6.7 The Action that injects roles into the token</h3>
+    <pre><code class="language-js">// Auth0 Action (Login flow) — add roles + a stable custom claim
+exports.onExecutePostLogin = async (event, api) => {
+  const ns = 'https://cineverse.com/';
+  const roles = event.authorization?.roles || [];
+  api.accessToken.setCustomClaim(`${ns}roles`, roles);
+  api.idToken.setCustomClaim(`${ns}roles`, roles);
+  // tighten: never let a customer self-assign staff perms
+  if (roles.includes('admin')) {
+    api.accessToken.setCustomClaim(`${ns}tenant_admin`, true);
+  }
+};</code></pre>
+  </section>
+
+  <!-- ============================================================= 7 -->
+  <section id="practical">
+    <h2>7. Practical Implementation — Wiring the Tenant</h2>
+    <p>Here is the exact Auth0 object model you create in the dashboard (or via the Management API / Terraform) before any code runs. Doing this in the right order saves hours of "invalid audience" debugging.</p>
+
+    <ol>
+      <li><strong>Create the API</strong> (Applications → APIs). Identifier (audience): <code>https://api.cineverse.com</code>. Signing: RS256. Enable <em>RBAC</em> and <em>Add Permissions in the Access Token</em>.</li>
+      <li><strong>Define permissions</strong> on that API: <code>book:seats</code>, <code>read:bookings</code>, <code>cancel:bookings</code>, <code>redeem:tickets</code>, <code>read:schedule</code>, <code>write:pricing</code>, <code>manage:screens</code>.</li>
+      <li><strong>Create roles</strong> (User Management → Roles) and attach permissions:
+        <ul>
+          <li><code>customer</code> → <code>book:seats</code>, <code>read:bookings</code>, <code>cancel:bookings</code></li>
+          <li><code>staff</code> → <code>redeem:tickets</code>, <code>read:schedule</code></li>
+          <li><code>admin</code> → all of the above + <code>write:pricing</code>, <code>manage:screens</code></li>
+        </ul>
+      </li>
+      <li><strong>Create three SPA/Regular Web Apps</strong> (customer Next.js = Regular Web App; staff + admin = SPA or Regular). Set callback/logout URLs. Authorization Code + PKCE.</li>
+      <li><strong>Create a second API</strong> for payments: <code>https://payments.cineverse.com</code> with permission <code>charge:create</code> and a refund permission.</li>
+      <li><strong>Create M2M applications:</strong> a "Booking→Payment" machine app, authorized for the Payments API with <code>charge:create</code>. Repeat for any other service-to-service edge.</li>
+      <li><strong>Add the post-login Action</strong> (section 6.7) and deploy it to the Login flow.</li>
+      <li><strong>(Optional, B2B)</strong> If each cinema chain is a separate tenant-within-tenant, enable <strong>Organizations</strong> and require <code>organization</code> on login so a token is scoped to one chain.</li>
+    </ol>
+
+    <pre><code class="language-bash"># Smoke-test the M2M edge from your laptop before writing Java
+curl -s --request POST \
+  --url https://cineverse.eu.auth0.com/oauth/token \
+  --header 'content-type: application/json' \
+  --data '{
+    "grant_type":"client_credentials",
+    "client_id":"'$M2M_ID'",
+    "client_secret":"'$M2M_SECRET'",
+    "audience":"https://payments.cineverse.com"
+  }'
+# → { "access_token":"eyJ...", "expires_in":86400, "token_type":"Bearer" }
+# Decode it on jwt.io: confirm aud=payments and the scope/permissions claim.</code></pre>
+
+    <div class="callout tip"><span class="tag">Tip</span><p>Assign a new customer the <code>customer</code> role automatically with a second Action on the <em>pre/post user registration</em> flow, or via a Management-API call from your signup webhook. Never make role assignment a manual step for self-service signups.</p></div>
+  </section>
+
+  <!-- ============================================================= 8 -->
+  <section id="production">
+    <h2>8. Production Architecture — Hardening for Real Traffic</h2>
+
+    <h3>8.1 Refresh-token strategy</h3>
+    <p>Customers should not be bounced to login mid-booking. Use <strong>refresh token rotation</strong> with automatic reuse detection: every refresh issues a new refresh token and invalidates the old; if an old one is replayed, Auth0 revokes the whole family (a stolen token is detected and killed). For the customer web app, refresh tokens live encrypted server-side in the session; for native/PWA staff scanners, store them in secure OS storage, never in JS-readable storage.</p>
+
+    <h3>8.2 Where each check lives</h3>
+    <pre class="diagram">
+   GATEWAY          → coarse: valid token? right issuer/audience? (401)
+   SERVICE          → fine:   does token carry THIS permission?   (403)
+   DOMAIN LOGIC     → ownership: is sub the OWNER of this booking? (403)
+    </pre>
+    <p>The gateway should not be the only place you check — it's a defense-in-depth layer, not the authority. Each service re-validates the token (JWKS is cached locally) and enforces its own permissions, because a misconfigured gateway must not become a single point of bypass. The <em>third</em> layer is the one juniors forget: even with <code>read:bookings</code>, Jane must not read <em>Bob's</em> booking. That is an <strong>object-level</strong> check (the dreaded OWASP API #1, BOLA) that only your domain code can do, because only it knows who owns the row.</p>
+
+    <h3>8.3 Identity propagation on Kafka</h3>
+    <p>Async events lose the HTTP request context, so identity must be put <em>into</em> the message. Two patterns:</p>
+    <ul>
+      <li><strong>Claims in the payload</strong> (simplest): include <code>actor: { sub, roles }</code> in the event body. Good enough when producers are trusted services inside your boundary.</li>
+      <li><strong>Signed token in a header</strong> (strongest): attach the short-lived access token (or a dedicated event JWT) as a Kafka header so consumers can <em>verify</em> it, not just trust it. Use when the bus crosses trust boundaries.</li>
+    </ul>
+
+    <h3>8.4 JWKS caching and resilience</h3>
+    <p>Cache the JWKS in every service (TTL ~10 min) and refresh on an unknown <code>kid</code>. If Auth0 is briefly unreachable, services keep validating with the cached keys — login stops, but in-flight requests with valid tokens still work. Set sensible token lifetimes: short access tokens (e.g. 1 hour) limit blast radius; longer-lived refresh tokens keep UX smooth.</p>
+
+    <h3>8.5 Deployment shape</h3>
+    <pre class="diagram">
+   [ CDN ]──static──▶ Next.js / React builds
+   [ WAF/Ingress ]──▶ [ API Gateway pods (HPA) ]
+                          ├─▶ Catalog (FastAPI)  ─ stateless, scale on RPS
+                          ├─▶ Booking (Spring)   ─ scale on RPS; talks Redis+Kafka
+                          ├─▶ Payment (Node)     ─ PCI-scoped, isolated namespace
+                          └─▶ Notification(Fast) ─ Kafka consumer group, scale on lag
+   [ Redis (clustered, AOF) ]   [ Kafka (3+ brokers, RF=3) ]   [ Postgres per svc ]
+    </pre>
+  </section>
+
+  <!-- ============================================================= 9 -->
+  <section id="security">
+    <h2>9. Security Analysis — Threats and Mitigations</h2>
+    <table>
+      <thead><tr><th>Threat</th><th>How it manifests in CineVerse</th><th>Mitigation</th></tr></thead>
+      <tbody>
+        <tr><td>Token theft (XSS)</td><td>Attacker reads access token from <code>localStorage</code></td><td>Never store tokens in JS storage; http-only encrypted cookies; strict CSP</td></tr>
+        <tr><td>Audience confusion</td><td>Token for Catalog API replayed against Booking API</td><td>Every service pins <code>aud</code> to its own identifier</td></tr>
+        <tr><td>Privilege escalation</td><td>Customer calls <code>/redeem</code> or <code>/pricing</code></td><td>Per-endpoint permission checks; RBAC roles; never trust client-sent roles</td></tr>
+        <tr><td>BOLA (object-level)</td><td>Jane requests <code>GET /bookings/&lt;Bob's id&gt;</code></td><td>Ownership check: row.owner == jwt.sub before returning</td></tr>
+        <tr><td>Replay of a QR ticket</td><td>Same ticket scanned twice</td><td>Atomic state flip to <em>used</em>; idempotent redeem; signed ticket id</td></tr>
+        <tr><td>Double-booking a seat</td><td>Two users confirm the same seat</td><td>Redis <code>SET NX</code> lock + DB unique constraint on (showing, seat)</td></tr>
+        <tr><td>M2M secret leak</td><td>Booking's client secret exposed in a repo</td><td>Secrets manager, short rotation, separate M2M app per edge (blast radius)</td></tr>
+        <tr><td>Refresh-token theft</td><td>Stolen refresh token used elsewhere</td><td>Rotation + reuse detection auto-revokes the token family</td></tr>
+        <tr><td>Forged events</td><td>Rogue producer publishes <code>ticket.redeemed</code></td><td>Network policy on Kafka; signed-token header on cross-boundary events</td></tr>
+        <tr><td>HS256 cross-service forgery</td><td>One compromised service mints tokens for all</td><td>Use RS256 (asymmetric) — services hold only public keys</td></tr>
+      </tbody>
+    </table>
+
+    <div class="callout danger"><span class="tag">Danger</span><p>The two most expensive bugs in a system like this are <strong>BOLA</strong> (returning someone else's booking because you only checked "is logged in") and <strong>double-charging</strong> (no idempotency key on the payment call). Both pass every "happy path" test. Test the adversarial path: another user's id, a duplicated request, a replayed token.</p></div>
+  </section>
+
+  <!-- ============================================================= 10 -->
+  <section id="performance">
+    <h2>10. Performance Considerations</h2>
+    <ul>
+      <li><strong>Validate tokens locally, not over the network.</strong> RS256 verification against a cached JWKS is microseconds. Never call Auth0 per request to "check" a token — that adds latency and a hard dependency. JWTs are self-contained on purpose.</li>
+      <li><strong>Cache the M2M token.</strong> Client-credentials tokens are valid for hours. Fetching one per outbound call would hammer the token endpoint and hit rate limits. Cache it and refresh ~60s before expiry (section 6.4).</li>
+      <li><strong>Keep tokens lean.</strong> Every claim adds bytes to every request header. Put only what services need (permissions, a roles claim). Don't dump the whole user profile into the token.</li>
+      <li><strong>Redis for hot, ephemeral state.</strong> Seat locks and session lookups are sub-millisecond. Use short TTLs so abandoned holds free themselves with no cleanup job.</li>
+      <li><strong>Kafka decouples slow work.</strong> Sending a ticket email takes seconds; doing it inline would block the booking response. Publishing an event returns in ~1ms and lets Notification scale independently on consumer lag.</li>
+      <li><strong>Connection pooling to Auth0.</strong> Reuse HTTP clients for the token endpoint and JWKS; cold TLS handshakes dominate otherwise.</li>
+      <li><strong>Right-size token lifetime.</strong> Too short = constant refresh round-trips; too long = larger theft window. One hour for access tokens is a sane default.</li>
+    </ul>
+    <div class="callout note"><span class="tag">Note</span><p>The single biggest perf mistake teams make with Auth0 is treating token validation like a remote call. It is not — that's the whole point of a signed, stateless JWT. The only network calls should be: login (once), refresh (occasionally), JWKS fetch (rarely, cached), and M2M token fetch (hourly, cached).</p></div>
+  </section>
+
+  <!-- ============================================================= 11 -->
+  <section id="mistakes">
+    <h2>11. Common Mistakes</h2>
+    <ul>
+      <li><strong>Using the ID token to call APIs.</strong> The ID token's <code>aud</code> is the client, not your API; services will reject it. Always request and send the <em>access</em> token (set <code>audience</code> at login).</li>
+      <li><strong>Forgetting to enable RBAC / "add permissions to access token"</strong> on the API — then the <code>permissions</code> claim is missing and every <code>@PreAuthorize</code> denies.</li>
+      <li><strong>Trusting roles sent by the client.</strong> A front-end can lie. Roles must come from the signed token (injected by an Action), never from a request body or header.</li>
+      <li><strong>Skipping the ownership check</strong> (BOLA). "Authenticated" is not "authorized to see <em>this</em> object."</li>
+      <li><strong>No idempotency on payment.</strong> A retried request double-charges. Pass an idempotency key.</li>
+      <li><strong>Releasing a Redis lock without ownership check.</strong> A naive <code>DEL</code> can delete a lock another user just acquired; use the Lua compare-and-delete (section 6.3).</li>
+      <li><strong>HS256 across services.</strong> Shared secret = any service can forge tokens. Use RS256.</li>
+      <li><strong>Tokens in <code>localStorage</code>.</strong> One XSS and the attacker has the user's session.</li>
+      <li><strong>Dropping identity at the Kafka boundary.</strong> Consumers can't answer "who did this?" because the producer didn't stamp the <code>sub</code>.</li>
+      <li><strong>One M2M app for everything.</strong> Leak it once and every service edge is compromised. One app per edge.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================= 12 -->
+  <section id="bestpractices">
+    <h2>12. Best Practices</h2>
+    <ul>
+      <li><strong>One identity authority.</strong> Auth0 owns identity; services own data. The only user key services store is the <code>sub</code>.</li>
+      <li><strong>Zero trust internally.</strong> Every hop validates a token, including service-to-service. There is no "safe" internal network.</li>
+      <li><strong>Least privilege per token.</strong> Customers get customer perms, staff get staff perms, each M2M app gets exactly one API's scopes.</li>
+      <li><strong>Defense in depth:</strong> coarse check at the gateway, fine check at the service, ownership check in domain logic.</li>
+      <li><strong>RS256 + JWKS + caching</strong> everywhere; pin <code>iss</code> and <code>aud</code>.</li>
+      <li><strong>Refresh-token rotation with reuse detection.</strong></li>
+      <li><strong>Stamp identity onto events</strong> so the async world stays traceable and auditable.</li>
+      <li><strong>Idempotency keys</strong> on every mutating, money-touching, or non-replayable operation.</li>
+      <li><strong>Externalize config</strong> (issuer, audience, secrets) — never hard-code; manage secrets in a vault.</li>
+      <li><strong>Infrastructure as code:</strong> define APIs, roles, permissions, and M2M apps in Terraform/Deploy-CLI so the tenant is reproducible and reviewable.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================= 13 -->
+  <section id="interview">
+    <h2>13. Interview Questions (with model answers)</h2>
+
+    <h3>Q1. Walk me through how a single user identity flows from the browser to a downstream payment service.</h3>
+    <p><strong>Model answer:</strong> The browser does Authorization Code + PKCE with Auth0 and receives an ID token (for UI) and an access token whose <code>aud</code> is our API. The app sends only the access token to the gateway. The gateway and the Booking service each verify it (signature via JWKS, <code>iss</code>, <code>aud</code>, <code>exp</code>, and the required permission). Booking then needs to call Payment with no user present, so it uses the <em>Client Credentials</em> grant to get an M2M token whose <code>aud</code> is the Payments API, and calls Payment with that. The user's identity (<code>sub</code>) is carried forward in the booking record and stamped onto the Kafka event, so even async consumers know who acted. Two grant types, two audiences, one identity authority.</p>
+
+    <h3>Q2. Why not validate tokens by calling Auth0 on every request?</h3>
+    <p><strong>Model answer:</strong> JWTs are self-contained and signed; you verify them locally with the cached public key in microseconds. Calling Auth0 per request adds latency, creates a hard runtime dependency on the IdP, and will hit rate limits. The only remote calls should be login, occasional refresh, the rarely-refreshed JWKS fetch, and the hourly M2M token fetch.</p>
+
+    <h3>Q3. A customer's token is valid and has <code>read:bookings</code>. They request another customer's booking. What happens?</h3>
+    <p><strong>Model answer:</strong> If you only checked the permission, you'd leak it — that's BOLA (OWASP API #1). The permission grants the <em>ability</em> to read bookings in general; it does not grant access to a <em>specific</em> object. Domain logic must compare the row's owner to <code>jwt.sub</code> and return 403/404 if they differ. Authentication, then permission, then ownership.</p>
+
+    <h3>Q4. How do you prevent two users from booking the same seat under load?</h3>
+    <p><strong>Model answer:</strong> Two layers. First, an atomic Redis <code>SET seat NX EX 120</code> as a short hold — only one caller wins, and abandoned holds expire on their own. Second, a database unique constraint on <code>(showing_id, seat)</code> as the durable source of truth, so even if Redis fails, the DB rejects the second confirm. The lock is for UX (instant feedback); the constraint is for correctness.</p>
+
+    <h3>Q5. Why RS256 over HS256 in a microservices system?</h3>
+    <p><strong>Model answer:</strong> HS256 is symmetric — every verifier needs the signing secret, so any compromised service can forge tokens for all. RS256 is asymmetric: Auth0 signs with a private key it never shares; services verify with the public key from JWKS. A leaked verification key can't mint tokens, and rotation is automatic via the <code>kid</code> header.</p>
+
+    <h3>Q6. How does identity survive an async Kafka boundary?</h3>
+    <p><strong>Model answer:</strong> HTTP request context is gone, so the producer must put identity <em>into</em> the message — minimally an <code>actor.sub</code> field, or, across trust boundaries, a signed token in a Kafka header that consumers verify. Otherwise consumers can't audit or authorize, and "who did this?" becomes unanswerable.</p>
+
+    <h3>Q7. Where would you enforce that only staff can redeem tickets?</h3>
+    <p><strong>Model answer:</strong> The <code>redeem:tickets</code> permission belongs only to the <code>staff</code> and <code>admin</code> roles in Auth0, so it never appears in a customer's token. The Booking endpoint declares <code>@PreAuthorize("hasAuthority('redeem:tickets')")</code>. Even if a customer crafts a request, their token lacks the permission and gets a 403. The gateway can pre-filter too, but the service is the authority.</p>
+  </section>
+
+  <!-- ============================================================= 14 -->
+  <section id="certification">
+    <h2>14. Certification Tips</h2>
+    <ul>
+      <li><strong>Know ID vs access token cold.</strong> The exam loves "which token calls an API?" — always the access token; the ID token authenticates the user to the client.</li>
+      <li><strong>Client Credentials = no user.</strong> Expect questions on which grant a backend job uses (Client Credentials) vs an interactive web app (Authorization Code + PKCE).</li>
+      <li><strong>RBAC switches:</strong> remember you must enable RBAC <em>and</em> "Add Permissions in the Access Token" on the API for the <code>permissions</code> claim to appear.</li>
+      <li><strong>Actions vs Rules/Hooks:</strong> Actions are the current extensibility model; know that custom claims must be namespaced (a URL prefix) or Auth0 strips them.</li>
+      <li><strong>Refresh token rotation + reuse detection</strong> is the recommended SPA/native pattern — be ready to name it.</li>
+      <li><strong>Audience is mandatory</strong> to receive a JWT access token for your API; without it you get an opaque token. Common exam trap.</li>
+      <li><strong>Organizations</strong> are the B2B construct for isolating multiple business customers in one tenant — recognize the use case.</li>
+      <li><strong>JWKS / RS256</strong> is the default and recommended signing algorithm; know the public/private split.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================= 15 -->
+  <section id="handson">
+    <h2>15. Hands-On Exercises</h2>
+    <ol>
+      <li><strong>Tenant setup.</strong> Create the CineVerse API, three permissions minimum, and the three roles from section 7. Verify in the Roles UI.</li>
+      <li><strong>Get a real token.</strong> Log in via the customer app (or the Auth0 "Test" tab) and decode the access token on jwt.io. Confirm <code>aud</code>, <code>permissions</code>, and your namespaced roles claim are present.</li>
+      <li><strong>Break it on purpose.</strong> Call the Booking service with (a) no token, (b) an expired token, (c) a token for a different API's audience, (d) a customer token against <code>/redeem</code>. Confirm you get 401, 401, 401, 403 respectively.</li>
+      <li><strong>M2M edge.</strong> Use the curl in section 7 to fetch an M2M token for the Payments API, then call <code>/charge</code> with it. Then call <code>/charge</code> with a <em>user</em> token and confirm it's rejected (wrong audience / missing scope).</li>
+      <li><strong>Seat race.</strong> Fire two concurrent <code>hold</code> requests for the same seat (e.g. with <code>hey</code> or two terminals). Confirm exactly one wins and the loser gets "unavailable."</li>
+      <li><strong>Identity on events.</strong> Confirm a booking via the API, then inspect the <code>booking.confirmed</code> Kafka message and verify the <code>actor.sub</code> matches the booking user.</li>
+    </ol>
+  </section>
+
+  <!-- ============================================================= 16 -->
+  <section id="assignment">
+    <h2>16. Assignment</h2>
+    <p>Extend CineVerse with a <strong>refund</strong> capability and document the identity flow end to end.</p>
+    <ol>
+      <li>Add a <code>refund:bookings</code> permission; grant it to <code>admin</code> only.</li>
+      <li>Add an admin endpoint <code>POST /bookings/{id}/refund</code> guarded by that permission <em>and</em> an ownership/authority check that the booking exists and is refundable.</li>
+      <li>Have it call the Payment service's <code>/refund</code> via a <em>new, dedicated</em> M2M app authorized only for a <code>refund:create</code> scope (least privilege — separate from charge).</li>
+      <li>Publish a <code>booking.refunded</code> event stamped with the acting admin's <code>sub</code> and the original customer's <code>sub</code>.</li>
+      <li>Make the refund <strong>idempotent</strong> with an idempotency key so a retried request never double-refunds.</li>
+      <li>Write a one-page threat model for the refund path: who can call it, what could go wrong, and which of your checks stops each threat.</li>
+    </ol>
+    <div class="callout tip"><span class="tag">Tip</span><p>Grade yourself on whether an attacker holding a <em>customer</em> token can trigger a refund (they must not), and whether a network glitch causing a retry can refund twice (it must not).</p></div>
+  </section>
+
+  <!-- ============================================================= 17 -->
+  <section id="miniproject">
+    <h2>17. Mini Project — The Walk-Up Kiosk</h2>
+    <p>Build a fourth surface: a <strong>self-service kiosk</strong> in the lobby that lets a guest buy a ticket without a personal login, while still being fully governed.</p>
+    <ul>
+      <li><strong>Device identity:</strong> the kiosk is a machine, so it authenticates with its own M2M (or Device-Authorization) client. It is <em>not</em> a person; its token carries a <code>kiosk</code> scope, not customer permissions.</li>
+      <li><strong>Guest booking:</strong> the kiosk creates an <em>anonymous</em> booking — the <code>sub</code> on the event is the kiosk client, with a guest reference (phone/email entered at the screen) in the payload, not in identity.</li>
+      <li><strong>Payment:</strong> the kiosk calls Booking, which calls Payment over the existing M2M edge — no new privileged path.</li>
+      <li><strong>Ticket delivery:</strong> Notification consumes <code>booking.confirmed</code> as usual; if there's no <code>sub</code>-linked email, it prints the QR at the kiosk instead.</li>
+      <li><strong>Constraint:</strong> a kiosk token must <em>not</em> be able to call <code>/refund</code>, <code>/pricing</code>, or read other people's bookings. Prove it with the same break-it-on-purpose tests from section 15.</li>
+    </ul>
+    <p>The lesson: a non-human surface is still an identity in Auth0 — it just gets a machine credential and a tightly scoped token, slotting into the exact same validation pipeline as every human.</p>
+  </section>
+
+  <!-- ============================================================= 18 -->
+  <section id="quiz">
+    <h2>18. Quiz — 22 Questions</h2>
+    <ol>
+      <li>Which token does a front-end send to call a back-end API — ID or access?</li>
+      <li>What claim must a resource server pin to avoid audience-confusion attacks?</li>
+      <li>Which OAuth grant does a service use to call another service with no user present?</li>
+      <li>Why is RS256 preferred over HS256 across multiple services?</li>
+      <li>What two Auth0 API settings must be on for the <code>permissions</code> claim to appear in tokens?</li>
+      <li>Where does the ID token's audience point?</li>
+      <li>What is BOLA and which layer must stop it?</li>
+      <li>What Redis command gives an atomic, expiring seat hold?</li>
+      <li>Why must you not release a Redis lock with a plain <code>DEL</code>?</li>
+      <li>How does a user's identity survive an async Kafka event?</li>
+      <li>What does refresh-token reuse detection do when an old token is replayed?</li>
+      <li>Name the three authorization layers (gateway, service, domain) and what each checks.</li>
+      <li>Why should custom claims be namespaced with a URL prefix?</li>
+      <li>Why cache the M2M token instead of fetching one per call?</li>
+      <li>Which status code is "valid token but lacks permission" — 401 or 403?</li>
+      <li>Which status code is "missing/expired/forged token"?</li>
+      <li>Why should tokens never live in <code>localStorage</code>?</li>
+      <li>What durable mechanism (besides Redis) guarantees a seat isn't double-booked?</li>
+      <li>Why give each service-to-service edge its own M2M application?</li>
+      <li>What flow does the interactive customer login use, and what does PKCE protect?</li>
+      <li>Why validate the JWT locally instead of calling Auth0 each request?</li>
+      <li>What Auth0 construct isolates multiple business customers (e.g. cinema chains) in one tenant?</li>
+    </ol>
+
+    <details>
+      <summary>Show answer key</summary>
+      <ol>
+        <li><strong>Access token.</strong> The ID token is for the client to identify the user, not for calling APIs.</li>
+        <li><strong><code>aud</code></strong> (and also <code>iss</code>). The token's audience must match this service's identifier.</li>
+        <li><strong>Client Credentials</strong> (M2M). The token represents the calling service, not a user.</li>
+        <li>HS256 is symmetric — every verifier holds the signing secret and could forge tokens. RS256 verifiers hold only the public key.</li>
+        <li><strong>Enable RBAC</strong> and <strong>Add Permissions in the Access Token</strong>.</li>
+        <li>At the <strong>client application</strong> (its client id), not at an API.</li>
+        <li><strong>Broken Object-Level Authorization</strong> — accessing another user's object. Only <strong>domain logic</strong> (ownership check) can stop it.</li>
+        <li><strong><code>SET key value NX EX 120</code></strong> — set only if absent, auto-expire in 120s.</li>
+        <li>A plain <code>DEL</code> could delete a lock another user just acquired; use a Lua compare-and-delete that only deletes if you still own it.</li>
+        <li>The producer stamps identity (e.g. <code>actor.sub</code>) into the message payload, or attaches a signed token as a header for verification.</li>
+        <li>It revokes the entire refresh-token <strong>family</strong>, killing the session — a detected theft.</li>
+        <li>Gateway = valid token (authN, coarse); Service = required permission (fine authZ); Domain = ownership of the specific object.</li>
+        <li>Auth0 strips non-namespaced custom claims; a URL prefix prevents collisions with standard claims.</li>
+        <li>M2M tokens are valid for hours; per-call fetching adds latency and hits rate limits.</li>
+        <li><strong>403 Forbidden.</strong></li>
+        <li><strong>401 Unauthorized.</strong></li>
+        <li>JS-readable storage is exposed to XSS; tokens belong in http-only cookies or secure OS storage.</li>
+        <li>A <strong>database unique constraint</strong> on <code>(showing_id, seat)</code> — the durable source of truth.</li>
+        <li>Least privilege / blast radius: leaking one edge's secret doesn't compromise the others.</li>
+        <li><strong>Authorization Code flow</strong>; PKCE protects against authorization-code interception (no client secret needed/exposed).</li>
+        <li>JWTs are self-contained and signed; local verification is microseconds and avoids a runtime dependency and rate limits.</li>
+        <li><strong>Organizations.</strong></li>
+      </ol>
+    </details>
+  </section>
+
+  <!-- ============================================================= 19 -->
+  <section id="cheatsheet">
+    <h2>19. Cheat Sheet</h2>
+    <pre class="diagram">
+ TOKENS
+   ID token   → client; "who is the user"; never sent to APIs
+   Access tok → API (aud); "may call this API"; validated by every service
+
+ GRANTS
+   Auth Code + PKCE  → interactive user login (the 3 front-ends)
+   Client Credentials→ service-to-service (Booking→Payment), no user
+
+ VALIDATE EVERY TOKEN (services)
+   1 signature (JWKS/RS256) 2 iss 3 aud 4 exp 5 permission
+   fail 1-4 → 401   fail 5 → 403   wrong owner → 403/404
+
+ AUTH0 OBJECTS
+   API(audience) → permissions → roles(customer/staff/admin) → users
+   M2M app per edge   Action injects namespaced roles claim
+   enable RBAC + "add permissions to access token"
+
+ STATE
+   Redis  SET seat NX EX 120   (hold) ; Lua compare-and-del (release)
+   DB     unique(showing, seat)        (durable truth)
+   Kafka  event.actor.sub               (identity on async)
+
+ RULES OF THUMB
+   never tokens in localStorage   never trust client-sent roles
+   validate locally, cache JWKS + M2M token   idempotency on money
+   zero trust internally   least privilege per token
+    </pre>
+  </section>
+
+  <!-- ============================================================= 20 -->
+  <section id="takeaways">
+    <h2>20. Key Takeaways</h2>
+    <div class="callout key"><span class="tag">Key</span><p><strong>One identity authority, many trust boundaries.</strong> Auth0 is the single source of identity; every front-end and service references the same user by <code>sub</code> and trusts only Auth0-signed tokens. That is what turns ten apps into one system.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p><strong>Two tokens, two grants, two audiences.</strong> ID token for UI, access token for APIs; Authorization Code + PKCE for humans, Client Credentials for services; each token's <code>aud</code> pins it to exactly one API.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p><strong>Authorize in three layers.</strong> Coarse at the gateway (valid token), fine at the service (right permission), object-level in domain logic (right owner). Skipping the third is the classic BOLA breach.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p><strong>Distributed correctness lives outside Auth0 too.</strong> Redis settles the seat race atomically, a DB constraint guarantees it durably, idempotency keys stop double-charges, and Kafka carries the <code>sub</code> so the async world stays auditable.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p><strong>Validate locally, trust nothing internally, grant least privilege.</strong> RS256 + cached JWKS makes verification fast and dependency-free; zero-trust hops and per-edge M2M apps keep the blast radius small when something leaks.</p></div>
+    <p>You have now assembled, from first principles, a production-shaped identity system spanning three front-ends, an API gateway, and six polyglot services, with Auth0 at the center. Everything in earlier chapters — tokens, RBAC, Actions, M2M, Organizations — has snapped into a single coherent whole. This is the architecture you draw on the whiteboard and the one you ship.</p>
+  </section>
+
+  <nav class="pager">
+    <a class="prev" href="chapter-25.html">← Previous</a>
+    <a class="next" href="chapter-27.html">Next →</a>
+  </nav>
+</main>
+<footer class="site-footer">Master Auth0 End-to-End · Chapter 26 of 32</footer>
+</body>
+</html>

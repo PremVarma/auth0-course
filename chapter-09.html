@@ -1,0 +1,774 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 9 — JWT Deep Dive: Structure and Algorithms | Master Auth0</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">🔐 Master Auth0</a>
+  <nav class="topnav">
+    <a href="chapter-08.html">← Prev</a>
+    <a href="index.html">Contents</a>
+    <a href="chapter-10.html">Next →</a>
+  </nav>
+</header>
+<main class="container">
+  <div class="chapter-head">
+    <span class="phase">Phase 4 · JWT Deep Dive</span>
+    <h1>Chapter 9 — JWT Deep Dive: Structure and Algorithms</h1>
+    <p class="lead">Every time Auth0 logs a user in, it hands your application a small, dense string of characters — a JSON Web Token. That string is the beating heart of modern identity: it is how your backend knows <em>who</em> is calling without a database lookup, how a mobile app proves it is allowed to hit your API, and how a microservice trusts a request that travelled through five other services first. In this chapter we crack the JWT wide open. We will read it byte by byte, learn exactly why it is encoded the way it is, master the cryptography that makes it tamper-proof, and write real code in Node.js, Java, Python, and the browser that decodes and <strong>verifies</strong> one correctly. By the end you will never again copy-paste a token into a website to "see what's inside" — you will know precisely what is inside, and more importantly, whether you should believe it.</p>
+  </div>
+
+  <!-- 1 -->
+  <section id="theory">
+    <h2>1. Theory — First Principles: What a JWT Actually Is</h2>
+    <p>Start with the problem, not the solution. HTTP is <strong>stateless</strong>: every request arrives as if the server has never seen the client before. Yet we need the server to know "this request is from Alice, and Alice is an admin." There are two broad ways to solve this:</p>
+    <ol>
+      <li><strong>Stateful sessions:</strong> the server stores a random opaque session ID in memory or a database. The client sends the ID; the server looks it up to find <em>who</em> the ID belongs to. The truth lives on the server.</li>
+      <li><strong>Stateless tokens:</strong> the server hands the client a self-describing token that <em>contains</em> the identity claims, cryptographically sealed so it cannot be forged. The client sends the token; the server verifies the seal and reads the claims directly. The truth travels with the request.</li>
+    </ol>
+    <p>A <strong>JWT (JSON Web Token, RFC 7519)</strong> is the second approach. It is a compact, URL-safe container for a set of <strong>claims</strong> (statements about an entity, usually a user) that is digitally signed so any party with the right key can confirm two things: the claims have not been altered, and they were issued by who they say they were.</p>
+    <p>The word "token" is generic; the precision comes from the layers. A JWT is the <em>payload format</em>. The signing/encryption rules come from <strong>JOSE</strong> (Javascript Object Signing and Encryption), which splits into:</p>
+    <ul>
+      <li><strong>JWS — JSON Web Signature (RFC 7515):</strong> a token that is <em>signed</em>. Anyone can read it; only the holder of the key can have created it. This is what Auth0 issues by default (an ID token and access token are signed JWTs).</li>
+      <li><strong>JWE — JSON Web Encryption (RFC 7516):</strong> a token that is <em>encrypted</em>. Only the holder of the decryption key can read it. Rarer; used when claims are sensitive.</li>
+    </ul>
+    <div class="callout key"><span class="tag">Key</span><p>A signed JWT is <strong>not secret</strong>. Anyone who intercepts it can read every claim. The signature guarantees <em>integrity and authenticity</em> (it wasn't changed, it came from the real issuer), <strong>not confidentiality</strong>. Never put a password, a credit card number, or any secret in a JWT payload.</p></div>
+    <p>The defining property is <strong>self-verification</strong>: given only the token and a public key (or shared secret), a resource server thousands of miles from Auth0, with no network call back to Auth0, can decide whether to trust the token. That property is what makes JWTs the lingua franca of distributed systems.</p>
+  </section>
+
+  <!-- 2 -->
+  <section id="story">
+    <h2>2. Story-Based Explanation — The Sealed Festival Wristband</h2>
+    <p>Imagine a three-day music festival. At the gate you show your ticket and ID. The staff don't want to check your ID every time you walk between stages, food trucks, and the VIP lounge — that would create huge queues. So they give you a <strong>wristband</strong>.</p>
+    <p>On the wristband, written in plain ink, is some information: your name, your ticket tier (General / VIP / Artist), and an expiry stamp ("valid until Sunday 23:59"). Anyone can read it — it's right there on your wrist. But the wristband also has a special <strong>holographic seal</strong> that only the festival's machine at the gate can produce. Bouncers at each stage carry a small UV light. They don't re-check your ID; they just shine the light on the seal. If the hologram is genuine and the expiry hasn't passed, you're waved through.</p>
+    <p>Now map the story:</p>
+    <ul>
+      <li>The <strong>festival gate machine</strong> is Auth0's authorization server — only it can mint genuine wristbands.</li>
+      <li>The <strong>ink-written info</strong> (name, tier, expiry) is the JWT <strong>payload / claims</strong> — readable by anyone.</li>
+      <li>The <strong>holographic seal</strong> is the <strong>signature</strong>.</li>
+      <li>The <strong>bouncer's UV light</strong> is your API verifying the signature with the public key.</li>
+      <li>A <strong>forged wristband</strong> drawn with a marker has no real hologram — the UV light reveals it instantly. That's a tampered JWT failing signature verification.</li>
+    </ul>
+    <p>One subtlety the story teaches: the bouncer never phones the front gate. The whole point of the seal is that verification is <em>local</em>. That is exactly why a JWT lets ten microservices trust a token without any of them calling Auth0 on every request.</p>
+  </section>
+
+  <!-- 3 -->
+  <section id="diagrams">
+    <h2>3. ASCII Diagrams — Anatomy and Flow</h2>
+    <p>A JWT is literally three Base64url strings joined by dots: <code>header.payload.signature</code>.</p>
+    <pre class="diagram">
+   HEADER                 PAYLOAD                    SIGNATURE
+ (algorithm,            (the claims:            (cryptographic seal over
+  key id, type)         who/what/when)           header + "." + payload)
+ +-----------+         +----------------+        +-------------------+
+ | eyJhbGci  |    .    | eyJzdWIiOiJ... |   .    | SflKxwRJSMeKKF2QT |
+ | OiJSUzI1  |         | eyJpc3MiOiJ... |        | 4fwpMeJf36POk6yJV |
+ | NiIsImtp  |         |                |        | _adQssw5c (etc.)  |
+ +-----------+         +----------------+        +-------------------+
+       \___________________ . _______________________/
+                  one single string, no spaces
+    </pre>
+    <p>How the three parts are produced when Auth0 signs a token:</p>
+    <pre class="diagram">
+  +-----------------+        +------------------+
+  | header (JSON)   |        | payload (JSON)   |
+  | {"alg":"RS256", |        | {"sub":"auth0|1",|
+  |  "kid":"abc"}   |        |  "exp":1718...}  |
+  +--------+--------+        +---------+--------+
+           |                           |
+     base64url()                  base64url()
+           |                           |
+           v                           v
+      H = "eyJhbGci..."          P = "eyJzdWIi..."
+           |                           |
+           +-----------+   +-----------+
+                       v   v
+                 signingInput = H + "." + P
+                            |
+                            v
+              +-----------------------------+
+              | SIGN(signingInput, KEY, alg)|  <-- private key (RS256)
+              +--------------+--------------+      or secret  (HS256)
+                            |
+                       base64url()
+                            v
+                      S = "SflKxw..."
+                            |
+          TOKEN = H + "." + P + "." + S
+    </pre>
+    <p>Verification at the resource server (your API) reverses only the last step:</p>
+    <pre class="diagram">
+  incoming TOKEN = H . P . S
+        |
+        |-- split on "."  -->  H , P , S
+        |
+        |-- read H to learn alg + kid
+        |
+        |-- fetch matching PUBLIC key (via JWKS, by kid)
+        |
+        v
+   recompute / verify:
+        VERIFY( H + "." + P , signature=S , publicKey , alg )
+        |
+        +--> valid?  --no--> 401 REJECT (tampered or wrong issuer)
+        |
+       yes
+        |
+        v
+   check claims:  exp not passed?  iss == expected?  aud == my API?
+        |
+        +--> any fail --> 401 REJECT
+        |
+       all good
+        |
+        v
+   TRUST the claims in P  -->  request.user = decode(P)
+    </pre>
+  </section>
+
+  <!-- 4 -->
+  <section id="analogy">
+    <h2>4. Real-World Analogy — The Notarised, Tamper-Evident Letter</h2>
+    <p>Think of a JWT as a letter sealed by a notary public, sent through the post.</p>
+    <table>
+      <thead><tr><th>Letter concept</th><th>JWT concept</th><th>Why it matters</th></tr></thead>
+      <tbody>
+        <tr><td>The envelope label saying "official letter, signed in red wax"</td><td>Header (<code>typ</code>, <code>alg</code>)</td><td>Tells the reader what kind of document this is and how it was sealed before they even open it.</td></tr>
+        <tr><td>The letter's actual text: "Bearer is John Smith, a gold member, until June 30"</td><td>Payload / claims</td><td>The meaningful content. Plainly readable — not secret.</td></tr>
+        <tr><td>The notary's embossed wax seal across the flap</td><td>Signature</td><td>If anyone opens and re-writes the letter, the seal breaks. Proves integrity + origin.</td></tr>
+        <tr><td>The notary's published specimen stamp on file at city hall</td><td>Public key in the JWKS endpoint</td><td>Anyone can fetch the official stamp to verify a seal is genuine — without phoning the notary.</td></tr>
+        <tr><td>A shared family signet ring both sender and receiver own</td><td>HS256 shared secret</td><td>Symmetric: whoever can verify can also forge. Only safe between two trusted parties.</td></tr>
+        <tr><td>The "void after" date printed on the letter</td><td><code>exp</code> claim</td><td>Old letters stop being valid automatically; no need to recall them.</td></tr>
+      </tbody>
+    </table>
+    <p>The crucial insight from the analogy: a notary seal proves the letter is authentic and unaltered, but it does <strong>not</strong> hide the contents. If you want secrecy, you'd put the letter inside a locked box (that's JWE encryption). Most of the time identity claims aren't secret — they just must be trustworthy — so JWS (signature only) is what we use.</p>
+  </section>
+
+  <!-- 5 -->
+  <section id="internal">
+    <h2>5. Internal Working — Base64url, Claims, and the Signature Math</h2>
+
+    <h3>5.1 Base64url encoding — what and why</h3>
+    <p>Each of the three parts is text encoded with <strong>Base64url</strong>. Base64 takes arbitrary bytes and represents them using 64 printable characters (A–Z, a–z, 0–9, plus two more), turning every 3 bytes into 4 characters. <em>Standard</em> Base64 uses <code>+</code>, <code>/</code>, and <code>=</code> padding. Those characters are problematic in URLs and HTTP headers: <code>+</code> means space in query strings, <code>/</code> is a path separator, and <code>=</code> needs escaping.</p>
+    <p><strong>Base64url</strong> (RFC 4648 §5) fixes this with two substitutions and one removal:</p>
+    <table>
+      <thead><tr><th>Standard Base64</th><th>Base64url</th></tr></thead>
+      <tbody>
+        <tr><td><code>+</code> (plus)</td><td><code>-</code> (hyphen)</td></tr>
+        <tr><td><code>/</code> (slash)</td><td><code>_</code> (underscore)</td></tr>
+        <tr><td><code>=</code> padding</td><td>removed entirely</td></tr>
+      </tbody>
+    </table>
+    <div class="callout warn"><span class="tag">Warn</span><p>Base64url is <strong>encoding, not encryption</strong>. It scrambles nothing — it is fully reversible by anyone with no key. The header and payload of every signed JWT are wide open. Decoding them is trivial (we'll do it in code). Encoding exists only to make arbitrary JSON safe to transport in a URL or header.</p></div>
+    <p>Let's decode a real header by hand. The string <code>eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9</code> is Base64url. Decoded, it is the ASCII text:</p>
+    <pre><code class="language-json">{"alg":"RS256","typ":"JWT"}</code></pre>
+
+    <h3>5.2 The header</h3>
+    <p>The header is JSON describing how the token was signed. Common fields:</p>
+    <table>
+      <thead><tr><th>Field</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>alg</code></td><td>Signing algorithm, e.g. <code>RS256</code>, <code>HS256</code>, <code>ES256</code>. <strong>Required.</strong></td></tr>
+        <tr><td><code>typ</code></td><td>Type, usually <code>JWT</code>. For access tokens Auth0 may use <code>at+jwt</code> (RFC 9068).</td></tr>
+        <tr><td><code>kid</code></td><td>Key ID — tells the verifier <em>which</em> public key in the JWKS to use. Essential for rotation.</td></tr>
+      </tbody>
+    </table>
+
+    <h3>5.3 The payload and the signature math</h3>
+    <p>The payload is JSON containing the claims (next section). The signature is where cryptography enters. Define:</p>
+    <pre class="diagram">
+ signingInput = base64url(header) + "." + base64url(payload)
+
+ HS256:  signature = HMAC-SHA256( signingInput, secret )
+         verify: recompute HMAC with same secret, compare to S
+
+ RS256:  signature = RSA-PKCS1v1.5-SHA256-SIGN( signingInput, privateKey )
+         verify: RSA-VERIFY( signingInput, S, publicKey )
+
+ ES256:  signature = ECDSA-P256-SHA256-SIGN( signingInput, privateKey )
+         verify: ECDSA-VERIFY( signingInput, S, publicKey )
+    </pre>
+    <p>Notice the asymmetry of trust. With HMAC (HS256) the same <code>secret</code> both creates and checks the signature — symmetric. With RSA/ECDSA the <em>private</em> key creates and the <em>public</em> key only checks — asymmetric. That single difference drives nearly every architectural decision later in this chapter.</p>
+  </section>
+
+  <!-- 6 -->
+  <section id="walkthrough">
+    <h2>6. Code Walkthrough — Building and Reading a JWT from Scratch</h2>
+    <p>To truly understand a JWT, build one without a library first. This Node.js script signs and verifies an HS256 token using only the built-in <code>crypto</code> module — no dependencies. Read every line; the comments explain the <em>why</em>.</p>
+    <pre><code class="language-javascript">// build-jwt.js  — run with: node build-jwt.js
+import crypto from "node:crypto";
+
+// Base64url helpers: encode bytes/JSON to base64url, and back.
+const b64url = (buf) =&gt;
+  Buffer.from(buf)
+    .toString("base64")
+    .replace(/\+/g, "-")   // + -&gt; -
+    .replace(/\//g, "_")   // / -&gt; _
+    .replace(/=+$/g, "");  // strip padding
+
+const fromB64url = (str) =&gt;
+  Buffer.from(str.replace(/-/g, "+").replace(/_/g, "/"), "base64");
+
+const secret = "super-secret-shared-key-keep-this-safe";
+
+// 1. Header: declare the algorithm.
+const header  = { alg: "HS256", typ: "JWT" };
+
+// 2. Payload: the claims. iat/exp are UNIX seconds (NOT milliseconds).
+const now = Math.floor(Date.now() / 1000);
+const payload = {
+  sub: "user_42",
+  name: "Alice",
+  roles: ["admin"],
+  iat: now,
+  exp: now + 3600,            // expires in 1 hour
+  iss: "https://my-app.example.com/",
+  aud: "https://api.my-app.example.com",
+};
+
+// 3. Encode header and payload, join with a dot = the signing input.
+const encHeader  = b64url(JSON.stringify(header));
+const encPayload = b64url(JSON.stringify(payload));
+const signingInput = `${encHeader}.${encPayload}`;
+
+// 4. Sign: HMAC-SHA256 over the signing input, keyed by the secret.
+const signature = b64url(
+  crypto.createHmac("sha256", secret).update(signingInput).digest()
+);
+
+const token = `${signingInput}.${signature}`;
+console.log("TOKEN:\n", token);
+
+// ---- VERIFY (what a resource server does) ----
+function verify(token, secret) {
+  const [h, p, s] = token.split(".");
+  if (!h || !p || !s) throw new Error("Malformed token");
+
+  // Recompute the signature over the received header.payload.
+  const expected = b64url(
+    crypto.createHmac("sha256", secret).update(`${h}.${p}`).digest()
+  );
+
+  // Constant-time compare to avoid timing attacks.
+  const ok = crypto.timingSafeEqual(Buffer.from(s), Buffer.from(expected));
+  if (!ok) throw new Error("Invalid signature — token was tampered with!");
+
+  const claims = JSON.parse(fromB64url(p).toString("utf8"));
+
+  // Claim checks — the signature being valid is NOT enough.
+  const nowSec = Math.floor(Date.now() / 1000);
+  if (claims.exp &amp;&amp; nowSec &gt;= claims.exp) throw new Error("Token expired");
+  if (claims.iss !== "https://my-app.example.com/") throw new Error("Bad issuer");
+  if (claims.aud !== "https://api.my-app.example.com") throw new Error("Bad audience");
+
+  return claims;
+}
+
+console.log("VERIFIED CLAIMS:\n", verify(token, secret));</code></pre>
+    <div class="callout tip"><span class="tag">Tip</span><p>Note the two-stage validation: first the <strong>signature</strong> (is this token genuine and unaltered?), then the <strong>claims</strong> (<code>exp</code>, <code>iss</code>, <code>aud</code> — is it for me, right now?). A token can have a perfect signature and still be wrong for your API. Real libraries do both for you, but you must <em>configure</em> the claim checks.</p></div>
+  </section>
+
+  <!-- 7 -->
+  <section id="practical">
+    <h2>7. Practical Implementation — Verifying Auth0 Tokens with Real Libraries</h2>
+    <p>You will almost never hand-roll JWT code in production. Auth0 issues <strong>RS256</strong> tokens, so your API fetches Auth0's public keys from its <strong>JWKS endpoint</strong> and verifies with them. Here are correct, runnable examples per stack.</p>
+
+    <h3>7.1 Node.js / Express — <code>express-oauth2-jwt-bearer</code></h3>
+    <pre><code class="language-javascript">// npm i express express-oauth2-jwt-bearer
+import express from "express";
+import { auth } from "express-oauth2-jwt-bearer";
+
+const app = express();
+
+// This middleware fetches Auth0's JWKS, caches keys, picks by `kid`,
+// verifies the RS256 signature, and checks iss/aud/exp automatically.
+const checkJwt = auth({
+  audience: "https://api.my-app.example.com",          // must equal token `aud`
+  issuerBaseURL: "https://YOUR_TENANT.us.auth0.com/",  // builds iss + JWKS url
+  tokenSigningAlg: "RS256",                            // pin the algorithm!
+});
+
+app.get("/api/private", checkJwt, (req, res) =&gt; {
+  // req.auth.payload now holds the verified claims.
+  res.json({ message: "Verified!", sub: req.auth.payload.sub });
+});
+
+app.listen(3000, () =&gt; console.log("API on :3000"));</code></pre>
+
+    <h3>7.2 Node.js — manual verification with <code>jose</code> + remote JWKS</h3>
+    <pre><code class="language-javascript">// npm i jose
+import { jwtVerify, createRemoteJWKSet } from "jose";
+
+const JWKS = createRemoteJWKSet(
+  new URL("https://YOUR_TENANT.us.auth0.com/.well-known/jwks.json")
+);
+
+export async function verifyAccessToken(token) {
+  const { payload, protectedHeader } = await jwtVerify(token, JWKS, {
+    issuer: "https://YOUR_TENANT.us.auth0.com/",
+    audience: "https://api.my-app.example.com",
+    algorithms: ["RS256"],   // never trust alg from the header alone
+  });
+  return payload; // exp/nbf checked automatically by jwtVerify
+}</code></pre>
+
+    <h3>7.3 Java Spring Boot — resource server (Spring Security)</h3>
+    <pre><code class="language-java">// build.gradle: org.springframework.boot:spring-boot-starter-oauth2-resource-server
+// application.yml configures issuer + audience; Spring builds the JWKS pipeline.
+package com.example.api;
+
+import org.springframework.context.annotation.Bean;
+import org.springframework.context.annotation.Configuration;
+import org.springframework.security.config.annotation.web.builders.HttpSecurity;
+import org.springframework.security.web.SecurityFilterChain;
+
+@Configuration
+public class SecurityConfig {
+  @Bean
+  SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+    http
+      .authorizeHttpRequests(a -&gt; a
+        .requestMatchers("/api/public").permitAll()
+        .anyRequest().authenticated())
+      .oauth2ResourceServer(oauth2 -&gt; oauth2.jwt()); // RS256 via JWKS
+    return http.build();
+  }
+}</code></pre>
+    <pre><code class="language-yaml"># application.yml
+spring:
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: https://YOUR_TENANT.us.auth0.com/
+          # Spring auto-discovers the JWKS URL from the issuer's metadata,
+          # validates iss + exp; add an audience validator for `aud`.</code></pre>
+
+    <h3>7.4 Python FastAPI — verify with PyJWT + JWKS</h3>
+    <pre><code class="language-python"># pip install fastapi "pyjwt[crypto]" requests uvicorn
+import jwt
+from jwt import PyJWKClient
+from fastapi import FastAPI, Depends, HTTPException
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+
+ISSUER   = "https://YOUR_TENANT.us.auth0.com/"
+AUDIENCE = "https://api.my-app.example.com"
+jwks_client = PyJWKClient(f"{ISSUER}.well-known/jwks.json")
+
+app = FastAPI()
+bearer = HTTPBearer()
+
+def verify(creds: HTTPAuthorizationCredentials = Depends(bearer)):
+    token = creds.credentials
+    try:
+        # Pick the right public key using the token's `kid`.
+        signing_key = jwks_client.get_signing_key_from_jwt(token).key
+        claims = jwt.decode(
+            token, signing_key,
+            algorithms=["RS256"],          # pin algorithm
+            audience=AUDIENCE,             # checks `aud`
+            issuer=ISSUER,                 # checks `iss`
+        )                                  # checks exp/nbf automatically
+        return claims
+    except jwt.PyJWTError as e:
+        raise HTTPException(status_code=401, detail=str(e))
+
+@app.get("/api/private")
+def private(claims=Depends(verify)):
+    return {"sub": claims["sub"]}</code></pre>
+
+    <h3>7.5 curl + Postman</h3>
+    <pre><code class="language-bash"># 1. Get an access token (client credentials grant) from Auth0:
+curl --request POST \
+  --url https://YOUR_TENANT.us.auth0.com/oauth/token \
+  --header 'content-type: application/json' \
+  --data '{
+    "client_id":"YOUR_CLIENT_ID",
+    "client_secret":"YOUR_CLIENT_SECRET",
+    "audience":"https://api.my-app.example.com",
+    "grant_type":"client_credentials"
+  }'
+# -&gt; { "access_token": "eyJhbGci...", "token_type": "Bearer", ... }
+
+# 2. Call your protected API with the token in the Authorization header:
+curl https://api.my-app.example.com/api/private \
+  --header "Authorization: Bearer eyJhbGci...REST_OF_TOKEN"</code></pre>
+    <div class="callout note"><span class="tag">Note</span><p><strong>Postman:</strong> use the <em>Authorization</em> tab → type <em>Bearer Token</em> → paste the access token, or set up an <em>OAuth 2.0</em> authorization with the token URL above and let Postman fetch and attach the token automatically. The header it sends is always <code>Authorization: Bearer &lt;token&gt;</code>.</p></div>
+  </section>
+
+  <!-- 8 -->
+  <section id="architecture">
+    <h2>8. Production Architecture — Issuer, JWKS, and Distributed Verification</h2>
+    <p>In production, signing and verifying live in different places, connected only by the public key distributed through JWKS. Here is the canonical picture.</p>
+    <pre class="diagram">
+                         AUTH0 TENANT (issuer)
+                  +--------------------------------+
+                  |  Authorization Server          |
+   user login --&gt; |  - holds PRIVATE signing keys  |
+                  |  - signs RS256 tokens          |
+                  |  - publishes PUBLIC keys at:   |
+                  |    /.well-known/jwks.json      |
+                  +----------------+---------------+
+                                   |
+            access token (JWT)     |   JWKS (public keys, by kid)
+            handed to client       |   fetched + cached by APIs
+                                   |
+        +--------------+-----------+-----------+--------------+
+        v              v                       v              v
+  +-----------+  +-----------+           +-----------+  +-----------+
+  | Orders    |  | Payments  |   . . .   | Inventory |  | Reporting |
+  | API       |  | API       |           | API       |  | API       |
+  | verify    |  | verify    |           | verify    |  | verify    |
+  | locally   |  | locally   |           | locally   |  | locally   |
+  +-----------+  +-----------+           +-----------+  +-----------+
+   each service verifies the SAME token with the SAME public key,
+   independently, with NO call back to Auth0 per request.
+    </pre>
+    <p>The JWKS document is just JSON listing one or more public keys, each tagged with a <code>kid</code>:</p>
+    <pre><code class="language-json">{
+  "keys": [
+    {
+      "kty": "RSA",
+      "use": "sig",
+      "kid": "NEC1...currentKey",
+      "n":   "0vx7agoebGc...very-long-modulus...",
+      "e":   "AQAB",
+      "alg": "RS256"
+    },
+    {
+      "kty": "RSA", "use": "sig", "kid": "PRE2...nextKey",
+      "n": "...", "e": "AQAB", "alg": "RS256"
+    }
+  ]
+}</code></pre>
+    <p><strong>Key rotation</strong> works like this: Auth0 starts signing with a new key while still publishing the old public key in JWKS. Tokens already in the wild carry the old <code>kid</code> and still verify; new tokens carry the new <code>kid</code>. Your library matches by <code>kid</code> and "just works" across the rollover, because it fetches the current JWKS. This is why <strong>you must look up the key by <code>kid</code></strong> and cache JWKS with a sensible TTL, rather than hardcoding a public key.</p>
+    <div class="callout key"><span class="tag">Key</span><p>The architectural superpower of RS256 + JWKS: a brand-new microservice can verify Auth0 tokens with zero shared secrets and zero coordination — it just fetches the public JWKS. With HS256 you would have to securely distribute the same secret to every service, and any one of them could mint tokens. That is why Auth0 defaults to and recommends RS256.</p></div>
+  </section>
+
+  <!-- 9 -->
+  <section id="security">
+    <h2>9. Security Analysis — Algorithms, Attacks, and Defenses</h2>
+
+    <h3>9.1 HS256 vs RS256 vs ES256</h3>
+    <table>
+      <thead><tr><th>Property</th><th>HS256</th><th>RS256</th><th>ES256</th></tr></thead>
+      <tbody>
+        <tr><td>Family</td><td>HMAC (symmetric)</td><td>RSA (asymmetric)</td><td>ECDSA (asymmetric)</td></tr>
+        <tr><td>Sign with / verify with</td><td>same secret / same secret</td><td>private key / public key</td><td>private key / public key</td></tr>
+        <tr><td>Who can forge tokens</td><td>anyone with the secret (= every verifier)</td><td>only holder of private key</td><td>only holder of private key</td></tr>
+        <tr><td>Key/signature size</td><td>tiny secret, small sig</td><td>large keys (2048-bit+), larger sig</td><td>small keys (256-bit), small sig</td></tr>
+        <tr><td>Sign speed</td><td>fastest</td><td>slow</td><td>fast</td></tr>
+        <tr><td>Verify speed</td><td>fastest</td><td>fast</td><td>fast (slightly slower than RSA verify)</td></tr>
+        <tr><td>Distributed verification</td><td>poor — secret must be shared</td><td>excellent — public key only</td><td>excellent — public key only</td></tr>
+        <tr><td>Auth0 default for APIs</td><td>discouraged</td><td><strong>recommended / default</strong></td><td>supported, great for size-constrained</td></tr>
+      </tbody>
+    </table>
+
+    <h3>9.2 The "alg: none" attack</h3>
+    <p>The original JWT spec allowed <code>"alg":"none"</code> — an <em>unsigned</em> token. Naive verifiers that "trusted" the header's algorithm would accept a token with an empty signature, letting an attacker craft <code>{"sub":"admin"}</code> with no signature at all. Defense: <strong>never let the token's header decide the algorithm.</strong> Always pass an explicit allow-list (<code>algorithms: ["RS256"]</code>) to your verify call. Every example in this chapter does this.</p>
+
+    <h3>9.3 The RS256 → HS256 confusion attack</h3>
+    <p>If a server is configured to "verify with the public key" but lets the header pick the algorithm, an attacker can take the well-known RSA <em>public</em> key, switch the header to <code>HS256</code>, and HMAC-sign the token <em>using the public key as the HMAC secret</em>. A buggy verifier would then HMAC-verify with that same public key — and accept the forgery. Defense, again: pin <code>algorithms: ["RS256"]</code> so an HS256 token is rejected outright.</p>
+
+    <div class="callout danger"><span class="tag">Danger</span><p>The two deadliest JWT mistakes are (1) trusting <code>alg</code> from the token header, and (2) skipping <code>aud</code>/<code>iss</code>/<code>exp</code> validation. Either one alone can turn "verified" into "owned." A valid signature only proves the token wasn't altered — it says nothing about whether the token was meant for <em>your</em> API or whether it is still in date.</p></div>
+
+    <h3>9.4 Other essentials</h3>
+    <ul>
+      <li><strong>Confidentiality:</strong> signed JWTs are readable. Don't store secrets in claims; serve everything over HTTPS so tokens aren't sniffed.</li>
+      <li><strong>Revocation:</strong> a signed JWT is valid until <code>exp</code> regardless of logout. Keep access-token lifetimes short (minutes), use refresh tokens for renewal, and use Auth0 features (token revocation, sender-constraining) for high-risk cases.</li>
+      <li><strong>Storage in browsers:</strong> prefer in-memory or secure, <code>HttpOnly</code> cookies over <code>localStorage</code> to reduce XSS theft risk.</li>
+      <li><strong>Clock skew:</strong> allow a small leeway (e.g. 60s) on <code>exp</code>/<code>nbf</code> so minor clock differences don't reject valid tokens.</li>
+    </ul>
+  </section>
+
+  <!-- 10 -->
+  <section id="performance">
+    <h2>10. Performance Considerations</h2>
+    <ul>
+      <li><strong>Verification is local and cheap.</strong> RS256 signature verification is on the order of microseconds-to-low-milliseconds — vastly faster than a network round-trip to a session store. This is the headline performance win of JWTs.</li>
+      <li><strong>Cache the JWKS.</strong> Never fetch <code>/.well-known/jwks.json</code> on every request. Libraries cache it; tune the TTL (commonly 10 minutes to a few hours). On a <code>kid</code> miss, refetch once — that gracefully handles rotation.</li>
+      <li><strong>HS256 verify is fastest</strong> (a single HMAC), RS256 verify is fast (public-exponent is small, so RSA <em>verify</em> is cheap even though RSA <em>sign</em> is slow), ES256 verify is fast and produces much smaller tokens.</li>
+      <li><strong>Token size matters on the wire.</strong> Every API call carries the whole token in the header. Bloated custom claims inflate every request and can blow past header size limits (often ~8 KB). Keep payloads lean; fetch large profile data from an endpoint, don't stuff it into the token.</li>
+      <li><strong>Avoid double work.</strong> Verify once per request at the edge/gateway, then pass the decoded claims downstream rather than re-verifying in every service if they share a trust boundary.</li>
+    </ul>
+    <pre class="diagram">
+  Stateful session lookup        Stateless JWT verify
+  ----------------------         --------------------
+  request --&gt; cache/db  (network) request --&gt; CPU verify (local)
+          ~1-10 ms per hit                ~0.01-1 ms, no network
+  scales with shared store        scales horizontally, no shared store
+    </pre>
+  </section>
+
+  <!-- 11 -->
+  <section id="mistakes">
+    <h2>11. Common Mistakes</h2>
+    <ul>
+      <li><strong>Thinking a JWT is encrypted.</strong> It is signed, not secret. Putting a password or PII you don't want exposed in the payload leaks it to anyone who sees the token.</li>
+      <li><strong>Letting the header choose the algorithm.</strong> Opens <code>alg:none</code> and RS256→HS256 confusion attacks. Always pin an allow-list.</li>
+      <li><strong>Verifying the signature but not the claims.</strong> Forgetting <code>aud</code> means a token issued for a <em>different</em> API of the same tenant will be accepted by yours.</li>
+      <li><strong>Confusing seconds and milliseconds.</strong> <code>exp</code>, <code>iat</code>, <code>nbf</code> are UNIX time in <em>seconds</em>. Passing JavaScript's <code>Date.now()</code> (milliseconds) makes tokens "expire" in the year 50000+.</li>
+      <li><strong>Hardcoding a single public key.</strong> Breaks the moment Auth0 rotates keys. Always resolve by <code>kid</code> from JWKS.</li>
+      <li><strong>Decoding ≠ verifying.</strong> Calling <code>jwt.decode()</code> without a key (or with verification disabled) just reads claims — it provides <em>zero</em> security. Use <code>verify</code>.</li>
+      <li><strong>Treating namespaced custom claims as registered.</strong> Auth0 requires custom claims to be namespaced (a URI prefix). Reading them under the wrong key returns <code>undefined</code>.</li>
+      <li><strong>Non-constant-time comparison of HS256 signatures.</strong> Use a timing-safe compare to avoid leaking the secret via timing.</li>
+      <li><strong>Long-lived access tokens.</strong> Because JWTs can't be easily revoked, a 30-day access token is a 30-day liability. Keep them short.</li>
+    </ul>
+  </section>
+
+  <!-- 12 -->
+  <section id="best-practices">
+    <h2>12. Best Practices</h2>
+    <ul>
+      <li><strong>Use RS256 (or ES256) for APIs</strong> so verifiers only need the public key; reserve HS256 for tightly-coupled, single-trust-boundary cases.</li>
+      <li><strong>Always validate <code>iss</code>, <code>aud</code>, and <code>exp</code></strong> (and <code>nbf</code> if present) on top of the signature, with a small clock-skew leeway.</li>
+      <li><strong>Pin the algorithm</strong> via an explicit allow-list on every verify call.</li>
+      <li><strong>Resolve keys by <code>kid</code> from a cached JWKS</strong>; refetch on miss to handle rotation transparently.</li>
+      <li><strong>Keep access tokens short-lived</strong> (minutes); use refresh tokens (rotating) for longevity.</li>
+      <li><strong>Keep payloads minimal</strong>; namespace all custom claims; never store secrets in claims.</li>
+      <li><strong>Use battle-tested libraries</strong> (jose, PyJWT, Spring Security, express-oauth2-jwt-bearer) instead of hand-rolling crypto.</li>
+      <li><strong>Always transport over HTTPS</strong>; protect tokens at rest in the client (HttpOnly cookies / in-memory, not localStorage).</li>
+    </ul>
+  </section>
+
+  <!-- 13 -->
+  <section id="interview">
+    <h2>13. Interview Questions (with Model Answers)</h2>
+
+    <h4>Q1. What are the three parts of a JWT and what does each do?</h4>
+    <p><strong>A.</strong> Header, payload, signature, joined by dots and Base64url-encoded. The header declares the signing algorithm (<code>alg</code>) and often a key id (<code>kid</code>) and type (<code>typ</code>). The payload holds the claims — statements about the subject plus metadata like <code>exp</code>. The signature is a cryptographic seal over <code>header.payload</code> that proves integrity and authenticity.</p>
+
+    <h4>Q2. Is a JWT encrypted? Can I put a password in it?</h4>
+    <p><strong>A.</strong> A standard (JWS) JWT is <em>signed, not encrypted</em> — the payload is plainly readable by anyone via Base64url decode. Never put secrets in it. If you need confidentiality you use JWE (encryption), which is far less common for identity claims.</p>
+
+    <h4>Q3. Explain HS256 vs RS256 and when you'd choose each.</h4>
+    <p><strong>A.</strong> HS256 is symmetric HMAC: one shared secret both signs and verifies, so every verifier could also forge tokens. RS256 is asymmetric RSA: a private key signs, a public key verifies, so verifiers can confirm authenticity without the power to mint tokens. Choose RS256 when many independent services must verify (the Auth0 default) because you distribute only the public key via JWKS. Choose HS256 only when one party both issues and consumes within a single trust boundary and you want maximum speed/simplicity.</p>
+
+    <h4>Q4. What is the JWKS endpoint and what is <code>kid</code> for?</h4>
+    <p><strong>A.</strong> JWKS (<code>/.well-known/jwks.json</code>) publishes the issuer's public keys as JSON. Each key has a <code>kid</code> (key id). A token's header carries the <code>kid</code> of the key that signed it; the verifier reads it, finds the matching public key in the cached JWKS, and verifies. This makes key rotation seamless.</p>
+
+    <h4>Q5. How does key rotation work without breaking live tokens?</h4>
+    <p><strong>A.</strong> The issuer publishes both old and new public keys in JWKS during the transition, signs new tokens with the new key (new <code>kid</code>), and lets old tokens (old <code>kid</code>) keep verifying until they expire. Verifiers select by <code>kid</code> and refresh JWKS on a cache-miss, so they pick up new keys automatically.</p>
+
+    <h4>Q6. What is the <code>alg:none</code> attack and how do you prevent it?</h4>
+    <p><strong>A.</strong> An attacker sets the header algorithm to <code>none</code> and removes the signature; a naive verifier that trusts the header accepts the unsigned token. Prevent it by never letting the header pick the algorithm — pass an explicit allow-list (e.g. <code>["RS256"]</code>) to the verify function.</p>
+
+    <h4>Q7. A token has a valid signature. Is the request safe to trust?</h4>
+    <p><strong>A.</strong> Not yet. A valid signature only means the token wasn't altered and came from the expected key. You still must check <code>exp</code> (not expired), <code>iss</code> (right issuer), and <code>aud</code> (this token was meant for <em>my</em> API). Only then trust the claims.</p>
+
+    <h4>Q8. How do you revoke a JWT before it expires?</h4>
+    <p><strong>A.</strong> You can't cheaply, by design — that's the trade-off for statelessness. Mitigations: keep access tokens short-lived; use rotating refresh tokens; maintain a small denylist of revoked token ids (<code>jti</code>) checked at the gateway for high-risk scenarios; or use Auth0's revocation and sender-constraining features.</p>
+
+    <h4>Q9. Why namespaced custom claims?</h4>
+    <p><strong>A.</strong> To avoid collisions with registered claims and to comply with the OIDC rule that non-standard claims in ID tokens be collision-resistant. Auth0 enforces a URI namespace, e.g. <code>https://myapp.com/roles</code>, so your custom data can't clash with reserved names.</p>
+
+    <h4>Q10. Why is RS256 verification fast even though RSA is "slow"?</h4>
+    <p><strong>A.</strong> RSA signing uses the large private exponent (slow), but verification uses the tiny public exponent (commonly 65537), which makes the modular exponentiation cheap. So verify — the operation your APIs do constantly — is fast.</p>
+  </section>
+
+  <!-- 14 -->
+  <section id="cert-tips">
+    <h2>14. Certification Tips</h2>
+    <div class="callout note"><span class="tag">Exam focus</span><p>For the Auth0 / Okta certification, anchor these facts:</p></div>
+    <ul>
+      <li>Auth0 signs API access tokens and ID tokens with <strong>RS256 by default</strong>; you can switch a client to HS256 but it's discouraged for APIs.</li>
+      <li>The <strong>ID token</strong> is for the <em>client</em> (proves who logged in, OIDC); the <strong>access token</strong> is for the <em>API</em> (authorizes a call). Don't send an ID token to an API.</li>
+      <li>JWKS lives at <code>https://YOUR_TENANT/.well-known/jwks.json</code>; OIDC metadata at <code>/.well-known/openid-configuration</code>.</li>
+      <li>Validate <code>iss</code>, <code>aud</code>, <code>exp</code>, signature, and (for ID tokens) <code>nonce</code>/<code>azp</code> where applicable.</li>
+      <li>Custom claims in Auth0 must be <strong>namespaced</strong> and are added via <strong>Actions</strong> (post-login flow) — know that Actions are the modern mechanism (Rules/Hooks are legacy).</li>
+      <li>Know <code>at+jwt</code> as the access-token type per RFC 9068 and that access tokens <em>may</em> be opaque if no API audience is requested.</li>
+      <li>Remember the difference: <strong>authentication</strong> = who you are (ID token); <strong>authorization</strong> = what you may do (access token + scopes/permissions).</li>
+    </ul>
+  </section>
+
+  <!-- 15 -->
+  <section id="hands-on">
+    <h2>15. Hands-On Exercises</h2>
+    <ol>
+      <li><strong>Decode by hand.</strong> Take any Auth0 access token from your tenant. Split on <code>.</code>; Base64url-decode the first two parts in a terminal: <code>echo 'HEADER_PART' | base64 -d</code> (add <code>=</code> padding if your tool needs it). Identify <code>alg</code>, <code>kid</code>, <code>iss</code>, <code>aud</code>, <code>exp</code>.</li>
+      <li><strong>Run the from-scratch script.</strong> Save §6's <code>build-jwt.js</code>, run it, then tamper with one character of the payload segment and re-run <code>verify</code> — watch it throw "Invalid signature."</li>
+      <li><strong>Inspect JWKS.</strong> <code>curl https://YOUR_TENANT/.well-known/jwks.json</code> and match a token's <code>kid</code> to a key in the list.</li>
+      <li><strong>Break the algorithm pin.</strong> In the <code>jose</code> example, change <code>algorithms: ["RS256"]</code> to <code>["RS256","HS256"]</code> and reason about why that's dangerous (don't ship it).</li>
+      <li><strong>Expiry test.</strong> Set <code>exp</code> to <code>now - 1</code> in the script and confirm verification rejects it with "Token expired."</li>
+    </ol>
+  </section>
+
+  <!-- 16 -->
+  <section id="assignment">
+    <h2>16. Assignment</h2>
+    <p>Build a minimal protected API in the stack of your choice (Express, FastAPI, or Spring Boot) that:</p>
+    <ol>
+      <li>Exposes <code>GET /api/public</code> (open) and <code>GET /api/private</code> (protected).</li>
+      <li>Verifies Auth0 <strong>RS256</strong> access tokens using the tenant's <strong>JWKS</strong>, resolving the key by <code>kid</code>.</li>
+      <li>Validates <code>iss</code>, <code>aud</code>, and <code>exp</code> with a 60-second clock-skew leeway and pins the algorithm to <code>RS256</code>.</li>
+      <li>Returns the verified <code>sub</code> and any namespaced <code>roles</code> claim from <code>/api/private</code>.</li>
+      <li><strong>Write-up:</strong> document what happens when you (a) send no token, (b) send a token for a different audience, (c) send an expired token, and (d) tamper with one payload character. Each must yield a 401 with a distinct reason.</li>
+    </ol>
+    <div class="callout tip"><span class="tag">Tip</span><p>Get a real token via the client-credentials curl in §7.5, or from the API's "Test" tab in the Auth0 Dashboard.</p></div>
+  </section>
+
+  <!-- 17 -->
+  <section id="mini-project">
+    <h2>17. Mini Project — A JWT Inspector Web Tool</h2>
+    <p>Build a small React component that lets a user paste a JWT, then displays the decoded header and payload <strong>and</strong> verifies the signature against a JWKS URL. This cements the decode-vs-verify distinction.</p>
+    <pre><code class="language-jsx">// JwtInspector.jsx — npm i jose
+import { useState } from "react";
+import { jwtVerify, createRemoteJWKSet, decodeJwt, decodeProtectedHeader } from "jose";
+
+export default function JwtInspector() {
+  const [token, setToken] = useState("");
+  const [jwksUrl, setJwksUrl] = useState(
+    "https://YOUR_TENANT.us.auth0.com/.well-known/jwks.json"
+  );
+  const [out, setOut] = useState(null);
+
+  async function inspect() {
+    try {
+      // 1. DECODE (no key) — read-only, NOT trustworthy yet.
+      const header = decodeProtectedHeader(token);
+      const payload = decodeJwt(token);
+
+      // 2. VERIFY against the live JWKS — this is what establishes trust.
+      const JWKS = createRemoteJWKSet(new URL(jwksUrl));
+      let verified = false, reason = "";
+      try {
+        await jwtVerify(token, JWKS, { algorithms: ["RS256"] });
+        verified = true;
+      } catch (e) { reason = e.message; }
+
+      setOut({ header, payload, verified, reason });
+    } catch (e) {
+      setOut({ error: "Malformed token: " + e.message });
+    }
+  }
+
+  return (
+    &lt;div&gt;
+      &lt;textarea value={token} onChange={(e) =&gt; setToken(e.target.value)}
+                placeholder="Paste JWT here" rows={4} /&gt;
+      &lt;input value={jwksUrl} onChange={(e) =&gt; setJwksUrl(e.target.value)} /&gt;
+      &lt;button onClick={inspect}&gt;Inspect&lt;/button&gt;
+      {out &amp;&amp; &lt;pre&gt;{JSON.stringify(out, null, 2)}&lt;/pre&gt;}
+    &lt;/div&gt;
+  );
+}</code></pre>
+    <p><strong>Stretch goals:</strong> show a green/red badge for verification; highlight expired tokens by comparing <code>exp</code> to <code>Date.now()/1000</code>; pretty-print namespaced custom claims separately from registered ones; warn loudly if the header <code>alg</code> is anything other than RS256.</p>
+    <div class="callout warn"><span class="tag">Warn</span><p>This is a learning tool. Never paste <em>production</em> tokens into any third-party online JWT decoder — the token is a live credential. Decode locally.</p></div>
+  </section>
+
+  <!-- 18 -->
+  <section id="quiz">
+    <h2>18. Quiz — 22 Questions</h2>
+    <ol>
+      <li>What three segments make up a JWT, and what separates them?</li>
+      <li>Is a signed (JWS) JWT encrypted? What does the signature actually guarantee?</li>
+      <li>Why Base64url instead of standard Base64? Name the two character substitutions.</li>
+      <li>What does Base64url do about padding (<code>=</code>) characters?</li>
+      <li>Which header field tells the verifier which public key to use?</li>
+      <li>Name five registered claims and what each means.</li>
+      <li>Are <code>exp</code> and <code>iat</code> in seconds or milliseconds?</li>
+      <li>What does <code>nbf</code> control?</li>
+      <li>In HS256, who can both create and verify a token? Why is that a limitation?</li>
+      <li>In RS256, which key signs and which key verifies?</li>
+      <li>Why is RS256 the better choice for distributed microservices?</li>
+      <li>What is the JWKS endpoint and what format is it?</li>
+      <li>Describe how key rotation works without breaking valid tokens.</li>
+      <li>What is the <code>alg:none</code> attack and the one-line defense?</li>
+      <li>Explain the RS256→HS256 confusion attack.</li>
+      <li>A token's signature is valid. List three claim checks you still must perform.</li>
+      <li>Why must custom Auth0 claims be namespaced?</li>
+      <li>Why can't you cheaply revoke a JWT, and what mitigations exist?</li>
+      <li>Why is RSA <em>verification</em> fast despite RSA being "slow"?</li>
+      <li>What advantage does ES256 have over RS256 in token/key size?</li>
+      <li>What's the difference between decoding and verifying a JWT?</li>
+      <li>Why should access tokens be short-lived, and what renews them?</li>
+    </ol>
+    <details>
+      <summary>Show answer key</summary>
+      <ol>
+        <li>Header, payload, signature — separated by dots (<code>.</code>).</li>
+        <li>No, it is not encrypted; it is signed. The signature guarantees integrity (not altered) and authenticity (issued by the expected key), not confidentiality.</li>
+        <li>URL/header safety. Base64url replaces <code>+</code>→<code>-</code> and <code>/</code>→<code>_</code>.</li>
+        <li>It strips trailing <code>=</code> padding entirely.</li>
+        <li><code>kid</code> (key id) in the header.</li>
+        <li><code>iss</code> issuer, <code>sub</code> subject, <code>aud</code> audience, <code>exp</code> expiry, <code>iat</code> issued-at (others: <code>nbf</code> not-before, <code>jti</code> token id).</li>
+        <li>Seconds (UNIX epoch seconds).</li>
+        <li>The "not before" time — the token is invalid until this moment.</li>
+        <li>Anyone holding the shared secret; since every verifier needs the secret, every verifier could also forge tokens.</li>
+        <li>The private key signs; the public key verifies.</li>
+        <li>Verifiers need only the public key (via JWKS), so they can confirm tokens without the ability to mint them and without sharing secrets.</li>
+        <li><code>/.well-known/jwks.json</code> — a JSON document listing the issuer's public keys, each with a <code>kid</code>.</li>
+        <li>The issuer publishes old and new public keys simultaneously, signs new tokens with the new key (new <code>kid</code>), and old tokens keep verifying with the old key until they expire; verifiers select by <code>kid</code> and refresh JWKS on miss.</li>
+        <li>Setting <code>alg</code> to <code>none</code> and dropping the signature so a naive verifier accepts an unsigned token. Defense: pin an explicit algorithm allow-list and reject <code>none</code>.</li>
+        <li>The attacker re-signs with HS256 using the RSA public key as the HMAC secret; a verifier that trusts the header's <code>alg</code> and verifies with that public key accepts the forgery. Pin <code>RS256</code> to defeat it.</li>
+        <li><code>exp</code> not passed, <code>iss</code> matches expected issuer, <code>aud</code> matches your API (also optionally <code>nbf</code>).</li>
+        <li>To avoid collisions with registered/OIDC claims; Auth0 enforces a URI namespace so custom data is collision-resistant.</li>
+        <li>It's self-contained and valid until <code>exp</code> with no server-side state. Mitigations: short lifetimes, rotating refresh tokens, a <code>jti</code> denylist at the gateway, Auth0 revocation features.</li>
+        <li>Verification uses the small public exponent (e.g. 65537), making the modular exponentiation cheap.</li>
+        <li>ES256 uses much smaller keys (256-bit elliptic curve) and produces smaller signatures/tokens than 2048-bit RSA.</li>
+        <li>Decoding just Base64url-reads the claims (no security). Verifying checks the signature with a key and validates claims — it establishes trust.</li>
+        <li>Because they can't be cheaply revoked, a stolen short-lived token has a small blast radius; refresh tokens (ideally rotating) obtain new access tokens.</li>
+      </ol>
+    </details>
+  </section>
+
+  <!-- 19 -->
+  <section id="cheatsheet">
+    <h2>19. Cheat Sheet</h2>
+    <pre class="diagram">
+ STRUCTURE   header.payload.signature   (3 base64url parts, dot-joined)
+ HEADER      { "alg":"RS256", "typ":"JWT", "kid":"..." }
+ SIGN INPUT  base64url(header) + "." + base64url(payload)
+ SIGNATURE   sign(signInput, key, alg)
+
+ REGISTERED CLAIMS
+   iss  issuer        sub  subject (user id)   aud  audience (the API)
+   exp  expiry (sec)  iat  issued-at (sec)     nbf  not-before (sec)
+   jti  unique token id
+
+ ALGORITHMS
+   HS256  HMAC-SHA256   symmetric    same secret signs+verifies
+   RS256  RSA-SHA256    asymmetric   private signs / public verifies  (Auth0 default)
+   ES256  ECDSA-SHA256  asymmetric   small keys+tokens, fast
+
+ VERIFY CHECKLIST  (do ALL)
+   [ ] signature valid (key by kid from JWKS)
+   [ ] alg pinned to an allow-list  (defeats alg:none / RS256->HS256)
+   [ ] exp not passed (+small leeway)   [ ] nbf reached
+   [ ] iss == expected issuer           [ ] aud == my API
+
+ ENDPOINTS
+   JWKS:   https://TENANT/.well-known/jwks.json
+   OIDC:   https://TENANT/.well-known/openid-configuration
+   HEADER: Authorization: Bearer &lt;token&gt;
+
+ GOLDEN RULES
+   * signed != secret      * decode != verify
+   * times are SECONDS     * never trust header alg
+   * RS256 for APIs        * keep access tokens short-lived
+    </pre>
+  </section>
+
+  <!-- 20 -->
+  <section id="takeaways">
+    <h2>20. Key Takeaways</h2>
+    <div class="callout key"><span class="tag">Key</span><p>A JWT is three Base64url segments — <strong>header.payload.signature</strong> — that together form a self-describing, tamper-evident container for identity claims.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p>Base64url is <strong>encoding, not encryption</strong>. A signed JWT's contents are readable by anyone; the signature provides <strong>integrity and authenticity</strong>, never confidentiality. Never store secrets in claims.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p>The registered claims <code>iss</code>, <code>sub</code>, <code>aud</code>, <code>exp</code>, <code>nbf</code>, <code>iat</code>, <code>jti</code> carry the who/what/when of a token. Validating <code>iss</code>, <code>aud</code>, and <code>exp</code> is as essential as checking the signature.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p><strong>HS256</strong> is symmetric (one shared secret). <strong>RS256</strong>/<strong>ES256</strong> are asymmetric (private signs, public verifies). Asymmetric signing + JWKS is what lets countless services verify Auth0 tokens locally with no shared secrets — the reason RS256 is the default.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p><strong>JWKS + <code>kid</code></strong> make key rotation seamless: publish old and new public keys, select by <code>kid</code>, refresh on miss. Custom claims must be <strong>namespaced</strong>.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p>Always <strong>pin the algorithm</strong> to an allow-list (defeats <code>alg:none</code> and RS256→HS256), and remember: a valid signature alone is necessary but not sufficient — you must still validate the claims before you trust the request.</p></div>
+  </section>
+
+  <nav class="pager">
+    <a class="prev" href="chapter-08.html">← Previous</a>
+    <a class="next" href="chapter-10.html">Next →</a>
+  </nav>
+</main>
+<footer class="site-footer">Master Auth0 End-to-End · Chapter 9 of 32</footer>
+</body>
+</html>

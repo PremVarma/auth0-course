@@ -1,0 +1,736 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 23 — Project 7 — GraphQL Authentication | Master Auth0</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">🔐 Master Auth0</a>
+  <nav class="topnav">
+    <a href="chapter-22.html">← Prev</a>
+    <a href="index.html">Contents</a>
+    <a href="chapter-24.html">Next →</a>
+  </nav>
+</header>
+<main class="container">
+  <div class="chapter-head">
+    <span class="phase">Phase 8 · Integration Projects</span>
+    <h1>Chapter 23 — Project 7 — GraphQL Authentication</h1>
+    <p class="lead">REST gave you a comfortable mental model: one URL is one resource, one HTTP verb is one action, so you bolt a middleware in front of the route and you are secured. GraphQL deliberately demolishes that model. There is <em>one</em> endpoint, <em>one</em> HTTP verb (POST), and a client can ask for any shape of data it likes in a single request — including data it is not allowed to see. The gateway-guard pattern collapses, because there is no longer a gate per resource; there is a single door behind which lives an entire graph. This chapter rebuilds authentication and authorization for that graph from first principles. We will put the Auth0-verified principal into the GraphQL <code>context</code>, validate Auth0-issued JWTs in Apollo Server, and then enforce access at three depths — the <em>operation</em>, the <em>type</em>, and the individual <em>field</em> — using both imperative checks in resolvers and declarative schema directives like <code>@auth</code> and <code>@hasPermission</code>. By the end you will be able to defend why a query and a mutation need different authorization philosophies, and ship a GraphQL API that is as locked down as any REST service you have built.</p>
+  </div>
+
+  <!-- ============================================================= 1 -->
+  <section id="theory">
+    <h2>1. Theory — First Principles: Why GraphQL Breaks Gateway Auth</h2>
+
+    <p>Start from the two questions every secured system must answer, the same pair we have used all course long:</p>
+    <ul>
+      <li><strong>Authentication (AuthN) — <em>Who are you?</em></strong> Proving the caller's identity. In our stack this is done <em>once</em>, by validating an Auth0-issued JWT access token. GraphQL changes <em>nothing</em> about this step; a JWT is a JWT no matter what protocol carries it.</li>
+      <li><strong>Authorization (AuthZ) — <em>What may you do?</em></strong> Deciding whether <em>this</em> caller may perform <em>this</em> operation on <em>this</em> data. This is where GraphQL is genuinely different from REST, and where most teams get it dangerously wrong.</li>
+    </ul>
+
+    <p>To see <em>why</em> it is different, you must understand what a GraphQL request actually is. A REST request is addressed: <code>GET /invoices/482</code> names exactly one resource and one action. The server can inspect the URL and the verb <em>before running any business logic</em> and decide allow/deny. That is why REST security lives in middleware — the middleware has everything it needs from the request line.</p>
+
+    <p>A GraphQL request is not addressed. It is a <em>document</em>. The client POSTs a query like <code>{ me { email invoices { total } } }</code> to a single endpoint (conventionally <code>/graphql</code>). The server cannot know what data will be touched until it <em>parses and executes</em> that document, walking a tree of resolvers. There is no URL that says "invoices" and no verb that says "read." The authorization decision therefore cannot live at the door — it must live <em>inside the graph</em>, attached to the schema itself.</p>
+
+    <table>
+      <thead><tr><th>Concept</th><th>REST</th><th>GraphQL</th></tr></thead>
+      <tbody>
+        <tr><td>Endpoints</td><td>Many (one per resource)</td><td>One (<code>/graphql</code>)</td></tr>
+        <tr><td>HTTP verb carries intent</td><td>Yes (GET/POST/PUT/DELETE)</td><td>No (almost always POST)</td></tr>
+        <tr><td>What is requested is knowable from the request line</td><td>Yes</td><td>No — only after parsing the query</td></tr>
+        <tr><td>Natural place for AuthZ</td><td>Route middleware / gateway</td><td>Resolver / schema directive / field level</td></tr>
+        <tr><td>Over-fetching risk</td><td>Low (server picks the shape)</td><td>High (client picks the shape)</td></tr>
+        <tr><td>Authentication mechanism</td><td>JWT / session</td><td>Identical — JWT / session</td></tr>
+      </tbody>
+    </table>
+
+    <p>The crucial first-principles takeaway: <strong>AuthN is unchanged; AuthZ moves from the perimeter into the resolution layer.</strong> The Auth0 part of this chapter (validating a JWT against your tenant's JWKS) is exactly what you learned for REST APIs. The new work is wiring the <em>result</em> of that validation — the principal — into a place every resolver can reach, and then enforcing fine-grained rules there.</p>
+
+    <div class="callout key"><span class="tag">Key</span><p>In REST you guard <em>routes</em>. In GraphQL you guard <em>the graph</em>. Authentication still happens once at the edge (validate the Auth0 JWT). Authorization must happen at the operation, type, and field level — because a single query can reach data that spans many "resources" at once.</p></div>
+  </section>
+
+  <!-- ============================================================= 2 -->
+  <section id="story">
+    <h2>2. Story-Based Explanation — The Restaurant With One Waiter</h2>
+
+    <p>Picture two restaurants owned by the same company.</p>
+
+    <p><strong>Restaurant REST</strong> is a food court. Every dish has its own counter — the pizza counter, the sushi counter, the dessert counter. A security guard stands at each counter checking your wristband. If your band does not grant dessert, the dessert guard simply refuses you. Adding security is easy: hire one guard per counter. This is route middleware.</p>
+
+    <p><strong>Restaurant GraphQL</strong> is a single table where you hand one waiter a written order: <em>"the steak, my account balance, the chef's secret recipe, and the other table's bill."</em> The waiter takes <em>one</em> order slip and fetches everything in one trip. There is exactly one waiter and one door. If you put a guard at the door, the guard can check that you are a customer at all (authentication) but cannot tell, from the door, that your slip secretly asked for the chef's recipe and a stranger's bill. The dangerous items are <em>inside</em> the order.</p>
+
+    <p>So the company rewrites the rule: the <em>waiter</em> must read each line of the slip and apply policy line by line. "Steak — allowed. Your balance — allowed, it's yours. Secret recipe — denied, staff only. Other table's bill — denied, not yours." The order still succeeds for the allowed lines; the forbidden lines come back as errors or nulls. That is field-level authorization, and the waiter is your resolver layer.</p>
+
+    <p>Now extend the story. Some slips are not requests for food but <em>instructions</em>: "cancel table 5's order," "comp this meal," "fire the kitchen." Those are <strong>mutations</strong>. The company decides that any instruction — anything that changes the restaurant's state — must be checked <em>before</em> the waiter acts, and that the bar for instructions is higher than for merely reading the menu. Reading is permissive; commanding is strict. Hold that distinction; it is the spine of Section&nbsp;13's interview answers and the reason mutations and queries get different default postures.</p>
+
+    <div class="callout note"><span class="tag">Note</span><p>The "one waiter, one door" image explains the single most asked GraphQL-security question: <em>"If everything goes through one endpoint, how do you secure individual fields?"</em> Answer: you don't secure the door — you make the waiter (resolvers + directives) enforce policy per line of the order.</p></div>
+  </section>
+
+  <!-- ============================================================= 3 -->
+  <section id="diagrams">
+    <h2>3. ASCII Diagrams — The Request Lifecycle and Where Auth Lives</h2>
+
+    <h3>3.1 The end-to-end token flow (browser → Auth0 → Apollo)</h3>
+    <pre class="diagram">
+   ┌──────────┐   1. login (Universal Login)    ┌─────────────┐
+   │  Browser │ ───────────────────────────────▶│   Auth0     │
+   │  / SPA   │ ◀───────────────────────────────│  (issuer)   │
+   └────┬─────┘   2. access_token (JWT, RS256)   └──────┬──────┘
+        │                                               │ publishes
+        │ 3. POST /graphql                              │ JWKS at
+        │    Authorization: Bearer &lt;JWT&gt;                │ /.well-known
+        │    body: { query: "{ me { email } }" }        │ /jwks.json
+        ▼                                               │
+   ┌─────────────────────────────────────────────┐     │
+   │            APOLLO SERVER (Node.js)           │     │
+   │                                              │     │
+   │  context() ──▶ verify JWT signature ◀────────┼─────┘
+   │                using cached JWKS keys        │  4. fetch + cache
+   │       │                                      │     signing keys
+   │       ▼                                      │
+   │  principal = { sub, permissions, scope } ──▶ context
+   │       │                                      │
+   │       ▼                                      │
+   │  execute query ──▶ resolvers read context    │
+   │                    + enforce AuthZ           │
+   └─────────────────────────────────────────────┘
+    </pre>
+
+    <h3>3.2 Where each layer of authorization sits in the schema tree</h3>
+    <pre class="diagram">
+                       Query (operation root)
+                          │
+        ┌─────────────────┼──────────────────┐
+        ▼                 ▼                  ▼
+   me: User        users: [User]      report: Report
+  (logged-in)   @auth(role:"admin")  @hasPermission("read:reports")
+        │          ── TYPE/OP level ──        │  ── OP level ──
+        ▼
+     User type
+        │
+   ┌────┼───────────────┬──────────────────────┐
+   ▼    ▼               ▼                       ▼
+  id  email      ssn @hasPermission     salary @auth(self|admin)
+ (any) (self)    ("read:pii")            ── FIELD level ──
+                 ── FIELD level ──
+
+  Legend:
+    OP-level     = guard the whole query/mutation entry
+    TYPE-level   = guard every field returning this type
+    FIELD-level  = guard one sensitive field only
+    </pre>
+
+    <h3>3.3 Decision flow inside a single field resolver</h3>
+    <pre class="diagram">
+  resolver(parent, args, context, info)
+        │
+        ▼
+   context.user exists? ──no──▶ throw AuthenticationError (401-equivalent)
+        │ yes
+        ▼
+   does user have required
+   permission / role / scope? ──no──▶ throw ForbiddenError (403-equivalent)
+        │ yes
+        ▼
+   is this row owned by user
+   OR is user admin?         ──no──▶ throw ForbiddenError / return null
+        │ yes
+        ▼
+   return data
+    </pre>
+
+    <div class="callout tip"><span class="tag">Tip</span><p>Memorize diagram 3.3 as the universal field-guard ladder: <strong>authenticated? → authorized (coarse)? → owns the resource (fine)?</strong> Every directive and helper you write is just an automation of these three rungs.</p></div>
+  </section>
+
+  <!-- ============================================================= 4 -->
+  <section id="analogy">
+    <h2>4. Real-World Analogy — The Office Building vs. The Open-Plan Library</h2>
+
+    <p>A <strong>REST API is an office building.</strong> Each room (route) has a door with a badge reader. Want the finance room? Badge in at the finance door. Security is physical and per-room; the building's architecture <em>is</em> the access-control list.</p>
+
+    <p>A <strong>GraphQL API is an open-plan library</strong> where you fill out a single request form and a librarian fetches a stack of materials for you in one trip. There are no walls between sections, so you cannot put a badge reader on a room — there are no rooms. Instead:</p>
+    <ul>
+      <li><strong>The front desk (context builder)</strong> checks your membership card once — that's authentication, the Auth0 JWT.</li>
+      <li><strong>The librarian (resolvers/directives)</strong> reads your form item by item and applies the rules: public shelves for anyone, the rare-books cage only for researchers, your own borrowing history only for you.</li>
+      <li><strong>Restricted items</strong> can be silently omitted from the stack (return <code>null</code>) or refused out loud (return an error) — a deliberate design choice we examine in Section&nbsp;9.</li>
+    </ul>
+
+    <p>The analogy also explains the <em>N+1 cost</em> of fine-grained auth (Section&nbsp;10): if checking each form line requires the librarian to walk to a back office and phone HR ("is this person really a researcher?"), a form with 100 lines triggers 100 phone calls. The fix is to phone HR <em>once</em> when you check the membership card and write the answer on a sticky note (the principal in context) the librarian can glance at for free.</p>
+
+    <div class="callout note"><span class="tag">Note</span><p>Why the analogy matters for interviews: when asked "how is GraphQL auth different?" the strongest answer is structural, not syntactic — REST's <em>architecture</em> enforces access (rooms with doors); GraphQL's architecture is a single open space, so access control must be <em>data-driven</em> and pushed into resolution.</p></div>
+  </section>
+
+  <!-- ============================================================= 5 -->
+  <section id="internals">
+    <h2>5. Internal Working — How Apollo Builds Context and Resolves Fields</h2>
+
+    <p>To secure GraphQL correctly you must understand the execution machinery, because authorization hooks into specific phases. A GraphQL request passes through these stages:</p>
+
+    <ol>
+      <li><strong>HTTP receive.</strong> The server receives a POST with a JSON body <code>{ query, variables, operationName }</code> and HTTP headers including <code>Authorization: Bearer &lt;token&gt;</code>.</li>
+      <li><strong>Context construction.</strong> <em>Before</em> any resolver runs, Apollo invokes your <code>context</code> function <em>once per request</em>. This is the single, perfect place to authenticate: read the header, verify the JWT against Auth0's JWKS, and return a <code>context</code> object containing the principal. If the token is missing or invalid you have a choice — throw here (reject the whole request) or set <code>user = null</code> and let resolvers decide (recommended, because public fields should still work for anonymous callers).</li>
+      <li><strong>Parse.</strong> The query string is lexed and parsed into an Abstract Syntax Tree (AST). Syntax errors are rejected here, before any auth or business logic.</li>
+      <li><strong>Validate.</strong> The AST is validated against the schema (do the requested fields exist? are types correct?). Custom validation rules can run here — e.g. query-depth and complexity limits, which are themselves a security control (Section&nbsp;10).</li>
+      <li><strong>Execute.</strong> Apollo walks the AST top-down, calling a resolver for every requested field. Each resolver receives four arguments: <code>(parent, args, contextValue, info)</code>. <code>contextValue</code> is the object your context function returned — the same instance is shared by every resolver in this request, which is exactly why the principal belongs there.</li>
+    </ol>
+
+    <h3>The four resolver arguments — the load-bearing one is <code>context</code></h3>
+    <table>
+      <thead><tr><th>Argument</th><th>What it is</th><th>Role in auth</th></tr></thead>
+      <tbody>
+        <tr><td><code>parent</code></td><td>Result of the parent field's resolver (e.g. the <code>User</code> object when resolving <code>User.ssn</code>)</td><td>Holds the owning record — used for ownership checks (is <code>parent.id === context.user.sub</code>?)</td></tr>
+        <tr><td><code>args</code></td><td>Arguments passed to the field (<code>{ id: "5" }</code>)</td><td>Identifies the target resource for the policy decision</td></tr>
+        <tr><td><code>context</code></td><td>Per-request shared object from your context function</td><td><strong>Carries the authenticated principal</strong> — the heart of GraphQL auth</td></tr>
+        <tr><td><code>info</code></td><td>AST + execution metadata (field name, path, schema)</td><td>Used by directives/plugins to read field-level config and the selection set</td></tr>
+      </tbody>
+    </table>
+
+    <h3>How a schema directive actually intercepts a field</h3>
+    <p>A directive like <code>@hasPermission(permission: "read:reports")</code> is not magic. At server startup you <em>transform the schema</em>: you walk every field, look for the directive in <code>info</code>/the field's AST, and if present you <strong>wrap the original resolver</strong> in a new function that runs the check first, then calls the original. This is the same decorator pattern you would use in any language. The directive is just declarative sugar over "wrap this resolver with a guard." Understanding this demystifies the whole feature: a directive is a compile-time resolver wrapper.</p>
+
+    <div class="callout key"><span class="tag">Key</span><p>The <code>context</code> function runs once per request, before resolution, and its return value is handed to <em>every</em> resolver as the third argument. That single fact is the entire architecture: authenticate in <code>context</code>, authorize in resolvers/directives that read <code>context.user</code>.</p></div>
+  </section>
+
+  <!-- ============================================================= 6 -->
+  <section id="walkthrough">
+    <h2>6. Code Walkthrough — From JWT Verification to a Populated Principal</h2>
+
+    <p>We build the spine piece by piece using Node.js with <strong>Apollo Server 4</strong> (the current major line in 2026). Alternatives are noted in Section&nbsp;7. First, the JWT verifier. We never hardcode a secret: Auth0 signs access tokens with <strong>RS256</strong> (asymmetric), so we fetch the public signing keys from the tenant's JWKS endpoint and cache them.</p>
+
+    <pre><code class="language-js">// auth.js — verify an Auth0 access token (RS256) using the tenant JWKS
+import { jwtVerify, createRemoteJWKSet } from 'jose';
+
+// Auth0 publishes rotating public keys here. createRemoteJWKSet
+// caches them in memory and refreshes on key rotation automatically.
+const JWKS = createRemoteJWKSet(
+  new URL(`https://${process.env.AUTH0_DOMAIN}/.well-known/jwks.json`)
+);
+
+export async function verifyToken(token) {
+  // jwtVerify checks: signature (against JWKS), exp/nbf, iss, aud.
+  const { payload } = await jwtVerify(token, JWKS, {
+    issuer:   `https://${process.env.AUTH0_DOMAIN}/`,   // must match `iss`
+    audience: process.env.AUTH0_AUDIENCE,               // your API identifier
+    // algorithms intentionally pinned — never accept "none" or HS256 here:
+    algorithms: ['RS256'],
+  });
+  return payload; // { sub, scope, permissions, ... }
+}</code></pre>
+
+    <p>Why each guard matters: the <code>audience</code> check ensures the token was minted for <em>your</em> API and not some other Auth0 application in the same tenant; the <code>issuer</code> check binds it to your tenant; pinning <code>algorithms</code> to <code>RS256</code> defeats the classic "alg:none" and "HS256 with the public key as secret" attacks. Skipping any of these is a real, exploited vulnerability — not theory.</p>
+
+    <p>Next, turn the verified payload into a principal and place it on the context.</p>
+
+    <pre><code class="language-js">// principal.js — shape the raw JWT payload into something resolvers like
+export function toPrincipal(payload) {
+  if (!payload) return null;
+  // Auth0 puts API permissions in `permissions` when RBAC is enabled,
+  // and OAuth scopes in the space-delimited `scope` string.
+  const scopes = (payload.scope || '').split(' ').filter(Boolean);
+  return {
+    sub: payload.sub,                         // stable user id, e.g. auth0|abc
+    scopes,
+    permissions: payload.permissions || [],   // e.g. ["read:reports"]
+    // helpers the resolvers/directives will call:
+    has(perm)  { return this.permissions.includes(perm); },
+    hasScope(s){ return this.scopes.includes(s); },
+    isAdmin()  { return this.permissions.includes('admin:all'); },
+  };
+}</code></pre>
+
+    <p>Finally, the context function that ties them together. Note the deliberate choice: a missing/invalid token does <em>not</em> throw — it yields <code>user: null</code>, so public fields still work and <em>resolvers</em> decide what requires login.</p>
+
+    <pre><code class="language-js">// context.js
+import { verifyToken } from './auth.js';
+import { toPrincipal } from './principal.js';
+
+export async function buildContext({ req }) {
+  const header = req.headers.authorization || '';
+  const token  = header.startsWith('Bearer ') ? header.slice(7) : null;
+
+  let user = null;
+  if (token) {
+    try {
+      const payload = await verifyToken(token);
+      user = toPrincipal(payload);
+    } catch (err) {
+      // Invalid token (expired, wrong aud, bad signature) → stay anonymous.
+      // Do NOT leak the reason to the client; log it server-side.
+      console.warn('Token rejected:', err.code || err.message);
+    }
+  }
+  return { user };   // &lt;-- handed to EVERY resolver as the 3rd argument
+}</code></pre>
+
+    <div class="callout warn"><span class="tag">Warn</span><p>Do not return the raw JWT payload as your principal. Map it to a small, intentional shape. Leaking the entire token into context tempts resolvers to trust arbitrary claims, and couples your business logic to Auth0's exact claim layout — which makes provider migration painful and auditing harder.</p></div>
+  </section>
+
+  <!-- ============================================================= 7 -->
+  <section id="implementation">
+    <h2>7. Practical Implementation — Operation, Type, and Field Authorization</h2>
+
+    <p>Now we enforce the three depths. We will show <strong>both</strong> styles — imperative checks in resolvers (explicit, easy to debug) and a declarative custom directive (DRY, self-documenting in the schema). Production systems usually combine them.</p>
+
+    <h3>7.1 The schema (with directive definitions)</h3>
+    <pre><code class="language-graphql"># schema.graphql
+# Declare custom directives so the schema is the source of truth for policy.
+directive @auth on FIELD_DEFINITION | OBJECT
+directive @hasPermission(permission: String!) on FIELD_DEFINITION
+
+type Query {
+  publicStats: Stats                                   # anonymous OK
+  me: User @auth                                       # any logged-in user
+  users: [User!]! @hasPermission(permission: "read:users")  # admin-ish
+  report(id: ID!): Report @hasPermission(permission: "read:reports")
+}
+
+type Mutation {
+  updateProfile(name: String!): User @auth
+  deleteUser(id: ID!): Boolean @hasPermission(permission: "delete:users")
+}
+
+type User {
+  id: ID!
+  email: String! @auth          # only logged-in callers see emails
+  ssn: String @hasPermission(permission: "read:pii")  # field-level PII guard
+}
+
+type Report { id: ID! title: String! body: String! }
+type Stats  { totalUsers: Int! }</code></pre>
+
+    <h3>7.2 Imperative resolver checks (the explicit style)</h3>
+    <pre><code class="language-js">// Small reusable guards — these throw the right GraphQL errors.
+import { GraphQLError } from 'graphql';
+
+function requireUser(ctx) {
+  if (!ctx.user) {
+    throw new GraphQLError('Not authenticated', {
+      extensions: { code: 'UNAUTHENTICATED', http: { status: 401 } },
+    });
+  }
+  return ctx.user;
+}
+function requirePermission(ctx, perm) {
+  const user = requireUser(ctx);
+  if (!user.has(perm)) {
+    throw new GraphQLError('Forbidden', {
+      extensions: { code: 'FORBIDDEN', http: { status: 403 } },
+    });
+  }
+  return user;
+}
+
+export const resolvers = {
+  Query: {
+    publicStats: () =&gt; ({ totalUsers: 42 }),         // no guard: public
+    me: (_p, _a, ctx) =&gt; getUser(requireUser(ctx).sub),
+    users: (_p, _a, ctx) =&gt; { requirePermission(ctx, 'read:users'); return listUsers(); },
+    report: (_p, { id }, ctx) =&gt; {
+      requirePermission(ctx, 'read:reports');
+      return getReport(id);
+    },
+  },
+  Mutation: {
+    deleteUser: (_p, { id }, ctx) =&gt; {
+      requirePermission(ctx, 'delete:users');
+      return removeUser(id);
+    },
+  },
+  User: {
+    // FIELD-level ownership check: you see your own ssn; admins see all.
+    ssn: (parent, _a, ctx) =&gt; {
+      const user = requireUser(ctx);
+      if (user.sub !== parent.id &amp;&amp; !user.isAdmin()) {
+        throw new GraphQLError('Forbidden', { extensions: { code: 'FORBIDDEN' } });
+      }
+      return parent.ssn;
+    },
+  },
+};</code></pre>
+
+    <h3>7.3 The declarative custom directive (the DRY style)</h3>
+    <p>This is the centerpiece the chapter promised: a real <code>@hasPermission</code> directive implemented as a schema transform that wraps resolvers.</p>
+
+    <pre><code class="language-js">// directives.js — implement @auth and @hasPermission via schema mapping
+import { mapSchema, getDirective, MapperKind } from '@graphql-tools/utils';
+import { defaultFieldResolver, GraphQLError } from 'graphql';
+
+export function authDirectiveTransformer(schema) {
+  return mapSchema(schema, {
+    [MapperKind.OBJECT_FIELD]: (fieldConfig) =&gt; {
+      const authDir = getDirective(schema, fieldConfig, 'auth')?.[0];
+      const permDir = getDirective(schema, fieldConfig, 'hasPermission')?.[0];
+      if (!authDir &amp;&amp; !permDir) return fieldConfig;          // no guard, leave it
+
+      const original = fieldConfig.resolve || defaultFieldResolver;
+      fieldConfig.resolve = async (parent, args, ctx, info) =&gt; {
+        if (!ctx.user) {
+          throw new GraphQLError('Not authenticated', {
+            extensions: { code: 'UNAUTHENTICATED' } });
+        }
+        if (permDir &amp;&amp; !ctx.user.has(permDir.permission)) {
+          throw new GraphQLError('Forbidden', {
+            extensions: { code: 'FORBIDDEN' } });
+        }
+        return original(parent, args, ctx, info);   // delegate to real resolver
+      };
+      return fieldConfig;
+    },
+  });
+}</code></pre>
+
+    <h3>7.4 Wiring it all into Apollo Server 4</h3>
+    <pre><code class="language-js">// server.js
+import { ApolloServer } from '@apollo/server';
+import { startStandaloneServer } from '@apollo/server/standalone';
+import { makeExecutableSchema } from '@graphql-tools/schema';
+import { readFileSync } from 'node:fs';
+import { resolvers } from './resolvers.js';
+import { authDirectiveTransformer } from './directives.js';
+import { buildContext } from './context.js';
+
+let schema = makeExecutableSchema({
+  typeDefs: readFileSync('./schema.graphql', 'utf8'),
+  resolvers,
+});
+schema = authDirectiveTransformer(schema);   // apply directive wrappers
+
+const server = new ApolloServer({ schema });
+
+const { url } = await startStandaloneServer(server, {
+  listen: { port: 4000 },
+  context: buildContext,                      // runs per request (Section 6)
+});
+console.log(`🚀 Secured GraphQL ready at ${url}`);</code></pre>
+
+    <div class="callout note"><span class="tag">Note · Alternatives</span><p>Apollo Server is the reference here, but the same principles port directly: <strong>GraphQL Yoga</strong> (also exposes a per-request <code>context</code>), <strong>Mercurius</strong> for Fastify, <strong>express-graphql</strong> (legacy), <strong>Pothos</strong>/<strong>Nexus</strong> (code-first schemas with auth plugins), and managed graphs like <strong>Hasura</strong>/<strong>Apollo Router</strong> with the <code>@requiresScopes</code>/<code>@authenticated</code> federation directives. The contract is universal: authenticate in context, authorize in the resolution layer.</p></div>
+  </section>
+
+  <!-- ============================================================= 8 -->
+  <section id="architecture">
+    <h2>8. Production Architecture — Where Auth Lives at Scale</h2>
+
+    <p>A single Apollo process is fine for a tutorial. In production you usually face a <em>federated graph</em> or a graph behind a gateway, and you must decide where token validation and policy enforcement live.</p>
+
+    <pre class="diagram">
+                  ┌──────────────────────────────────────┐
+   Client ──JWT──▶│  API Gateway / Apollo Router         │
+                  │  • validate Auth0 JWT once (RS256)   │
+                  │  • inject claims as signed headers   │
+                  │  • depth/complexity limits           │
+                  └───────────────┬──────────────────────┘
+                                  │  trusted internal headers
+                                  │  (x-user-sub, x-permissions)
+            ┌─────────────────────┼─────────────────────┐
+            ▼                     ▼                     ▼
+     ┌────────────┐       ┌────────────┐        ┌────────────┐
+     │ Users      │       │ Billing    │        │ Reports    │
+     │ subgraph   │       │ subgraph   │        │ subgraph   │
+     │ field auth │       │ field auth │        │ field auth │
+     └────────────┘       └────────────┘        └────────────┘
+       Each subgraph re-checks fine-grained authZ on its own fields.
+    </pre>
+
+    <p>Two architectural rules earn their keep:</p>
+    <ul>
+      <li><strong>Validate the JWT once, at the edge</strong> (gateway/router), then propagate <em>verified</em> claims to subgraphs as signed/trusted internal headers. Re-verifying the full JWT at every subgraph wastes CPU and JWKS round-trips. But — and this is critical — subgraphs must <strong>trust only the gateway</strong> (network isolation / mTLS), otherwise a caller could forge those headers directly.</li>
+      <li><strong>Authorize fine-grained access at the subgraph that owns the data.</strong> The gateway knows <em>who</em> you are; only the Billing subgraph knows whether <em>this</em> invoice is yours. Coarse, declarative checks (role/scope present?) can live at the gateway via Apollo Router's <code>@authenticated</code> and <code>@requiresScopes</code>; ownership checks must live with the data.</li>
+    </ul>
+
+    <p>For RBAC, enable it in the Auth0 dashboard (API → RBAC Settings → "Add Permissions in the Access Token") so the <code>permissions</code> claim arrives populated. Keep permission strings stable and resource-oriented (<code>read:reports</code>, <code>delete:users</code>) — they become a public contract between Auth0 and your graph.</p>
+
+    <div class="callout tip"><span class="tag">Tip</span><p>Cache the JWKS aggressively (the <code>jose</code> remote key set does this for you), but allow refresh on key rotation. A cold JWKS fetch on every request adds latency and a hard dependency on Auth0's availability to your hot path.</p></div>
+  </section>
+
+  <!-- ============================================================= 9 -->
+  <section id="security">
+    <h2>9. Security Analysis — Threats Unique to GraphQL</h2>
+
+    <table>
+      <thead><tr><th>Threat</th><th>Why GraphQL is exposed</th><th>Mitigation</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Introspection leakage</strong></td><td>The schema is queryable by default, handing attackers a full map of types and fields</td><td>Disable introspection in production (or gate it behind admin auth); never rely on it as security, only as defense-in-depth</td></tr>
+        <tr><td><strong>Field-level data exposure</strong></td><td>Clients pick the shape; a careless schema lets anyone select <code>ssn</code></td><td>Field/type directives; default-deny on sensitive fields</td></tr>
+        <tr><td><strong>BOLA / IDOR</strong> (broken object-level auth)</td><td><code>report(id: "999")</code> may fetch someone else's report</td><td>Ownership checks using <code>parent</code>/<code>args</code> vs <code>context.user.sub</code></td></tr>
+        <tr><td><strong>Batching / alias abuse</strong></td><td>One request can alias the same field 1000× to brute-force or amplify</td><td>Limit aliases, query depth, and complexity; rate-limit per principal</td></tr>
+        <tr><td><strong>Deeply nested queries (DoS)</strong></td><td><code>{ a { b { a { b ... }}}}</code> explodes resolver count</td><td>Query depth + cost analysis as a validation rule</td></tr>
+        <tr><td><strong>Error message leakage</strong></td><td>Stack traces / "wrong audience" hints aid attackers</td><td>Mask errors in production; log details server-side only</td></tr>
+        <tr><td><strong>Algorithm confusion</strong></td><td>Accepting <code>alg:none</code> or HS256 forges tokens</td><td>Pin <code>algorithms: ['RS256']</code> as in Section 6</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Throw vs. null: the philosophical security choice</h3>
+    <p>When a caller requests a forbidden field, you can <strong>throw</strong> a <code>ForbiddenError</code> (loud — the whole field errors, partial data returns for the rest) or <strong>return null</strong> (quiet — the field is simply empty). Throwing is honest and debuggable; returning null avoids confirming the field even exists, reducing information disclosure. Choose deliberately per field: for <em>existence-sensitive</em> data (does this user even have an SSN on file?) prefer null; for clear policy boundaries prefer an explicit <code>FORBIDDEN</code> error so clients can react correctly.</p>
+
+    <div class="callout danger"><span class="tag">Danger</span><p>The #1 GraphQL breach pattern is <strong>BOLA</strong>: authentication passes (the JWT is valid) but the resolver never checks <em>ownership</em>, so any logged-in user can read any record by guessing IDs. A valid token is not authorization. Always compare the target resource's owner against <code>context.user.sub</code>.</p></div>
+  </section>
+
+  <!-- ============================================================= 10 -->
+  <section id="performance">
+    <h2>10. Performance Considerations — Auth Without N+1</h2>
+
+    <p>Fine-grained authorization can quietly destroy performance because it runs <em>per field, per row</em>. A query returning 500 users, each with an authorized <code>ssn</code> field, runs the guard 500 times. If each guard hits the database or calls Auth0, you have built an N+1 catastrophe.</p>
+
+    <ul>
+      <li><strong>Authenticate once, authorize from memory.</strong> The principal (permissions, scopes, roles) is decoded from the JWT in the context function — a single operation. Every subsequent permission check is an in-memory array lookup, not a network call. This is the entire reason the principal lives in context.</li>
+      <li><strong>Batch ownership lookups with DataLoader.</strong> When ownership checks need data ("is report 999 owned by this user?"), use a per-request <code>DataLoader</code> to coalesce the lookups into one batched query, deduplicated and cached for the request's lifetime.</li>
+      <li><strong>Push authorization into the data query.</strong> The cheapest field-level check is the one you never make: filter at the database (<code>WHERE owner_id = $sub</code>) so unauthorized rows never enter the resolver. This converts authorization into a query predicate.</li>
+      <li><strong>Bound the work before it starts.</strong> Query depth and complexity limits cap how many resolvers (and thus how many auth checks) a single request can trigger — a performance <em>and</em> security control.</li>
+      <li><strong>Cache JWKS.</strong> Asymmetric verification is fast (microseconds), but fetching keys is a network call; cache it (Section 8).</li>
+    </ul>
+
+    <pre><code class="language-js">// DataLoader keeps ownership checks O(1 batched query) per request.
+import DataLoader from 'dataloader';
+function makeLoaders() {
+  return {
+    reportOwner: new DataLoader(async (ids) =&gt; {
+      const rows = await db.reports.findOwners(ids);  // ONE query for all ids
+      const map = new Map(rows.map(r =&gt; [r.id, r.owner_id]));
+      return ids.map(id =&gt; map.get(id) ?? null);
+    }),
+  };
+}
+// build a fresh loader set per request inside buildContext:
+//   return { user, loaders: makeLoaders() };</code></pre>
+
+    <div class="callout key"><span class="tag">Key</span><p>The performance secret of GraphQL auth: <strong>do the expensive work (token verification) once in context; make every per-field check a cheap in-memory comparison; batch any unavoidable DB ownership lookups with DataLoader.</strong></p></div>
+  </section>
+
+  <!-- ============================================================= 11 -->
+  <section id="mistakes">
+    <h2>11. Common Mistakes</h2>
+    <ol>
+      <li><strong>Guarding only the gateway, not the graph.</strong> Putting auth middleware in front of <code>/graphql</code> and assuming you're done. It checks authentication, not field-level authorization.</li>
+      <li><strong>Confusing authentication with authorization.</strong> "The JWT is valid" only proves identity. BOLA happens when you stop there.</li>
+      <li><strong>Trusting client-supplied IDs without ownership checks.</strong> <code>report(id)</code> with no owner comparison is an IDOR by construction.</li>
+      <li><strong>Verifying tokens without pinning the algorithm or checking <code>aud</code>/<code>iss</code>.</strong> Opens algorithm-confusion and cross-API token reuse.</li>
+      <li><strong>Throwing on missing token in <code>context</code>.</strong> Breaks legitimately public fields; set <code>user = null</code> and let resolvers decide.</li>
+      <li><strong>Leaking the raw JWT payload as the principal.</strong> Couples business logic to Auth0's claim layout and invites trusting arbitrary claims.</li>
+      <li><strong>Per-field DB/Auth0 calls for authorization.</strong> N+1 by design; authorize from the in-memory principal.</li>
+      <li><strong>Leaving introspection and verbose errors on in production.</strong> Hands attackers the schema map and internal hints.</li>
+      <li><strong>Treating queries and mutations identically.</strong> Mutations change state and deserve stricter, default-deny posture.</li>
+      <li><strong>Putting permission logic in the client.</strong> Clients can hide a button, never enforce a rule. The server is the only authority.</li>
+    </ol>
+    <div class="callout warn"><span class="tag">Warn</span><p>Mistakes #1, #2, and #3 are the same root cause expressed three ways: assuming the perimeter is enough. In GraphQL the perimeter only authenticates — authorization must reach every field.</p></div>
+  </section>
+
+  <!-- ============================================================= 12 -->
+  <section id="best-practices">
+    <h2>12. Best Practices</h2>
+    <ul>
+      <li><strong>Authenticate once in <code>context</code>, authorize everywhere in resolution.</strong> One verification, many cheap checks.</li>
+      <li><strong>Default-deny mutations.</strong> Every state-changing operation requires an explicit permission; reads may be more permissive.</li>
+      <li><strong>Make the schema the policy source of truth.</strong> Declarative <code>@auth</code>/<code>@hasPermission</code> directives put access rules where reviewers can see them.</li>
+      <li><strong>Layer coarse + fine checks.</strong> Operation/type directives for "has permission?"; resolver logic for "owns this row?".</li>
+      <li><strong>Pin RS256 and validate <code>aud</code>/<code>iss</code>/<code>exp</code>.</strong> Non-negotiable JWT hygiene.</li>
+      <li><strong>Centralize guard helpers.</strong> <code>requireUser</code>/<code>requirePermission</code> avoid copy-paste drift.</li>
+      <li><strong>Filter at the data layer when possible.</strong> The unauthorized row that never loads is the most secure row.</li>
+      <li><strong>Disable introspection and mask errors in prod;</strong> add depth/complexity/rate limits.</li>
+      <li><strong>Use stable, resource-oriented permission strings</strong> (<code>read:reports</code>) defined in Auth0 RBAC.</li>
+      <li><strong>Test authorization, not just authentication.</strong> Write tests that confirm a valid-but-unauthorized token is rejected per field.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================= 13 -->
+  <section id="interview">
+    <h2>13. Interview Questions (with Model Answers)</h2>
+
+    <h3>Q1. Why can't you secure a GraphQL API the way you secure REST?</h3>
+    <p><strong>Model answer:</strong> REST exposes many endpoints; the resource and action are knowable from the URL and HTTP verb <em>before</em> business logic runs, so route middleware can decide allow/deny. GraphQL has one endpoint and one verb; what data is touched is only knowable after parsing the query and walking resolvers. Authentication still happens once at the edge (validate the JWT), but authorization must move into the resolution layer — at the operation, type, and field level — because a single query can span many resources.</p>
+
+    <h3>Q2. Where do you put the authenticated user, and why there?</h3>
+    <p><strong>Model answer:</strong> In the per-request <code>context</code> object. Apollo runs the context function once before resolution and passes its return value to every resolver as the third argument. Verifying the JWT there means one verification per request, and every resolver gets the principal for free as an in-memory object — avoiding per-field network calls.</p>
+
+    <h3>Q3. What is BOLA and how does it manifest in GraphQL?</h3>
+    <p><strong>Model answer:</strong> Broken Object-Level Authorization: the caller is authenticated but the resolver never checks that they <em>own</em> the requested object, so <code>node(id)</code> or <code>report(id)</code> lets anyone read others' data by guessing IDs. Fix: compare the resource's owner (from <code>parent</code>/a loader) against <code>context.user.sub</code>, or filter by owner in the data query.</p>
+
+    <h3>Q4. How do you implement field-level authorization without an N+1 problem?</h3>
+    <p><strong>Model answer:</strong> Decode permissions once from the JWT into context; per-field checks become in-memory array lookups. For ownership checks that need data, batch with DataLoader so all checks in a request collapse into one query; better still, push the predicate into the SQL/data query so unauthorized rows never load.</p>
+
+    <h3>Q5. How should mutations be treated differently from queries?</h3>
+    <p><strong>Model answer:</strong> Mutations change state, so they default-deny and require explicit, often higher-privilege permissions; they should also be idempotent/validated and audited. Queries are reads and can be more permissive, often gated only at sensitive fields. Treating them identically either over-restricts reads or under-protects writes.</p>
+
+    <h3>Q6. What is a schema directive and how does <code>@hasPermission</code> work internally?</h3>
+    <p><strong>Model answer:</strong> A directive is declarative metadata on schema elements. <code>@hasPermission</code> is implemented as a schema transform that, at startup, wraps each annotated field's resolver in a guard that checks <code>context.user</code> for the required permission before delegating to the original resolver. It's the decorator pattern applied to resolvers.</p>
+
+    <h3>Q7. How do you validate an Auth0 access token, and which checks are mandatory?</h3>
+    <p><strong>Model answer:</strong> Fetch the tenant JWKS, verify the RS256 signature, and check <code>iss</code> (your tenant), <code>aud</code> (your API identifier), and <code>exp</code>/<code>nbf</code>. Pin the algorithm to RS256 to defeat alg-confusion. Cache JWKS for performance.</p>
+
+    <div class="callout tip"><span class="tag">Tip</span><p>In senior interviews, anchor every answer to the structural insight: <em>"one endpoint means authorization can't live at the perimeter."</em> It signals you understand the model, not just the syntax.</p></div>
+  </section>
+
+  <!-- ============================================================= 14 -->
+  <section id="cert">
+    <h2>14. Certification Tips</h2>
+    <ul>
+      <li><strong>RS256 vs HS256:</strong> Auth0 APIs sign access tokens with RS256 by default; the certification expects you to verify via JWKS, not a shared secret.</li>
+      <li><strong>RBAC switches:</strong> Know that "Enable RBAC" and "Add Permissions in the Access Token" (API settings) are what populate the <code>permissions</code> claim. Exam questions probe why <code>permissions</code> is empty — answer: those toggles are off.</li>
+      <li><strong>Scopes vs permissions:</strong> Scopes (<code>scope</code> claim) are what the client requested and was granted; permissions are what the user actually has via RBAC. Both can gate access; know the difference.</li>
+      <li><strong>Audience matters:</strong> A token without your API's <code>audience</code> is an ID token or for another API — reject it. This is a frequent distractor.</li>
+      <li><strong>Token vs session:</strong> APIs (including GraphQL) use bearer access tokens; web apps use sessions. Don't mix them up.</li>
+      <li><strong>Custom claims namespacing:</strong> Non-standard claims added via Actions must be namespaced (a URL prefix) or Auth0 strips them — relevant if you push roles/permissions through an Action.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================= 15 -->
+  <section id="exercises">
+    <h2>15. Hands-On Exercises</h2>
+    <ol>
+      <li><strong>Stand up the server.</strong> Create the Apollo Server 4 project from Section 7, register an API in Auth0, set <code>AUTH0_DOMAIN</code>/<code>AUTH0_AUDIENCE</code>, and confirm <code>publicStats</code> works with no token.</li>
+      <li><strong>Authenticate.</strong> Obtain an access token (client-credentials or the Auth0 "Test" tab), call <code>me</code>, and confirm it returns <code>null</code>/error without a token and your user with one.</li>
+      <li><strong>Add a permission.</strong> Enable RBAC, define <code>read:reports</code>, assign it to your user, and verify the <code>permissions</code> claim appears and <code>report</code> succeeds.</li>
+      <li><strong>Break BOLA, then fix it.</strong> Remove the ownership check on <code>ssn</code>, prove you can read another user's SSN, then restore the <code>parent.id === user.sub</code> guard.</li>
+      <li><strong>Directive parity.</strong> Replace one imperative resolver guard with the <code>@hasPermission</code> directive and confirm identical behavior.</li>
+      <li><strong>Lock it down.</strong> Disable introspection and add a query-depth limit; verify a 10-level nested query is rejected.</li>
+    </ol>
+  </section>
+
+  <!-- ============================================================= 16 -->
+  <section id="assignment">
+    <h2>16. Assignment</h2>
+    <p>Build a <strong>multi-tenant notes API</strong> in GraphQL secured by Auth0:</p>
+    <ul>
+      <li>Types: <code>Note { id, title, body, ownerId }</code>, <code>User { id, email, plan }</code>.</li>
+      <li>Queries: <code>myNotes</code> (own notes only), <code>note(id)</code> (must own it), <code>allNotes</code> (requires <code>read:all_notes</code> — admin).</li>
+      <li>Mutations: <code>createNote</code>, <code>updateNote(id)</code>, <code>deleteNote(id)</code> — each default-deny, with ownership enforced on update/delete and <code>delete:any_note</code> overriding ownership for admins.</li>
+      <li>Implement coarse checks with a <code>@hasPermission</code> directive and fine ownership checks in resolvers.</li>
+      <li>Write a test matrix: anonymous, authenticated non-owner, owner, admin — for every operation. Document, in a short README, exactly which layer (context / directive / resolver) rejects each forbidden case and why.</li>
+    </ul>
+    <div class="callout note"><span class="tag">Deliverable</span><p>Submit the repo plus the test matrix. The matrix is the real grade: it proves you can reason about <em>which</em> authorization layer fires for each principal × operation combination.</p></div>
+  </section>
+
+  <!-- ============================================================= 17 -->
+  <section id="mini-project">
+    <h2>17. Mini Project — "GraphQL Guardrail" Audit Tool</h2>
+    <p>Write a small Node script that, given your schema and a list of test access tokens (anonymous, user, admin), automatically probes every field for authorization gaps:</p>
+    <ol>
+      <li>Read the schema via introspection (locally, with introspection enabled in dev).</li>
+      <li>Generate a minimal query selecting each field in turn.</li>
+      <li>Fire each query with each token and record the result (data / <code>UNAUTHENTICATED</code> / <code>FORBIDDEN</code> / null).</li>
+      <li>Flag any field where an anonymous or non-privileged token receives data it shouldn't — a candidate BOLA or missing guard.</li>
+      <li>Output a colored report: green (correctly guarded), red (leaked), yellow (returns null — verify intent).</li>
+    </ol>
+    <p>This mirrors a real security-team practice: continuous authorization regression testing. Bonus: run it in CI so a newly added unguarded field fails the build.</p>
+  </section>
+
+  <!-- ============================================================= 18 -->
+  <section id="quiz">
+    <h2>18. Quiz — 22 Questions</h2>
+    <ol>
+      <li>Why can't route middleware fully secure a GraphQL API?</li>
+      <li>How many HTTP endpoints does a typical GraphQL API expose, and why does that matter for auth?</li>
+      <li>What HTTP verb do GraphQL operations almost always use?</li>
+      <li>Where in Apollo Server is the per-request authenticated principal stored?</li>
+      <li>How often does the <code>context</code> function run per request?</li>
+      <li>Name the four arguments every resolver receives.</li>
+      <li>Which resolver argument carries the principal?</li>
+      <li>Which argument is used for ownership checks, and how?</li>
+      <li>What algorithm does Auth0 use to sign access tokens by default?</li>
+      <li>Why must you fetch JWKS instead of using a shared secret with RS256?</li>
+      <li>Which three JWT claims must you validate besides the signature?</li>
+      <li>What is the risk of accepting <code>alg:none</code> or HS256?</li>
+      <li>Define BOLA and give a GraphQL example.</li>
+      <li>What is the difference between authentication and authorization in one sentence each?</li>
+      <li>Why should a missing token yield <code>user = null</code> rather than an immediate throw?</li>
+      <li>How is a <code>@hasPermission</code> directive implemented internally?</li>
+      <li>Why might field-level auth cause an N+1 problem, and how do you fix it?</li>
+      <li>What does DataLoader do for authorization?</li>
+      <li>Why should mutations default-deny while queries can be more permissive?</li>
+      <li>Name two GraphQL-specific DoS vectors and a mitigation for each.</li>
+      <li>When should a forbidden field return <code>null</code> versus throw an error?</li>
+      <li>In a federated graph, where should the JWT be validated and where should ownership be checked?</li>
+    </ol>
+
+    <details>
+      <summary>Show answer key</summary>
+      <ol>
+        <li>Because the data touched is only known after parsing/executing the query; middleware at the single endpoint can authenticate but not authorize per field.</li>
+        <li>One endpoint (<code>/graphql</code>); a single door can't gate the many resources a query may reach, so authorization moves into resolution.</li>
+        <li>POST.</li>
+        <li>In the per-request <code>context</code> object.</li>
+        <li>Once, before resolution begins.</li>
+        <li><code>parent</code>, <code>args</code>, <code>context</code>, <code>info</code>.</li>
+        <li><code>context</code> (third argument).</li>
+        <li><code>parent</code> (and/or <code>args</code>) — compare the resource owner to <code>context.user.sub</code>.</li>
+        <li>RS256 (asymmetric).</li>
+        <li>RS256 signs with a private key Auth0 holds; you verify with the public key from JWKS — there is no shared secret to store.</li>
+        <li><code>iss</code>, <code>aud</code>, and <code>exp</code> (also <code>nbf</code> when present).</li>
+        <li>Attackers can forge tokens (alg:none) or sign with the public key as an HMAC secret (HS256 confusion).</li>
+        <li>Broken Object-Level Authorization — authenticated user reads others' data, e.g. <code>report(id: "999")</code> with no ownership check.</li>
+        <li>AuthN proves <em>who you are</em>; AuthZ decides <em>what you may do</em>.</li>
+        <li>So genuinely public fields still work and resolvers, not the context, decide what requires login.</li>
+        <li>A schema transform wraps each annotated field's resolver in a guard that checks the permission before delegating to the original resolver.</li>
+        <li>Guards run per field/row; if each calls the DB/Auth0 it's N+1. Fix: check from the in-memory principal, batch with DataLoader, or filter in the data query.</li>
+        <li>Batches and caches per-request lookups (e.g. ownership) into a single query.</li>
+        <li>Mutations change state, so the safe default is deny-with-explicit-permission; reads are lower-risk and can be permissive except at sensitive fields.</li>
+        <li>Deeply nested queries (mitigate with depth limits) and alias/batch amplification (mitigate with complexity limits + rate limiting).</li>
+        <li><code>null</code> when the field's very existence is sensitive (avoid disclosure); throw <code>FORBIDDEN</code> when the policy boundary should be explicit to the client.</li>
+        <li>Validate the JWT once at the gateway/router; check fine-grained ownership at the subgraph that owns the data.</li>
+      </ol>
+    </details>
+  </section>
+
+  <!-- ============================================================= 19 -->
+  <section id="cheatsheet">
+    <h2>19. Cheat Sheet</h2>
+    <pre class="diagram">
+  GRAPHQL + AUTH0 — QUICK REFERENCE
+  ─────────────────────────────────────────────────────────
+  AUTHENTICATE (once, in context):
+    header → Bearer token → jwtVerify(token, JWKS, {iss,aud})
+    pin algorithms: ['RS256']   |   cache JWKS
+    success → context.user = { sub, permissions, scopes }
+    failure → context.user = null   (do NOT throw here)
+
+  AUTHORIZE (in resolution):
+    OP-level    @hasPermission("read:reports") on Query/Mutation
+    TYPE-level  @auth on an OBJECT or its key fields
+    FIELD-level resolver checks parent.owner === user.sub
+
+  GUARD LADDER (every field):
+    authenticated? → has permission? → owns the resource?
+
+  MUTATIONS: default-deny + explicit permission + audit
+  QUERIES:   permissive, lock down sensitive fields only
+
+  ERRORS:
+    UNAUTHENTICATED (no/invalid token)  → 401-equivalent
+    FORBIDDEN       (valid but not allowed) → 403-equivalent
+    mask details in prod; log server-side
+
+  PERF: verify once · check in-memory · DataLoader · filter in DB
+  HARDEN: disable introspection · depth/complexity limits · rate limit
+  AUTH0: enable RBAC + "Add Permissions in Access Token"
+    </pre>
+  </section>
+
+  <!-- ============================================================= 20 -->
+  <section id="takeaways">
+    <h2>20. Key Takeaways</h2>
+    <ul>
+      <li><strong>AuthN is unchanged; AuthZ moves inward.</strong> Validating an Auth0 JWT is identical to REST; the difference is that authorization must live in the resolution layer, not at the perimeter.</li>
+      <li><strong>One endpoint, one waiter.</strong> A single query can reach many resources, so you guard the graph (operation, type, field), not the door.</li>
+      <li><strong>The principal lives in <code>context</code>.</strong> Verify the token once per request; every resolver reads the principal for free.</li>
+      <li><strong>Three rungs on every field:</strong> authenticated? → authorized (coarse permission)? → owns the resource (fine ownership)?</li>
+      <li><strong>Directives are resolver wrappers.</strong> <code>@auth</code>/<code>@hasPermission</code> are declarative sugar over the decorator pattern; combine them with imperative ownership checks.</li>
+      <li><strong>Mutations default-deny; queries default-permissive.</strong> Writes change state and earn stricter posture and auditing.</li>
+      <li><strong>BOLA is the cardinal sin.</strong> A valid token is not authorization — always compare the resource owner to <code>context.user.sub</code>.</li>
+      <li><strong>Pin RS256, validate <code>iss</code>/<code>aud</code>/<code>exp</code>, cache JWKS, disable introspection, and bound query depth/complexity.</strong></li>
+      <li><strong>Performance: verify once, check in memory, batch with DataLoader, filter in the database.</strong></li>
+    </ul>
+
+    <div class="callout key"><span class="tag">Key</span><p>If you remember one sentence from this chapter: <em>in GraphQL you authenticate at the edge and authorize inside the graph — operation, type, and field — because the single endpoint means the perimeter can prove who you are but never what each line of your query is allowed to touch.</em></p></div>
+  </section>
+
+  <nav class="pager">
+    <a class="prev" href="chapter-22.html">← Previous</a>
+    <a class="next" href="chapter-24.html">Next →</a>
+  </nav>
+</main>
+<footer class="site-footer">Master Auth0 End-to-End · Chapter 23 of 32</footer>
+</body>
+</html>

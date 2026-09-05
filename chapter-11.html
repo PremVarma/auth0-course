@@ -1,0 +1,649 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 11 — Auth0 Fundamentals: Architecture and Core Concepts | Master Auth0</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">🔐 Master Auth0</a>
+  <nav class="topnav">
+    <a href="chapter-10.html">← Prev</a>
+    <a href="index.html">Contents</a>
+    <a href="chapter-12.html">Next →</a>
+  </nav>
+</header>
+<main class="container">
+  <div class="chapter-head">
+    <span class="phase">Phase 5 · Auth0 Fundamentals</span>
+    <h1>Chapter 11 — Auth0 Fundamentals: Architecture and Core Concepts</h1>
+    <p class="lead">For the last ten chapters you built the theory: identity, OAuth 2.0, OpenID Connect, and the anatomy of a JWT. Now we put a real product behind that theory. This chapter is the map of Auth0 — the mental model that makes every later chapter click into place. We will define, from first principles, what Auth0 actually <em>is</em>, why a company would rent identity instead of building it, and how the nine or ten core nouns of the platform — tenant, region, application, connection, organization, API, scope, Universal Login, the two APIs, and the SDKs — fit together into one request flow. By the end you will be able to draw the entire Auth0 architecture from memory and explain every arrow on the diagram.</p>
+  </div>
+
+  <!-- 1 -->
+  <section id="theory">
+    <h2>1. Theory — Auth0 from First Principles</h2>
+    <p>Every application that has users faces the same unglamorous problem: <strong>how do I know who is calling me, and what am I allowed to let them do?</strong> That problem splits into two halves you already know by name:</p>
+    <ul>
+      <li><strong>Authentication (AuthN)</strong> — proving an identity. "You are Alice."</li>
+      <li><strong>Authorization (AuthZ)</strong> — deciding permissions for that identity. "Alice may read invoices but not delete them."</li>
+    </ul>
+    <p>Historically each app solved this itself: a <code>users</code> table, a password column, a bcrypt hash, a session cookie. That works for one app with email/password. It collapses the moment the business says: "add Google login," "let enterprise customers use their own SSO," "support passwordless," "add MFA," "be SOC 2 compliant," "rotate signing keys," "block credential-stuffing bots." Each of those is a deep, security-critical subsystem. Building them in-house means you are now an identity company that happens to sell something else.</p>
+    <p><strong>Auth0 is Identity-as-a-Service (IDaaS):</strong> a hosted <em>authorization server</em> and identity platform that implements OAuth 2.0 and OpenID Connect correctly, runs the login UI, stores or federates user identities, issues and signs tokens, and exposes everything through APIs and SDKs. You delegate the hard, dangerous parts of identity to a specialist and keep your codebase focused on your product.</p>
+    <p>The key first principle: <strong>Auth0 is, at its core, an OpenID Connect Provider (OP) and OAuth 2.0 Authorization Server.</strong> Everything else — the dashboard, connections, organizations, Actions — is configuration and value-added tooling around that standards-compliant core. Because it speaks the standards you learned in Chapters 4–10, you already understand 70% of it. This chapter teaches the Auth0-specific vocabulary that wraps those standards.</p>
+    <div class="callout key"><span class="tag">Key</span><p>Auth0 does not replace the OAuth/OIDC concepts you learned — it <em>implements</em> them as a product. A "client" becomes an <strong>Application</strong>, an "authorization server" becomes your <strong>tenant</strong>, a "resource server" becomes an <strong>API</strong>, and an "identity provider" becomes a <strong>connection</strong>.</p></div>
+  </section>
+
+  <!-- 2 -->
+  <section id="story">
+    <h2>2. Story-Based Explanation — The Cinema Startup</h2>
+    <p>Meet <strong>Maya</strong>, founder of <em>CineSpot</em>, a movie-booking startup (we will build exactly this in the Chapter 26 capstone). Week one, she ships a React app with email/password login backed by her own Postgres table. It works.</p>
+    <p>Week three, marketing wants "Sign in with Google." Maya spends two days wrestling Google's OAuth console, redirect URIs, and token exchange. Week five, a big corporate client says: "Our 4,000 employees must log in with our Okta — we will not create new passwords." That is SAML/enterprise SSO; Maya has no idea where to start. Week six, an attacker runs a credential-stuffing script against her login endpoint and locks out real users. Week seven, the company pursuing SOC 2 asks Maya for her password-rotation, MFA, and breach-detection policies. She has none.</p>
+    <p>Maya is now spending more time on identity than on movie booking. She signs up for Auth0. She creates a <strong>tenant</strong> (her private identity universe), registers her React app as an <strong>Application</strong>, flips on a Google <strong>social connection</strong> (the corporate Okta becomes an <strong>enterprise connection</strong> she configures once), turns on <strong>MFA</strong> and <strong>brute-force protection</strong> with two toggles, and points her API at an Auth0 <strong>API</strong> definition with <code>read:bookings</code> and <code>book:tickets</code> <strong>scopes</strong>. Login now happens on Auth0's <strong>Universal Login</strong> page. Maya deleted her password table. Her code shrank. She went back to building movie booking.</p>
+    <p>Every Auth0 noun in bold above is something we define in this chapter. Keep CineSpot in mind — it is the running example.</p>
+  </section>
+
+  <!-- 3 -->
+  <section id="diagrams">
+    <h2>3. ASCII Diagrams — The Whole Platform on One Page</h2>
+    <p>First, the conceptual hierarchy. Read it top-down: an account contains tenants; a tenant contains everything else.</p>
+    <pre class="diagram">
+   AUTH0 ACCOUNT (your company login to manage.auth0.com)
+  └── TENANT  e.g. "cinespot-dev"  (isolated in a REGION, e.g. US)
+       │      issuer = https://cinespot-dev.us.auth0.com/
+       │
+       ├── APPLICATIONS (OAuth clients — who asks for tokens)
+       │     ├── CineSpot SPA            (type: Single Page App)
+       │     ├── CineSpot Marketing Site (type: Regular Web App)
+       │     ├── CineSpot Mobile         (type: Native)
+       │     └── Nightly Sync Job        (type: Machine to Machine)
+       │
+       ├── APIs (resource servers — what tokens are FOR)
+       │     └── "CineSpot API"  identifier/audience = https://api.cinespot.com
+       │            scopes: read:bookings  book:tickets  manage:screenings
+       │
+       ├── CONNECTions (identity sources — where users come from)
+       │     ├── Username-Password-Authentication (database)
+       │     ├── google-oauth2                     (social)
+       │     ├── acme-okta                          (enterprise / SAML)
+       │     └── email                              (passwordless / magic link)
+       │
+       ├── ORGANIZATIONS (B2B tenants-within-tenant)
+       │     ├── "Acme Corp"   → enabled connections: acme-okta
+       │     └── "Globex Inc"  → enabled connections: database, google
+       │
+       ├── USERS  (identities; each linked to one+ connection)
+       └── EXTENSIBILITY: Actions, Rules*, Hooks*  (covered in Ch.12)
+                                  (*legacy)
+    </pre>
+    <p>Now the runtime request flow — what actually happens on the wire when a user logs in and then calls your API (this is the Authorization Code + PKCE flow from Chapter 5, drawn in Auth0 terms):</p>
+    <pre class="diagram">
+   Browser / SPA            Auth0 Tenant (the OP / Auth Server)        Your API
+   ============            ==================================        ========
+        |                                                              |
+   (1)  |  GET /authorize?client_id=..&amp;audience=https://api.cinespot.com
+        |  &amp;scope=openid profile read:bookings&amp;code_challenge=...        |
+        |------------------------------&gt;|                              |
+        |                              |  shows UNIVERSAL LOGIN page   |
+        |  (2) user authenticates via a CONNECTION (db/google/okta)    |
+        |&lt;------ 302 redirect with ?code=AUTH_CODE ----|              |
+        |                              |                              |
+   (3)  |  POST /oauth/token  code + code_verifier (PKCE)             |
+        |------------------------------&gt;|                              |
+        |  (4) &lt;-- id_token (who) + access_token (what) + refresh_token|
+        |                              |                              |
+   (5)  |  GET /bookings   Authorization: Bearer ACCESS_TOKEN ---------------&gt;|
+        |                              |     (6) API validates JWT via JWKS  |
+        |                              |&lt;----- GET /.well-known/jwks.json ----|
+        |  (7) &lt;------------------------ 200 OK  {bookings:[...]} -------------|
+        |                                                              |
+  id_token  -&gt; consumed by the CLIENT (authentication)
+  access_token -&gt; consumed by the API  (authorization, audience-scoped)
+    </pre>
+    <div class="callout note"><span class="tag">Note</span><p>Burn these two diagrams into memory. The first is the <em>configuration</em> model (nouns you set up in the dashboard). The second is the <em>runtime</em> model (what happens per request). Almost every Auth0 interview question is a question about one of these two pictures.</p></div>
+  </section>
+
+  <!-- 4 -->
+  <section id="analogy">
+    <h2>4. Real-World Analogy — The Airport</h2>
+    <p>Identity systems map cleanly onto an airport, and the analogy survives all the way to the certification exam.</p>
+    <table>
+      <thead><tr><th>Airport</th><th>Auth0</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td>The airport itself</td><td>Your <strong>tenant</strong></td><td>An isolated facility with its own rules, staff, and namespace.</td></tr>
+        <tr><td>Country the airport sits in</td><td><strong>Region</strong></td><td>Local laws (data residency) and physical distance (latency) apply.</td></tr>
+        <tr><td>Passport / national ID office</td><td><strong>Connection</strong> (identity provider)</td><td>Where your <em>identity</em> was originally issued and verified.</td></tr>
+        <tr><td>Check-in &amp; security checkpoint</td><td><strong>Universal Login</strong></td><td>One central, hardened place where you prove who you are.</td></tr>
+        <tr><td>Boarding pass</td><td><strong>access_token</strong></td><td>Says <em>what flight you may board</em> (scopes), expires, and is checked at the gate.</td></tr>
+        <tr><td>Passport stamp / "I verified you"</td><td><strong>id_token</strong></td><td>Proof to the airline (client) that immigration confirmed who you are.</td></tr>
+        <tr><td>The specific gate / aircraft</td><td><strong>API (audience)</strong></td><td>The resource your boarding pass is valid <em>for</em> — not any gate.</td></tr>
+        <tr><td>Gate agent scanning the pass</td><td>Your API validating the JWT</td><td>Checks signature, expiry, audience, and the right scope.</td></tr>
+        <tr><td>Airline alliances at one terminal</td><td><strong>Organizations</strong></td><td>Many companies operate in the same airport with their own desks and rules.</td></tr>
+      </tbody>
+    </table>
+    <p>The crucial insight the analogy makes obvious: <strong>your boarding pass is checked at the gate, not re-verified by immigration.</strong> Likewise, your API validates the access token's signature locally — it does not call Auth0 on every request. That single property is why Auth0 scales.</p>
+  </section>
+
+  <!-- 5 -->
+  <section id="internals">
+    <h2>5. Internal Working — What Each Concept Really Is</h2>
+
+    <h3>5.1 Tenants and Regions</h3>
+    <p>A <strong>tenant</strong> is a logically isolated instance of Auth0 dedicated to you. It is the top-level container for every other object — applications, APIs, connections, users, keys, logs, and settings. Crucially, the tenant <em>is</em> your authorization server: it owns a unique <strong>domain</strong> (e.g. <code>cinespot-dev.us.auth0.com</code>) which becomes the <code>issuer</code> (<code>iss</code>) claim in every token and the base of every endpoint. Tenants are hard-isolated from one another: users, connections, and keys never leak across tenants.</p>
+    <p>You typically run <strong>at least three tenants</strong> — <code>dev</code>, <code>staging</code>, and <code>prod</code> — because there is no "environments" concept inside a single tenant. Configuration is promoted between tenants with the Deploy CLI / Terraform (covered later).</p>
+    <p>A <strong>region</strong> is the geographic home of your tenant's data and compute: US, EU, AU (Australia), or JP (Japan), plus private-cloud options. You pick the region at tenant creation and <em>cannot move it later</em> without a migration. Region choice is driven by two forces: <strong>data residency / compliance</strong> (GDPR may require EU; some customers require data stay in-country) and <strong>latency</strong> (put the tenant near your users). The region is encoded in the domain: <code>...us.auth0.com</code>, <code>...eu.auth0.com</code>. (Tenants created before regional domains existed may have a bare <code>name.auth0.com</code> — a custom domain is the durable fix.)</p>
+
+    <h3>5.2 Applications (Clients)</h3>
+    <p>An <strong>Application</strong> in Auth0 is an OAuth 2.0 <em>client</em> — a piece of software that requests tokens. Each Application has a <code>client_id</code> (public) and, for confidential clients, a <code>client_secret</code> (private). The <strong>application type</strong> you choose is not cosmetic: it sets safe defaults for which OAuth flows and grant types are allowed, because the security model differs fundamentally depending on whether the client can keep a secret.</p>
+    <table>
+      <thead><tr><th>Type</th><th>Example</th><th>Can keep a secret?</th><th>Flow it uses</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Single Page App (SPA)</strong></td><td>React, Angular, Vue in the browser</td><td>No (code is public)</td><td>Authorization Code + <strong>PKCE</strong></td></tr>
+        <tr><td><strong>Regular Web App</strong></td><td>Next.js (server), Spring MVC, Express SSR</td><td>Yes (server-side)</td><td>Authorization Code (+ secret)</td></tr>
+        <tr><td><strong>Native</strong></td><td>iOS, Android, desktop, mobile</td><td>No</td><td>Authorization Code + PKCE (system browser)</td></tr>
+        <tr><td><strong>Machine to Machine (M2M)</strong></td><td>Cron job, backend service, daemon</td><td>Yes</td><td>Client Credentials (no user)</td></tr>
+      </tbody>
+    </table>
+    <p><strong>Public clients</strong> (SPA, Native) cannot hold a secret — anyone can read the JS bundle or decompile the app — so they must use PKCE to protect the code exchange. <strong>Confidential clients</strong> (Regular Web, M2M) run on a server and can authenticate with a secret. M2M is special: there is <em>no user</em>, so there is no <code>id_token</code> — only an <code>access_token</code> representing the application itself.</p>
+
+    <h3>5.3 Connections</h3>
+    <p>A <strong>connection</strong> is a configured source of identities — the bridge between Auth0 and wherever users actually live. Four families:</p>
+    <ul>
+      <li><strong>Database connections</strong> — Auth0 stores the username/password (Argon2/bcrypt hashed). The default is <code>Username-Password-Authentication</code>. You can also point at your own legacy DB via custom DB scripts.</li>
+      <li><strong>Social connections</strong> — federate to Google, Apple, GitHub, Facebook, Microsoft, etc. via OAuth. Auth0 brokers the OAuth dance with the provider for you.</li>
+      <li><strong>Enterprise connections</strong> — corporate IdPs via <strong>SAML</strong>, <strong>OIDC</strong>, <strong>WS-Fed</strong>, Azure AD / Entra ID, Okta, ADFS, Google Workspace, LDAP/AD (via connector). This is how Maya's corporate client logs in with their own Okta.</li>
+      <li><strong>Passwordless connections</strong> — no password at all: <strong>email magic link / OTP</strong> or <strong>SMS OTP</strong>.</li>
+    </ul>
+    <p>A connection is enabled per-application: an app can offer database + Google, while a B2B org offers only its enterprise connection. The same human can have multiple connection identities (Google <em>and</em> database) which can be <strong>account-linked</strong> into one user.</p>
+
+    <h3>5.4 Organizations</h3>
+    <p><strong>Organizations</strong> are Auth0's first-class B2B feature: logical groupings of users that represent your <em>business customers</em> inside a single tenant. Each organization can have its own enabled connections (Acme uses Acme's Okta; Globex uses Google), its own branding on the login page, its own membership and roles, and its own invitations. A user can belong to several organizations. The org context is carried in the <code>org_id</code> token claim, so your API can enforce tenant isolation ("this token is for Acme's data only"). Use organizations when you sell to companies; you do not need them for a pure consumer (B2C) app.</p>
+
+    <h3>5.5 Universal Login vs Embedded Login</h3>
+    <p><strong>Universal Login</strong> means the login UI is hosted by Auth0 on your tenant domain. Your app redirects the browser to <code>/authorize</code>; Auth0 renders the page, collects credentials, runs MFA, and redirects back with a code. <strong>Embedded login</strong> means you build your own login form and POST credentials through the Authentication API from your app.</p>
+    <p>Auth0 strongly recommends Universal Login, and so does every security-minded engineer, for reasons we detail in §9: credentials are never typed into your origin (phishing-resistant), you get SSO and MFA "for free," and new features (passkeys, bot detection) light up without code changes. We cover the <em>why</em> in depth in the Security Analysis section.</p>
+
+    <h3>5.6 Authentication API vs Management API</h3>
+    <p>Auth0 exposes <strong>two completely different APIs</strong>, and confusing them is the #1 beginner mistake:</p>
+    <ul>
+      <li><strong>Authentication API</strong> (<code>https://YOUR_DOMAIN/...</code>) — the OAuth/OIDC runtime: <code>/authorize</code>, <code>/oauth/token</code>, <code>/userinfo</code>, <code>/.well-known/openid-configuration</code>, <code>/.well-known/jwks.json</code>, logout. This is what end-users and your app touch to <em>log in and get tokens</em>. Public-facing.</li>
+      <li><strong>Management API</strong> (<code>https://YOUR_DOMAIN/api/v2/...</code>) — the admin/CRUD API for the tenant: create users, assign roles, list connections, configure clients programmatically. It is itself an Auth0 API with audience <code>https://YOUR_DOMAIN/api/v2/</code>; you call it with an M2M access token. Backend-only — never from a browser.</li>
+    </ul>
+
+    <h3>5.7 APIs, Audiences, and Scopes/Permissions</h3>
+    <p>In Auth0 an <strong>API</strong> is a resource server registration. Its most important field is the <strong>identifier</strong>, a URL-shaped string (it need not be reachable) that becomes the <strong>audience</strong> (<code>aud</code>) of access tokens minted for it — e.g. <code>https://api.cinespot.com</code>. When a client asks for a token, it sets <code>audience=https://api.cinespot.com</code>; Auth0 then issues a <em>JWT access token</em> aimed at that API (without an audience for a custom API, you get an opaque token only good for <code>/userinfo</code>).</p>
+    <p><strong>Scopes</strong> are the permissions an API defines: <code>read:bookings</code>, <code>book:tickets</code>, <code>manage:screenings</code>. A client requests scopes; the issued token's <code>scope</code> (or <code>permissions</code>) claim lists what was granted. With <strong>RBAC</strong> enabled on the API, you define <em>permissions</em>, group them into <em>roles</em>, assign roles to users, and Auth0 puts the user's effective permissions in the token. Your API then checks "does this token carry <code>book:tickets</code>?" before letting the call through.</p>
+
+    <h3>5.8 Auth0 SDKs</h3>
+    <p>You rarely hand-code these flows. Auth0 ships SDKs that wrap the redirects, PKCE, token storage, and validation:</p>
+    <table>
+      <thead><tr><th>Layer</th><th>SDK</th></tr></thead>
+      <tbody>
+        <tr><td>SPA / vanilla JS</td><td><code>@auth0/auth0-spa-js</code></td></tr>
+        <tr><td>React</td><td><code>@auth0/auth0-react</code></td></tr>
+        <tr><td>Next.js</td><td><code>@auth0/nextjs-auth0</code></td></tr>
+        <tr><td>Node / Express (web app)</td><td><code>express-openid-connect</code></td></tr>
+        <tr><td>Node API (validate JWT)</td><td><code>express-oauth2-jwt-bearer</code></td></tr>
+        <tr><td>Java / Spring Boot (API)</td><td>Spring Security OAuth2 Resource Server (validates against Auth0 JWKS)</td></tr>
+        <tr><td>Python / FastAPI</td><td><code>PyJWT</code> + JWKS, or <code>Authlib</code></td></tr>
+        <tr><td>Mobile</td><td><code>Auth0.swift</code> (iOS), <code>Auth0.Android</code></td></tr>
+        <tr><td>Backend management</td><td><code>auth0</code> (node-auth0), <code>auth0-python</code>, <code>auth0-java</code></td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- 6 -->
+  <section id="code-walkthrough">
+    <h2>6. Code Walkthrough — One Concept at a Time</h2>
+
+    <h3>6.1 The tenant's discovery document (where everything is)</h3>
+    <p>Every OIDC provider publishes a discovery document. This single URL tells your SDK every endpoint and the JWKS location — start here when integrating.</p>
+    <pre><code class="language-bash">curl https://cinespot-dev.us.auth0.com/.well-known/openid-configuration</code></pre>
+    <pre><code class="language-json">{
+  "issuer": "https://cinespot-dev.us.auth0.com/",
+  "authorization_endpoint": "https://cinespot-dev.us.auth0.com/authorize",
+  "token_endpoint": "https://cinespot-dev.us.auth0.com/oauth/token",
+  "userinfo_endpoint": "https://cinespot-dev.us.auth0.com/userinfo",
+  "jwks_uri": "https://cinespot-dev.us.auth0.com/.well-known/jwks.json",
+  "registration_endpoint": "https://cinespot-dev.us.auth0.com/oidc/register",
+  "scopes_supported": ["openid","profile","email","offline_access"],
+  "response_types_supported": ["code","token","id_token"],
+  "id_token_signing_alg_values_supported": ["RS256"]
+}</code></pre>
+
+    <h3>6.2 React SPA — Universal Login with the React SDK</h3>
+    <p>Note the <code>audience</code>: without it you get an id_token but no API-ready access token. The SDK does PKCE for you.</p>
+    <pre><code class="language-jsx">// main.jsx
+import { Auth0Provider } from "@auth0/auth0-react";
+
+&lt;Auth0Provider
+  domain="cinespot-dev.us.auth0.com"
+  clientId="SPA_CLIENT_ID"
+  authorizationParams={{
+    redirect_uri: window.location.origin,
+    audience: "https://api.cinespot.com",        // ask for an API token
+    scope: "openid profile email read:bookings"  // request permissions
+  }}&gt;
+  &lt;App /&gt;
+&lt;/Auth0Provider&gt;</code></pre>
+    <pre><code class="language-jsx">// App.jsx — login, read user, call the API
+import { useAuth0 } from "@auth0/auth0-react";
+
+function App() {
+  const { loginWithRedirect, logout, user, isAuthenticated,
+          getAccessTokenSilently } = useAuth0();
+
+  if (!isAuthenticated)
+    return &lt;button onClick={() =&gt; loginWithRedirect()}&gt;Log in&lt;/button&gt;;
+
+  const callApi = async () =&gt; {
+    const token = await getAccessTokenSilently();          // access_token
+    const res = await fetch("https://api.cinespot.com/bookings", {
+      headers: { Authorization: `Bearer ${token}` }        // gate scan
+    });
+    console.log(await res.json());
+  };
+
+  return (
+    &lt;&gt;
+      &lt;p&gt;Hello {user.name}&lt;/p&gt;
+      &lt;button onClick={callApi}&gt;Load bookings&lt;/button&gt;
+      &lt;button onClick={() =&gt; logout()}&gt;Log out&lt;/button&gt;
+    &lt;/&gt;
+  );
+}</code></pre>
+
+    <h3>6.3 Spring Boot — validating the access token (resource server)</h3>
+    <p>The API never calls Auth0 per request; it fetches the JWKS once, caches the public keys, and verifies signatures locally. This is the "gate agent" in our analogy.</p>
+    <pre><code class="language-yaml"># application.yml
+spring:
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: https://cinespot-dev.us.auth0.com/
+          audiences: https://api.cinespot.com   # reject tokens for other APIs</code></pre>
+    <pre><code class="language-java">// SecurityConfig.java
+@Configuration
+@EnableMethodSecurity
+public class SecurityConfig {
+  @Bean
+  SecurityFilterChain api(HttpSecurity http) throws Exception {
+    http
+      .authorizeHttpRequests(reg -&gt; reg
+        .requestMatchers(HttpMethod.GET, "/bookings")
+          .hasAuthority("SCOPE_read:bookings")   // require the scope
+        .anyRequest().authenticated())
+      .oauth2ResourceServer(o -&gt; o.jwt(org.springframework.security.config.Customizer.withDefaults()));
+    return http.build();
+  }
+}</code></pre>
+
+    <h3>6.4 FastAPI — validate a JWT against Auth0 JWKS</h3>
+    <pre><code class="language-python"># deps.py
+import jwt
+from jwt import PyJWKClient
+from fastapi import Depends, HTTPException, Security
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+
+ISSUER   = "https://cinespot-dev.us.auth0.com/"
+AUDIENCE = "https://api.cinespot.com"
+jwks = PyJWKClient(f"{ISSUER}.well-known/jwks.json")   # cached
+
+def verify(creds: HTTPAuthorizationCredentials = Security(HTTPBearer())):
+    token = creds.credentials
+    key = jwks.get_signing_key_from_jwt(token).key
+    try:
+        return jwt.decode(token, key, algorithms=["RS256"],
+                          audience=AUDIENCE, issuer=ISSUER)
+    except jwt.PyJWTError:
+        raise HTTPException(status_code=401, detail="invalid token")</code></pre>
+    <pre><code class="language-python"># main.py
+from fastapi import FastAPI, Depends
+app = FastAPI()
+
+@app.get("/bookings")
+def bookings(claims: dict = Depends(verify)):
+    if "read:bookings" not in claims.get("scope", "").split():
+        raise HTTPException(403, "insufficient scope")
+    return {"sub": claims["sub"], "bookings": []}</code></pre>
+
+    <h3>6.5 M2M — Client Credentials (no user) with curl</h3>
+    <p>This is how Maya's nightly sync job and the Management API get tokens. Note: no browser, no Universal Login.</p>
+    <pre><code class="language-bash">curl -X POST https://cinespot-dev.us.auth0.com/oauth/token \
+  -H 'content-type: application/json' \
+  -d '{
+    "grant_type": "client_credentials",
+    "client_id": "M2M_CLIENT_ID",
+    "client_secret": "M2M_CLIENT_SECRET",
+    "audience": "https://api.cinespot.com"
+  }'
+# -&gt; { "access_token": "eyJ...", "token_type": "Bearer", "expires_in": 86400 }</code></pre>
+
+    <h3>6.6 Management API — create a user from a backend</h3>
+    <pre><code class="language-bash"># 1) get a Management API token (audience = the v2 API)
+curl -X POST https://cinespot-dev.us.auth0.com/oauth/token \
+  -H 'content-type: application/json' \
+  -d '{"grant_type":"client_credentials","client_id":"MGMT_ID",
+       "client_secret":"MGMT_SECRET",
+       "audience":"https://cinespot-dev.us.auth0.com/api/v2/"}'
+
+# 2) use it to create a user
+curl -X POST https://cinespot-dev.us.auth0.com/api/v2/users \
+  -H 'authorization: Bearer MGMT_ACCESS_TOKEN' \
+  -H 'content-type: application/json' \
+  -d '{"email":"new@cinespot.com","password":"S3cret!23",
+       "connection":"Username-Password-Authentication"}'</code></pre>
+
+    <h3>6.7 Postman tip</h3>
+    <pre><code class="language-text">Postman -&gt; Authorization tab -&gt; Type: OAuth 2.0
+  Grant Type:    Authorization Code (With PKCE)
+  Auth URL:      https://cinespot-dev.us.auth0.com/authorize
+  Token URL:     https://cinespot-dev.us.auth0.com/oauth/token
+  Client ID:     SPA_CLIENT_ID
+  Scope:         openid profile read:bookings
+  Audience:      add as extra param: audience = https://api.cinespot.com
+Click "Get New Access Token" -&gt; Auth0 Universal Login opens -&gt; token returned.</code></pre>
+  </section>
+
+  <!-- 7 -->
+  <section id="practical">
+    <h2>7. Practical Implementation — Stand Up a Tenant in 10 Steps</h2>
+    <ol>
+      <li>Sign up at <code>auth0.com</code>; pick a <strong>region</strong> (match your users/compliance). Your first tenant is created — name it <code>yourco-dev</code>.</li>
+      <li>Dashboard → <strong>Applications</strong> → create one of type <em>Single Page Application</em>. Copy its <code>client_id</code>.</li>
+      <li>In the app settings, add <strong>Allowed Callback URLs</strong> (<code>http://localhost:3000</code>), <strong>Allowed Logout URLs</strong>, and <strong>Allowed Web Origins</strong>.</li>
+      <li>Dashboard → <strong>APIs</strong> → create one; set the <strong>Identifier</strong> to <code>https://api.cinespot.com</code>. Add scopes/permissions.</li>
+      <li>On the API, enable <strong>RBAC</strong> and "Add Permissions in the Access Token" if you want permissions in the JWT.</li>
+      <li>Dashboard → <strong>Authentication → Database</strong>: keep <code>Username-Password-Authentication</code>; enable it for your app.</li>
+      <li>Dashboard → <strong>Authentication → Social</strong>: add Google; enable for your app. (Use your own Google client ID in prod — the dev keys are shared and rate-limited.)</li>
+      <li>Dashboard → <strong>Security → Attack Protection</strong>: turn on Brute-force and Suspicious IP Throttling. <strong>Security → Multi-factor</strong>: enable MFA.</li>
+      <li>Wire the SDK (the React code above). Log in via Universal Login; inspect the tokens at <code>jwt.io</code>.</li>
+      <li>Create a separate <code>yourco-prod</code> tenant; never test in prod. Promote config via the Deploy CLI / Terraform.</li>
+    </ol>
+    <div class="callout tip"><span class="tag">Tip</span><p>Set up a <strong>custom domain</strong> (<code>auth.cinespot.com</code>) early. It keeps cookies first-party, looks professional, and decouples you from the regional <code>*.auth0.com</code> hostname so you can migrate without breaking the <code>issuer</code> in clients.</p></div>
+  </section>
+
+  <!-- 8 -->
+  <section id="prod-arch">
+    <h2>8. Production Architecture</h2>
+    <p>A real CineSpot deployment separates concerns by application type and keeps tokens flowing the right way:</p>
+    <pre class="diagram">
+                         ┌───────────────────────────────────────────┐
+                         │   AUTH0 TENANT (prod, EU region)            │
+                         │   custom domain: auth.cinespot.com          │
+   ┌─────────┐  redirect │   Universal Login · Connections · Actions   │
+   │ React   │──────────&gt;│   APIs: https://api.cinespot.com            │
+   │ SPA     │&lt;──tokens── │   M2M client for jobs + Management API      │
+   └────┬────┘           └───────────────┬─────────────────────────────┘
+        │ Bearer access_token            │ JWKS (public keys, cached)
+        v                                v
+   ┌─────────────┐   internal    ┌──────────────┐   ┌──────────────┐
+   │ Next.js BFF │──────────────&gt;│ Spring Boot  │   │ FastAPI      │
+   │ (Reg.WebApp)│   service mesh │ Booking API  │   │ Pricing API  │
+   └─────────────┘               └──────┬───────┘   └──────┬───────┘
+        ^                                │ validates JWT     │
+        │ session cookie (httpOnly)      └── audience+scope ─┘
+   ┌────┴────┐                    ┌────────────────────────────┐
+   │ Browser │                    │ Nightly Sync Job (M2M)      │
+   └─────────┘                    │ client_credentials -&gt; API   │
+                                  └────────────────────────────┘
+    </pre>
+    <ul>
+      <li><strong>SPA</strong> uses PKCE, stores tokens in memory, calls APIs directly with bearer tokens.</li>
+      <li><strong>Next.js BFF</strong> (Backend-for-Frontend, a Regular Web App) holds an <code>httpOnly</code> session cookie — the most secure pattern for browser apps because no tokens touch JS.</li>
+      <li><strong>APIs</strong> are independent resource servers; each validates the JWT against the cached JWKS — <strong>zero per-request calls to Auth0</strong>.</li>
+      <li><strong>M2M</strong> jobs use Client Credentials; rotate secrets via a vault.</li>
+      <li><strong>Three tenants</strong> (dev/staging/prod), config as code (Terraform/Deploy CLI), prod in the compliance-required region.</li>
+    </ul>
+  </section>
+
+  <!-- 9 -->
+  <section id="security">
+    <h2>9. Security Analysis</h2>
+    <p><strong>Why Universal Login over embedded login (the deepest reason):</strong> with embedded login your app's origin handles raw passwords, which means (a) any XSS on your origin can keylog credentials, (b) you become the phishing target, (c) cross-origin credential POSTs invite CSRF and CORS pain, and (d) you re-implement MFA, bot detection, and breach-password checks yourself. Universal Login moves credential entry to Auth0's hardened, isolated origin: your app never sees the password, attackers cannot phish what your origin never collects, and security upgrades (passkeys, bot detection) deploy without touching your code. This is the same principle as "never type your bank password into a third-party site."</p>
+    <p><strong>Audience is a security boundary, not a formality.</strong> A token minted for <code>https://api.cinespot.com</code> must be rejected by any other API. If your resource server skips the <code>aud</code> check, a token leaked from a low-value service can be replayed against a high-value one (the "confused deputy" / token-reuse attack). Always validate issuer <em>and</em> audience <em>and</em> signature.</p>
+    <p><strong>Public clients must use PKCE.</strong> SPAs and native apps cannot keep a secret; PKCE binds the authorization code to the client that started the flow, defeating code interception. Never use the legacy Implicit flow, and never ship a "client_secret" inside a SPA.</p>
+    <p><strong>Tenant isolation &amp; least privilege.</strong> Keep dev/staging/prod as separate tenants. Give each M2M client only the scopes it needs on the Management API — a sync job does not need <code>delete:users</code>. Treat the Management API token like a root credential: backend-only, short-lived, scoped.</p>
+    <div class="callout danger"><span class="tag">Danger</span><p>Never call the <strong>Management API</strong> from a browser or mobile app, and never embed its M2M secret in client code. A leaked Management token can read every user, reset passwords, and reconfigure the tenant.</p></div>
+  </section>
+
+  <!-- 10 -->
+  <section id="performance">
+    <h2>10. Performance Considerations</h2>
+    <ul>
+      <li><strong>Validate JWTs locally.</strong> RS256 verification uses the public keys from JWKS, fetched and cached by your SDK. Do <em>not</em> hit Auth0 per request. This makes token validation a sub-millisecond CPU op and lets your API scale horizontally without depending on Auth0's uptime per call.</li>
+      <li><strong>Cache JWKS, but respect rotation.</strong> SDKs cache keys and re-fetch on an unknown <code>kid</code>. Don't hardcode a public key — Auth0 rotates signing keys; hardcoding breaks logins on rotation.</li>
+      <li><strong>Prefer JWT access tokens over <code>/userinfo</code>.</strong> Calling <code>/userinfo</code> on every request adds a network round-trip to Auth0. Put the claims you need in the token (via Actions) and read them locally.</li>
+      <li><strong>Right-size token lifetimes.</strong> Short access tokens (e.g. 15–60 min) + refresh tokens balance security and the cost of re-authenticating. Avoid silent-auth storms by using refresh token rotation.</li>
+      <li><strong>Region/latency.</strong> Put the tenant near your users; use a custom domain on a CDN-backed edge. Login latency is dominated by redirect round-trips, not token validation.</li>
+      <li><strong>Rate limits.</strong> The Management API is rate-limited. Don't use it on the hot path — cache results, batch, and treat it as an admin tool, not a runtime dependency.</li>
+    </ul>
+  </section>
+
+  <!-- 11 -->
+  <section id="mistakes">
+    <h2>11. Common Mistakes</h2>
+    <ul>
+      <li><strong>Forgetting <code>audience</code></strong> → you get an opaque access token (or only an id_token) and your API rejects it. The id_token is for the client, not the API.</li>
+      <li><strong>Sending the id_token to your API.</strong> The id_token authenticates the user <em>to the client</em>; APIs must consume the <strong>access_token</strong>.</li>
+      <li><strong>Confusing the two APIs</strong> — calling <code>/api/v2/users</code> with a user's login token (it has the wrong audience), or trying to log users in via the Management API.</li>
+      <li><strong>Embedding login / shipping a client_secret in a SPA.</strong> Public clients have no secret; use PKCE + Universal Login.</li>
+      <li><strong>Skipping issuer/audience validation</strong> on the resource server — accepting any signed token.</li>
+      <li><strong>One tenant for all environments.</strong> Testing in prod corrupts real users and logs.</li>
+      <li><strong>Wrong application type</strong> (e.g. "Regular Web App" for a React SPA) → wrong default grants and a secret you can't protect.</li>
+      <li><strong>Hardcoding the JWKS key</strong> → logins break on key rotation.</li>
+      <li><strong>Picking the wrong region</strong> at creation and discovering a compliance problem later — you cannot move it in place.</li>
+    </ul>
+  </section>
+
+  <!-- 12 -->
+  <section id="best-practices">
+    <h2>12. Best Practices</h2>
+    <ul>
+      <li>Use <strong>Universal Login</strong> everywhere; treat embedded login as a last resort.</li>
+      <li>One <strong>API per resource server</strong> with a clear, URL-shaped identifier; always send the matching <code>audience</code>.</li>
+      <li>Choose the <strong>correct application type</strong>; let it set safe default grants.</li>
+      <li>Separate <strong>tenants per environment</strong>; manage config as code (Terraform / Deploy CLI) and promote dev → staging → prod.</li>
+      <li>Set up a <strong>custom domain</strong> for first-party cookies and durable issuer URLs.</li>
+      <li>Enable <strong>MFA</strong> and <strong>Attack Protection</strong> from day one.</li>
+      <li>Use <strong>RBAC</strong> + roles for permissions; keep scopes granular (<code>read:bookings</code>, not <code>admin</code>).</li>
+      <li>Validate <strong>signature + issuer + audience + expiry</strong> on every API.</li>
+      <li>Keep <strong>M2M secrets in a vault</strong>; grant least-privilege Management scopes.</li>
+      <li>Use the <strong>SDKs</strong> rather than hand-rolling flows; they handle PKCE, storage, and validation correctly.</li>
+    </ul>
+  </section>
+
+  <!-- 13 -->
+  <section id="interview">
+    <h2>13. Interview Questions (with model answers)</h2>
+    <h3>Q1. What is Auth0 at its core, and what problem does it solve?</h3>
+    <p><strong>A.</strong> Auth0 is Identity-as-a-Service — a hosted OAuth 2.0 authorization server and OpenID Connect provider. It solves the problem that authentication/authorization is a deep, security-critical subsystem (social login, enterprise SSO, MFA, breach detection, key rotation, compliance) that every app needs but few should build. You delegate it and keep your codebase focused on your product.</p>
+    <h3>Q2. Explain tenants and why you'd use more than one.</h3>
+    <p><strong>A.</strong> A tenant is an isolated Auth0 instance and your authorization server; its domain is the token issuer. There is no environments concept inside a tenant, so you run separate dev/staging/prod tenants and promote config as code, avoiding any chance of testing against real users.</p>
+    <h3>Q3. What's the difference between the four application types?</h3>
+    <p><strong>A.</strong> It's about whether the client can keep a secret. SPA and Native are public clients (no secret) and must use Authorization Code + PKCE. Regular Web App is confidential (server-side, uses a secret). M2M has no user and uses Client Credentials, receiving only an access token.</p>
+    <h3>Q4. id_token vs access_token — which goes where?</h3>
+    <p><strong>A.</strong> The id_token authenticates the user to the client (the app reads who the user is). The access_token authorizes calls to an API and is audience-scoped; the resource server validates and consumes it. Sending the id_token to an API is a classic bug.</p>
+    <h3>Q5. Authentication API vs Management API?</h3>
+    <p><strong>A.</strong> The Authentication API is the runtime OIDC/OAuth surface (<code>/authorize</code>, <code>/oauth/token</code>, <code>/userinfo</code>) used to log users in and mint tokens. The Management API (<code>/api/v2/*</code>) is the admin CRUD API for the tenant, called from a backend with an M2M token — never from a browser.</p>
+    <h3>Q6. What is an audience and why does it matter for security?</h3>
+    <p><strong>A.</strong> The audience is the API the token is intended for (the <code>aud</code> claim). Validating it prevents a token issued for one API from being replayed against another (confused-deputy/token-reuse). It's a hard security boundary, not metadata.</p>
+    <h3>Q7. Why is Universal Login preferred over embedded login?</h3>
+    <p><strong>A.</strong> Credentials are entered on Auth0's isolated origin, so your app never handles passwords — phishing- and XSS-resistant — and you get SSO, MFA, bot detection, and passkeys without writing security code. Embedded login makes your origin the attack surface.</p>
+    <h3>Q8. How does an API validate a token at scale without calling Auth0 each time?</h3>
+    <p><strong>A.</strong> It fetches the tenant's JWKS once, caches the RS256 public keys, and verifies the signature locally, also checking issuer, audience, and expiry. This is O(1) CPU and removes Auth0 from the per-request path.</p>
+    <h3>Q9. What are Organizations and when do you use them?</h3>
+    <p><strong>A.</strong> Organizations model your B2B customers inside one tenant — each with its own connections, branding, members, and roles, surfaced via the <code>org_id</code> claim. Use them for multi-tenant SaaS; you don't need them for pure consumer apps.</p>
+    <h3>Q10. Name the connection types and give an example of each.</h3>
+    <p><strong>A.</strong> Database (Auth0-stored username/password), Social (Google/Apple via OAuth), Enterprise (corporate Okta/Entra via SAML/OIDC), Passwordless (email magic link or SMS OTP).</p>
+  </section>
+
+  <!-- 14 -->
+  <section id="cert-tips">
+    <h2>14. Certification Tips</h2>
+    <div class="callout note"><span class="tag">Exam focus</span><p>The Auth0/Okta certification (and the "Identity Fundamentals"/CIAM tracks) lean heavily on the vocabulary in this chapter.</p></div>
+    <ul>
+      <li>Memorize the mapping: <strong>Application = client</strong>, <strong>API = resource server</strong>, <strong>tenant = authorization server</strong>, <strong>connection = identity provider</strong>.</li>
+      <li>Know which <strong>flow each application type uses</strong> by default (SPA/Native → Code+PKCE; Regular Web → Code+secret; M2M → Client Credentials).</li>
+      <li>Be crystal clear on <strong>Authentication API vs Management API</strong> and their audiences (<code>YOUR_DOMAIN</code> vs <code>YOUR_DOMAIN/api/v2/</code>).</li>
+      <li>Know that <strong>id_token = AuthN for the client</strong>, <strong>access_token = AuthZ for the API</strong>, and that custom-API access tokens are JWTs while no-audience tokens are opaque.</li>
+      <li>Remember <strong>Universal Login is recommended</strong>; embedded login is the exception.</li>
+      <li>Understand <strong>regions</strong> (data residency, can't move in place) and that the <strong>tenant domain is the issuer</strong>.</li>
+      <li>Recognize the four <strong>connection types</strong> and the role of <strong>Organizations</strong> for B2B.</li>
+      <li>Know that APIs validate tokens via <strong>JWKS</strong> with <strong>RS256</strong> and must check <strong>iss/aud/exp/sig</strong>.</li>
+    </ul>
+  </section>
+
+  <!-- 15 -->
+  <section id="hands-on">
+    <h2>15. Hands-On Exercises</h2>
+    <ol>
+      <li>Create a free dev tenant. Record your domain and confirm the region in it (<code>...us/eu...</code>).</li>
+      <li><code>curl</code> your <code>/.well-known/openid-configuration</code>. Identify the issuer, token endpoint, and jwks_uri.</li>
+      <li>Create a SPA application and an API (<code>https://api.demo.com</code> with scope <code>read:items</code>).</li>
+      <li>Wire <code>@auth0/auth0-react</code>, log in, and decode the resulting tokens at jwt.io. Find <code>iss</code>, <code>aud</code>, <code>sub</code>, <code>scope</code>.</li>
+      <li>Remove the <code>audience</code> from the SDK config and observe how the access token changes (opaque vs JWT).</li>
+      <li>Enable a Google social connection and log in with it; inspect the <code>sub</code> prefix (<code>google-oauth2|...</code>).</li>
+      <li>Create an M2M application, grant it the API, and fetch a token with the Client Credentials curl. Note: no id_token.</li>
+      <li>Get a Management API token and list your users via <code>GET /api/v2/users</code>.</li>
+    </ol>
+  </section>
+
+  <!-- 16 -->
+  <section id="assignment">
+    <h2>16. Assignment</h2>
+    <p>Write a one-page architecture brief for CineSpot. It must: (1) list the exact Auth0 objects you'd create (tenants, applications with types, the API and its scopes, connections, and whether organizations are needed); (2) include <em>both</em> ASCII diagrams from §3 redrawn for CineSpot specifically; (3) justify Universal Login over embedded login in two sentences; (4) state which token each component consumes (id_token vs access_token) and why; and (5) name the SDK for each component. Submit as a Markdown file.</p>
+  </section>
+
+  <!-- 17 -->
+  <section id="mini-project">
+    <h2>17. Mini Project — "Identity Smoke Test"</h2>
+    <p>Build a minimal end-to-end vertical slice proving you understand the core flow:</p>
+    <ol>
+      <li>A <strong>React SPA</strong> (<code>@auth0/auth0-react</code>) that logs in via Universal Login and shows the user's name.</li>
+      <li>A protected <strong>API</strong> in your language of choice (Spring Boot, FastAPI, or Express) that validates the JWT (signature + iss + aud) and exposes <code>GET /me</code> returning the <code>sub</code> and <code>scope</code>.</li>
+      <li>The SPA requests <code>audience=https://api.demo.com scope="openid profile read:items"</code>, then calls <code>/me</code> with the bearer token and renders the JSON.</li>
+      <li><strong>Acceptance:</strong> calling <code>/me</code> without a token returns 401; with a valid token returns the claims; with a token for a <em>different</em> audience returns 401. Add a screenshot of jwt.io decoding your access token.</li>
+    </ol>
+    <div class="callout tip"><span class="tag">Tip</span><p>If <code>/me</code> accepts the wrong-audience token, your resource server isn't validating <code>aud</code> — fix it before moving on. That single check is the heart of API security.</p></div>
+  </section>
+
+  <!-- 18 -->
+  <section id="quiz">
+    <h2>18. Quiz (25 questions)</h2>
+    <ol>
+      <li>In one sentence, what is Auth0 at its core?</li>
+      <li>What OAuth/OIDC role does an Auth0 <em>tenant</em> play?</li>
+      <li>What becomes the token <code>issuer</code> claim?</li>
+      <li>Why do you run separate dev/staging/prod tenants?</li>
+      <li>Can you change a tenant's region after creation?</li>
+      <li>Name the four application types.</li>
+      <li>Which application types are <em>public</em> clients, and what flow must they use?</li>
+      <li>Why can't a SPA keep a client_secret safely?</li>
+      <li>Which application type has no user and gets no id_token?</li>
+      <li>List the four connection families with an example of each.</li>
+      <li>What is an Organization and when would you use one?</li>
+      <li>What claim carries the organization context?</li>
+      <li>Define Universal Login vs embedded login.</li>
+      <li>Give two security reasons Universal Login is preferred.</li>
+      <li>What is the Authentication API responsible for?</li>
+      <li>What is the Management API responsible for, and where must it be called from?</li>
+      <li>What is the audience of a Management API token?</li>
+      <li>What is an Auth0 "API" object, and what field becomes the <code>aud</code>?</li>
+      <li>What's the difference between an id_token and an access_token?</li>
+      <li>What happens to the access token if you omit <code>audience</code> for a custom API?</li>
+      <li>How does a resource server validate a token without calling Auth0 per request?</li>
+      <li>Which four things must an API check on a JWT?</li>
+      <li>Why is hardcoding a JWKS public key a bug?</li>
+      <li>Name the SDK you'd use for: React, Next.js, Spring Boot API, FastAPI.</li>
+      <li>Why must you never call the Management API from a browser?</li>
+    </ol>
+    <details>
+      <summary>Show answer key</summary>
+      <ol>
+        <li>A hosted OAuth 2.0 authorization server / OpenID Connect provider — Identity-as-a-Service.</li>
+        <li>It <em>is</em> the authorization server (OIDC provider); the top-level isolated container for all objects.</li>
+        <li>The tenant's domain, e.g. <code>https://cinespot-dev.us.auth0.com/</code>.</li>
+        <li>There's no environments concept inside a tenant; separation prevents testing against real users/logs.</li>
+        <li>No — region is fixed at creation; moving requires a migration.</li>
+        <li>SPA, Regular Web App, Native, Machine-to-Machine (M2M).</li>
+        <li>SPA and Native; Authorization Code + PKCE.</li>
+        <li>Its code runs in the browser and is fully readable, so any embedded secret is exposed.</li>
+        <li>M2M (Client Credentials).</li>
+        <li>Database (Username-Password), Social (Google), Enterprise (Okta via SAML/OIDC), Passwordless (email magic link/SMS OTP).</li>
+        <li>A logical grouping representing a B2B customer with its own connections/branding/roles; used for multi-tenant SaaS.</li>
+        <li><code>org_id</code>.</li>
+        <li>Universal Login is hosted by Auth0 on the tenant domain; embedded login is your own form posting via the Authentication API.</li>
+        <li>Your app never handles passwords (phishing/XSS-resistant); you get MFA/SSO/bot-detection/passkeys without code.</li>
+        <li>Runtime OIDC/OAuth: <code>/authorize</code>, <code>/oauth/token</code>, <code>/userinfo</code> — logging in and minting tokens.</li>
+        <li>Admin CRUD on the tenant (<code>/api/v2/*</code>); called from a backend with an M2M token only.</li>
+        <li><code>https://YOUR_DOMAIN/api/v2/</code>.</li>
+        <li>A resource-server registration; its <strong>Identifier</strong> becomes the <code>aud</code>.</li>
+        <li>id_token = authenticates the user to the client; access_token = authorizes API calls, audience-scoped.</li>
+        <li>You get an opaque token (only valid at <code>/userinfo</code>), not a JWT your API can validate.</li>
+        <li>It fetches and caches the JWKS public keys and verifies RS256 signatures locally.</li>
+        <li>Signature, issuer (<code>iss</code>), audience (<code>aud</code>), and expiry (<code>exp</code>).</li>
+        <li>Auth0 rotates signing keys; a hardcoded key breaks logins on rotation. Use JWKS by <code>kid</code>.</li>
+        <li><code>@auth0/auth0-react</code>; <code>@auth0/nextjs-auth0</code>; Spring Security OAuth2 Resource Server; PyJWT/Authlib with JWKS.</li>
+        <li>A leaked Management token can read all users, reset passwords, and reconfigure the tenant — it's root-level.</li>
+      </ol>
+    </details>
+  </section>
+
+  <!-- 19 -->
+  <section id="cheat-sheet">
+    <h2>19. Cheat Sheet</h2>
+    <pre class="diagram">
+  MENTAL MAP (standards -&gt; Auth0)
+    client            = Application      (SPA | Regular Web | Native | M2M)
+    authorization srv = Tenant           (domain = issuer; lives in a Region)
+    resource server   = API              (Identifier = audience)
+    identity provider = Connection       (database | social | enterprise | passwordless)
+    B2B grouping      = Organization     (org_id claim)
+
+  TOKENS
+    id_token      -&gt; CLIENT  (who the user is)        | AuthN
+    access_token  -&gt; API     (what they may do, aud)  | AuthZ
+    refresh_token -&gt; renew access tokens
+
+  TWO APIs
+    Authentication API : /authorize /oauth/token /userinfo   (login + tokens)
+    Management API     : /api/v2/*  aud=YOUR_DOMAIN/api/v2/  (admin, backend only)
+
+  FLOWS BY APP TYPE
+    SPA / Native  -&gt; Authorization Code + PKCE
+    Regular Web   -&gt; Authorization Code + client_secret
+    M2M           -&gt; Client Credentials (no user, no id_token)
+
+  ALWAYS SEND audience=&lt;your API id&gt; to get a JWT access token.
+  ALWAYS VALIDATE sig + iss + aud + exp on the API (via JWKS / RS256).
+  PREFER Universal Login. SEPARATE tenants per environment.
+
+  KEY ENDPOINTS
+    https://YOUR_DOMAIN/.well-known/openid-configuration
+    https://YOUR_DOMAIN/.well-known/jwks.json
+    </pre>
+  </section>
+
+  <!-- 20 -->
+  <section id="takeaways">
+    <h2>20. Key Takeaways</h2>
+    <div class="callout key"><span class="tag">Key</span><p>Auth0 is a hosted OAuth 2.0 / OpenID Connect provider — it <em>implements</em> the standards you already learned as a product, so the vocabulary is just a renaming: client → Application, auth server → Tenant, resource server → API, IdP → Connection.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p>The <strong>tenant</strong> is your isolated authorization server; its domain is the token issuer; its <strong>region</strong> (fixed at creation) governs data residency and latency. Run separate tenants per environment.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p><strong>Application type</strong> = "can it keep a secret?" Public (SPA/Native) → PKCE; confidential (Regular Web) → secret; <strong>M2M</strong> → Client Credentials with no user and no id_token.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p><strong>id_token authenticates the user to the client; access_token authorizes the API and is audience-scoped.</strong> Always send <code>audience</code> to get a JWT; always validate sig + iss + aud + exp on the API via cached JWKS.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p>Two distinct APIs: the <strong>Authentication API</strong> (runtime login/tokens) and the <strong>Management API</strong> (backend-only admin CRUD). Never confuse them; never call Management from a browser.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p>Prefer <strong>Universal Login</strong> (credentials never touch your origin), use <strong>Connections</strong> for identity sources, <strong>Organizations</strong> for B2B, and the official <strong>SDKs</strong> so PKCE, storage, and validation are correct by default.</p></div>
+  </section>
+
+  <nav class="pager">
+    <a class="prev" href="chapter-10.html">← Previous</a>
+    <a class="next" href="chapter-12.html">Next →</a>
+  </nav>
+</main>
+<footer class="site-footer">Master Auth0 End-to-End · Chapter 11 of 32</footer>
+</body>
+</html>

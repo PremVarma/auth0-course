@@ -1,0 +1,704 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 27 — Production Architecture | Master Auth0</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">🔐 Master Auth0</a>
+  <nav class="topnav">
+    <a href="chapter-26.html">← Prev</a>
+    <a href="index.html">Contents</a>
+    <a href="chapter-28.html">Next →</a>
+  </nav>
+</header>
+<main class="container">
+  <div class="chapter-head">
+    <span class="phase">Phase 9 · Production Architecture</span>
+    <h1>Chapter 27 — Production Architecture</h1>
+    <p class="lead">A login button works on your laptop in five minutes. Keeping authentication alive for ten million users across three continents — through a data-centre fire, a leaked signing key, a sudden 50× traffic spike, and a regulator's audit — is a different discipline entirely. This chapter is where you stop being a developer who <em>uses</em> Auth0 and become an architect who can <em>defend a design</em>. We build, from first principles, the production substrate around Auth0: how to make identity highly available and horizontally scalable, how to deploy across regions without making logins slow, how to cache JWKS and tokens correctly (and the catastrophic ways people get it wrong), how sessions and logout behave at scale, how keys and secrets rotate without an outage, how to wire log streams into a SIEM, how to survive rate limits with backpressure, how to put a CDN and an API gateway in front of everything, and finally how zero-trust architecture ties it all together. Every concept is explained with the <em>why</em> before the <em>how</em>, with runnable code in Spring Boot, Node, FastAPI, Next.js, and curl.</p>
+  </div>
+
+  <!-- ============================================================= 1 -->
+  <section id="theory">
+    <h2>1. Theory — First Principles of Production Identity</h2>
+
+    <p>Before any tool or diagram, fix four definitions in your mind. Every architectural decision in this chapter is a trade between them.</p>
+
+    <table>
+      <thead><tr><th>Property</th><th>Plain-English definition</th><th>How you measure it</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Availability</strong></td><td>The fraction of time the system answers correctly</td><td>"nines" — 99.9% = 8.7h downtime/yr; 99.99% = 52min/yr</td></tr>
+        <tr><td><strong>Latency</strong></td><td>Time from request sent to response received</td><td>p50, p95, p99 percentiles (never the average)</td></tr>
+        <tr><td><strong>Throughput</strong></td><td>Requests successfully served per second</td><td>RPS / TPS, and the ceiling before errors</td></tr>
+        <tr><td><strong>Durability</strong></td><td>Probability data survives over time</td><td>"nines" of data not lost (e.g. 11 nines)</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Why identity is special</h3>
+    <p>Authentication is a <strong>hard dependency in the critical path of every other service</strong>. If your catalogue service is down, users can't browse — annoying. If your <em>identity</em> service is down, users can't <em>log in</em>, which usually means <em>nothing</em> works. Identity therefore carries a higher availability bar than almost any other component. This single fact drives the whole chapter: we obsessively remove single points of failure, we cache aggressively so that a slow identity provider doesn't stall every API call, and we design so that an identity outage degrades gracefully rather than taking the whole estate down.</p>
+
+    <h3>The stateless-token insight that makes scale possible</h3>
+    <p>OAuth 2.0 and OIDC give us a superpower: the <strong>access token is self-contained</strong>. A JWT carries its own claims and is signed with a key whose public half is published at a well-known URL (JWKS). That means your API can <em>verify</em> a token <strong>without calling Auth0 at all</strong> — it only needs the public key, which it fetches once and caches. This is the difference between an architecture that scales horizontally to infinity and one that funnels every request through a central bottleneck. Almost everything else in this chapter is a corollary of "verify locally, call the IdP rarely."</p>
+
+    <div class="callout key"><span class="tag">Key</span><p>The production mantra: <strong>authenticate centrally, authorize locally.</strong> The user proves identity once at Auth0; thereafter your services validate self-contained tokens offline using cached public keys. Central calls (token exchange, JWKS fetch, Management API) are rare and cached; per-request validation is local and cheap.</p></div>
+  </section>
+
+  <!-- ============================================================= 2 -->
+  <section id="story">
+    <h2>2. Story-Based Explanation — The Night Helios Almost Went Dark</h2>
+    <p>You are the on-call architect for <strong>Helios Analytics</strong>, now a global SaaS with 8 million monthly users across the US, EU, and APAC. At 02:14 your phone screams. Three things happened within minutes of each other:</p>
+    <ol>
+      <li>A marketing email blast drove a <strong>50× login spike</strong> in <code>eu-west</code>. Your API started returning <code>429 Too Many Requests</code> from Auth0.</li>
+      <li>A junior engineer, debugging, had earlier <strong>disabled JWKS caching</strong> "to always get fresh keys." Every single API request was now hammering the JWKS endpoint — which is exactly why the rate limit blew.</li>
+      <li>Security paged you: a CI secret leaked on a public repo. The Auth0 <strong>client secret</strong> for the back-channel app must be rotated <em>now</em>, and you must confirm no tokens were minted by an attacker.</li>
+    </ol>
+    <p>The engineer who could "just restart it" is on holiday. What saves you is not heroics — it's <strong>architecture decided months earlier</strong>: tokens were validated offline so the 429s only affected new logins, not existing sessions; JWKS had a fallback cache; the client had <em>two</em> secrets configured so you could rotate without downtime; and a log stream to your SIEM let you prove, in minutes, that no rogue tokens were issued. By 02:51 the spike was absorbed by autoscaling and a CDN, the secret was rotated, and the incident report wrote itself from the audit log. <strong>Every section in this chapter is a piece of that night-saving design.</strong></p>
+    <div class="callout note"><span class="tag">Note</span><p>The recurring lesson: production resilience is not something you bolt on during an incident. It is a series of boring decisions — cache here, configure two secrets there, stream logs everywhere — that turn a 3 a.m. catastrophe into a 30-minute footnote.</p></div>
+  </section>
+
+  <!-- ============================================================= 3 -->
+  <section id="diagrams">
+    <h2>3. ASCII Diagrams — The Production Topology</h2>
+
+    <h3>3.1 The end-to-end production architecture</h3>
+    <pre class="diagram">
+                          ┌──────────────────────────────┐
+        Browser / App ───▶│        CDN / Edge (POPs)      │  TLS, WAF, static,
+                          │  edge auth: verify JWT here   │  edge token check
+                          └───────────────┬──────────────┘
+                                          │ (valid token or login redirect)
+                                          ▼
+                          ┌──────────────────────────────┐
+                          │   API Gateway / Reverse Proxy │  authN at the edge:
+                          │   (Kong / APISIX / Envoy /    │  validate JWT, inject
+                          │    Spring Cloud Gateway)      │  X-User headers, rate-limit
+                          └───────┬───────────────┬───────┘
+                                  │               │
+                  ┌───────────────▼───┐   ┌───────▼───────────────┐
+                  │  Service A (pods)  │   │   Service B (pods)     │  stateless,
+                  │  verify JWT local  │   │   verify JWT local     │  horizontally
+                  │  authZ via FGA/API │   │   authZ via scopes     │  scaled
+                  └─────────┬──────────┘   └───────────┬───────────┘
+                            │ rare calls (token, JWKS, mgmt)        │
+                            └───────────────┬──────────────────────┘
+                                            ▼
+                          ┌──────────────────────────────┐
+                          │            Auth0              │  HA, multi-tenant,
+                          │  /authorize /oauth/token      │  region-pinned tenant
+                          │  /.well-known/jwks.json       │  log streams ─▶ SIEM
+                          └──────────────────────────────┘
+    </pre>
+
+    <h3>3.2 Multi-region: latency vs data residency</h3>
+    <pre class="diagram">
+      US users          EU users           APAC users
+         │                 │                   │
+         ▼                 ▼                   ▼
+   ┌───────────┐     ┌───────────┐       ┌───────────┐
+   │ us-east   │     │ eu-west   │       │ ap-south  │   <- your app, per region
+   │ services  │     │ services  │       │ services  │      (Anycast / GeoDNS routes)
+   └─────┬─────┘     └─────┬─────┘       └─────┬─────┘
+         │  local JWT validation (cached JWKS) │
+         └───────────┬─────────┴───────────────┘
+                     ▼
+            ┌──────────────────┐    Auth0 tenant lives in ONE region
+            │ Auth0 (e.g. EU)  │    (data residency). Login round-trips
+            │ region-pinned    │    cross-region; token VALIDATION does not.
+            └──────────────────┘    => cache keys + tokens to hide the distance.
+    </pre>
+
+    <h3>3.3 The JWKS cache decision flow (per request)</h3>
+    <pre class="diagram">
+   incoming request with Bearer JWT
+            │
+            ▼
+   read `kid` from JWT header
+            │
+            ▼
+   ┌──────────────────────────┐  hit
+   │ key for kid in cache?     ├───────▶ verify signature ─▶ check exp/aud/iss ─▶ allow
+   └────────────┬─────────────┘
+                │ miss / unknown kid
+                ▼
+   fetch /.well-known/jwks.json  (rate-limited; coalesce concurrent fetches!)
+                │
+                ▼
+   cache ALL keys (respect cooldown) ─▶ retry once ─▶ still miss? ─▶ 401
+    </pre>
+
+    <h3>3.4 Distributed logout / global sign-out</h3>
+    <pre class="diagram">
+   User clicks "Sign out everywhere"
+            │
+            ▼
+   App ─▶ GET /v2/logout  (clears Auth0 SSO cookie  ───────────────┐
+            │              => kills central session)               │
+            ▼                                                       ▼
+   App clears its OWN session/cookie         OPTIONAL: Back-Channel Logout
+            │                                (Auth0 POSTs logout_token to each
+            ▼                                 registered RP => they kill local
+   access tokens already issued STAY VALID    sessions). Plus: revoke refresh
+   until they EXPIRE (or until revoked /       tokens via /oauth/revoke and
+   checked against a deny-list).               add jti to a short-TTL deny-list.
+    </pre>
+  </section>
+
+  <!-- ============================================================= 4 -->
+  <section id="analogy">
+    <h2>4. Real-World Analogy — The National Passport System</h2>
+    <p>Imagine a country's passport and border system. It maps cleanly onto production identity:</p>
+    <ul>
+      <li><strong>The passport office (Auth0)</strong> is the single authoritative issuer of identity documents. You don't want one tiny office for the whole nation, so it has <strong>multiple branches and backups</strong> (high availability). It lives in a specific country governed by that country's laws (<strong>data residency / region pinning</strong>).</li>
+      <li><strong>The passport itself (JWT)</strong> is tamper-evident: it has a holographic seal (signature) anyone can verify with public knowledge of what a genuine seal looks like (JWKS public key). A border guard does <strong>not phone the passport office</strong> for every traveller — that would create a mile-long queue. They verify the seal locally (offline token validation).</li>
+      <li><strong>Border checkpoints (API gateways)</strong> sit at every entry point, check passports once, and stamp an internal note (inject <code>X-User</code> headers) so officers deeper inside don't re-check everyone.</li>
+      <li><strong>The seal design changes periodically (key rotation)</strong>. The office publishes the new seal alongside the old one for a while, so passports stamped under the old seal still verify until they expire.</li>
+      <li><strong>A revoked passport (global sign-out / deny-list)</strong> goes onto a watch-list distributed to checkpoints. But a passport already through the gate (an issued, unexpired access token) keeps working until it expires — unless guards actively check the watch-list.</li>
+      <li><strong>Embassy branches abroad (multi-region / CDN edge)</strong> let citizens get service close to home instead of flying to the capital, cutting latency.</li>
+    </ul>
+    <div class="callout tip"><span class="tag">Tip</span><p>If you remember one thing: the border guard verifies the seal <em>locally</em> and only consults the central office <em>rarely</em>. That is offline JWT validation, and it is why identity can scale to billions of checks per day.</p></div>
+  </section>
+
+  <!-- ============================================================= 5 -->
+  <section id="internals">
+    <h2>5. Internal Working — What Actually Happens Under Load</h2>
+
+    <h3>5.1 High availability and horizontal scaling</h3>
+    <p><strong>Vertical scaling</strong> means a bigger machine; it has a ceiling and a single point of failure. <strong>Horizontal scaling</strong> means more identical machines behind a load balancer; it is effectively unbounded and removes the single point of failure. Auth0's public cloud already runs HA for you — multiple availability zones, redundant data stores, automatic failover within a region. Your job is to make <em>your</em> tier equally resilient: run your services as <strong>stateless</strong> replicas so any pod can serve any request, store no session in local memory, and let an autoscaler add replicas as RPS climbs.</p>
+    <p>"Stateless" is the load-bearing word. A service is stateless if it holds no per-user data between requests that another replica couldn't reconstruct. JWTs make this natural: the token carries the user's identity and scopes, so replica #7 can serve a request that replica #2 served a moment ago. The moment you store a session in a single pod's RAM, you've created sticky sessions and broken horizontal scaling.</p>
+
+    <h3>5.2 Caching — JWKS, tokens, and user info</h3>
+    <p>There are three things worth caching, each with different rules:</p>
+    <table>
+      <thead><tr><th>What</th><th>Why cache</th><th>TTL / invalidation</th><th>Danger if wrong</th></tr></thead>
+      <tbody>
+        <tr><td><strong>JWKS (public keys)</strong></td><td>Avoid an HTTP call per request to verify signatures</td><td>Cache by <code>kid</code>; refresh on unknown <code>kid</code> (with cooldown). Hours is fine.</td><td>No cache → rate-limit blowout. Forever cache → can't verify after rotation.</td></tr>
+        <tr><td><strong>Access tokens (client side)</strong></td><td>Reuse a valid token instead of calling <code>/oauth/token</code> each call (esp. M2M)</td><td>Cache until ~30–60s before <code>exp</code></td><td>Caching past expiry → 401 storms. Not caching M2M → rate-limit + cost.</td></tr>
+        <tr><td><strong>User info / profile</strong></td><td>Avoid calling <code>/userinfo</code> or Management API per request</td><td>Short TTL (seconds–minutes) or event-driven invalidation</td><td>Long TTL → stale roles after a permission change.</td></tr>
+      </tbody>
+    </table>
+    <p>The subtle bug everyone hits is the <strong>thundering herd / cache stampede</strong>: when a cached key expires, a thousand concurrent requests all miss simultaneously and all fetch JWKS at once. The fix is <strong>request coalescing</strong> (a.k.a. single-flight): the first miss fetches, everyone else waits for that one fetch. Good JWKS libraries do this for you — which is precisely why you must never hand-roll JWKS fetching.</p>
+
+    <h3>5.3 Session management at scale</h3>
+    <p>There are <strong>two distinct sessions</strong> and confusing them causes most logout bugs:</p>
+    <ol>
+      <li>The <strong>Auth0 SSO session</strong> — a cookie on the Auth0 domain (<code>tenant.auth0.com</code>). It is what makes "I'm already logged in, skip the password" work across apps. It lives at Auth0, not in your app.</li>
+      <li>Your <strong>application session</strong> — how <em>your</em> app remembers the user between requests. For an SPA this is the stored tokens; for a server-rendered app (e.g. Next.js) this is usually an encrypted, signed cookie holding the tokens, stored client-side or in a shared store like Redis.</li>
+    </ol>
+    <p>At scale you must <strong>not</strong> store application sessions in a single server's memory. Either keep them <strong>stateless</strong> (encrypted cookie carrying the token — the token <em>is</em> the session) or use a <strong>shared, replicated session store</strong> (Redis Cluster) so any replica can read any session. Refresh tokens with <strong>rotation</strong> (each use returns a new refresh token and invalidates the old) let you keep access-token TTLs short while users stay logged in for days.</p>
+
+    <h3>5.4 JWKS rotation, key rotation, and secret rotation</h3>
+    <p><strong>Key rotation</strong> is changing the asymmetric signing key pair Auth0 uses for tokens. The mechanism that makes it zero-downtime is the <code>kid</code> (key ID) in every JWT header plus the JWKS endpoint publishing <em>multiple</em> keys at once. Rotation is a three-phase dance: (1) Auth0 introduces a new key and publishes it in JWKS alongside the old; (2) new tokens are signed with the new key while old tokens (signed by the old key) still verify because the old key is still published; (3) once all old tokens have expired, the old key is revoked/removed. Your service survives this automatically <em>if and only if</em> it caches keys by <code>kid</code> and re-fetches on an unknown <code>kid</code>.</p>
+    <p><strong>Secret rotation</strong> applies to symmetric secrets: M2M <em>client secrets</em>, signing secrets for the legacy HS256, API keys, log-stream tokens. The zero-downtime pattern is <strong>overlap</strong>: provision a second valid secret, deploy it to consumers, then retire the first. Auth0 supports multiple credentials per application precisely so you can rotate without an outage. Best practice in 2026 is to avoid long-lived client secrets entirely for M2M by using <strong>Private Key JWT</strong> (asymmetric client authentication) or workload identity / mTLS, so there is no shared secret to leak.</p>
+
+    <div class="callout warn"><span class="tag">Warn</span><p>Prefer <strong>RS256</strong> (asymmetric) over <strong>HS256</strong> (symmetric) for tokens your APIs validate. With RS256 your API only needs the <em>public</em> key — a leaked API never lets an attacker mint tokens. With HS256 the same secret signs <em>and</em> verifies, so every validating service must hold the minting secret. Never expose an HS256 secret to a browser or mobile client.</p></div>
+
+    <h3>5.5 Rate limiting and backpressure</h3>
+    <p>Auth0 enforces rate limits per endpoint and per tenant (returning HTTP <code>429</code> with <code>X-RateLimit-Remaining</code> and <code>Retry-After</code> headers). The correct client behaviour is <strong>not</strong> to retry instantly in a tight loop — that amplifies the overload. It is <strong>exponential backoff with jitter</strong>, respecting <code>Retry-After</code>. <strong>Backpressure</strong> is the broader principle: when a downstream is saturated, the upstream must <em>slow down or shed load</em> rather than pile on. Implement it with a token-bucket limiter on your side, a bounded queue, and a <strong>circuit breaker</strong> that fails fast (and serves a cached/degraded response) when the IdP is unhealthy, instead of letting threads pile up waiting.</p>
+  </section>
+
+  <!-- ============================================================= 6 -->
+  <section id="walkthrough">
+    <h2>6. Code Walkthrough — The Pieces That Matter</h2>
+
+    <h3>6.1 Offline JWT validation with cached, rotating JWKS (Spring Boot Resource Server)</h3>
+    <p>Spring Security's resource server does the right thing out of the box: it caches the JWK set and refreshes on an unknown <code>kid</code>. You almost never write the cache yourself — you configure it.</p>
+    <pre><code class="language-yaml"># application.yml — point the resource server at Auth0's JWKS + issuer
+spring:
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          # NimbusJwtDecoder fetches &amp; caches this JWK Set, keyed by `kid`,
+          # and auto-refreshes when it sees a kid it doesn't have.
+          jwk-set-uri: https://YOUR_TENANT.us.auth0.com/.well-known/jwks.json
+          issuer-uri: https://YOUR_TENANT.us.auth0.com/
+</code></pre>
+    <pre><code class="language-java">// SecurityConfig.java — validate issuer + audience, map scopes -&gt; authorities
+@Configuration
+@EnableWebSecurity
+public class SecurityConfig {
+
+  @Value("${auth0.audience}") String audience;
+  @Value("${spring.security.oauth2.resourceserver.jwt.issuer-uri}") String issuer;
+
+  @Bean
+  JwtDecoder jwtDecoder() {
+    // Nimbus decoder with a built-in, single-flight JWKS cache (default 5 min,
+    // plus a 5 min "forced refresh" cooldown) — survives key rotation safely.
+    NimbusJwtDecoder decoder =
+        JwtDecoders.fromIssuerLocation(issuer) instanceof NimbusJwtDecoder d ? d
+        : NimbusJwtDecoder.withIssuerLocation(issuer).build();
+
+    OAuth2TokenValidator&lt;Jwt&gt; withIssuer = JwtValidators.createDefaultWithIssuer(issuer);
+    OAuth2TokenValidator&lt;Jwt&gt; audienceValidator = jwt -&gt;
+        jwt.getAudience().contains(audience)
+            ? OAuth2TokenValidatorResult.success()
+            : OAuth2TokenValidatorResult.failure(
+                new OAuth2Error("invalid_token", "Missing required audience", null));
+
+    decoder.setJwtValidator(new DelegatingOAuth2TokenValidator&lt;&gt;(withIssuer, audienceValidator));
+    return decoder;
+  }
+
+  @Bean
+  SecurityFilterChain api(HttpSecurity http) throws Exception {
+    http
+      .authorizeHttpRequests(a -&gt; a
+        .requestMatchers(HttpMethod.GET, "/health").permitAll()
+        .requestMatchers("/api/reports/**").hasAuthority("SCOPE_read:reports")
+        .anyRequest().authenticated())
+      .oauth2ResourceServer(o -&gt; o.jwt(Customizer.withDefaults()))
+      .sessionManagement(s -&gt; s.sessionCreationPolicy(SessionCreationPolicy.STATELESS));
+    return http.build();
+  }
+}
+</code></pre>
+
+    <h3>6.2 M2M token caching with backoff (Node.js)</h3>
+    <pre><code class="language-javascript">// m2mToken.js — cache the client-credentials token until just before expiry,
+// retry 429s with exponential backoff + jitter (backpressure-aware).
+let cached = { token: null, expiresAt: 0 };
+
+async function fetchToken() {
+  const res = await fetch(`https://${process.env.AUTH0_DOMAIN}/oauth/token`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({
+      grant_type: 'client_credentials',
+      client_id: process.env.AUTH0_CLIENT_ID,
+      client_secret: process.env.AUTH0_CLIENT_SECRET, // prefer private_key_jwt in prod
+      audience: process.env.AUTH0_API_AUDIENCE,
+    }),
+  });
+
+  if (res.status === 429) {                       // rate limited — back off, don't hammer
+    const retryAfter = Number(res.headers.get('retry-after') || 1);
+    const err = new Error('rate_limited');
+    err.retryAfter = retryAfter;
+    throw err;
+  }
+  if (!res.ok) throw new Error(`token_error ${res.status}`);
+  return res.json();
+}
+
+export async function getM2MToken() {
+  const now = Date.now();
+  if (cached.token &amp;&amp; now &lt; cached.expiresAt) return cached.token;  // cache hit
+
+  for (let attempt = 0; attempt &lt; 5; attempt++) {
+    try {
+      const { access_token, expires_in } = await fetchToken();
+      // refresh 60s early so a request never carries an about-to-expire token
+      cached = { token: access_token, expiresAt: now + (expires_in - 60) * 1000 };
+      return access_token;
+    } catch (e) {
+      const base = e.retryAfter ? e.retryAfter * 1000 : 2 ** attempt * 200;
+      const jitter = Math.random() * 200;          // jitter avoids synchronized retries
+      await new Promise(r =&gt; setTimeout(r, base + jitter));
+    }
+  }
+  throw new Error('token_unavailable_after_retries');
+}
+</code></pre>
+
+    <h3>6.3 Edge / gateway JWT verification (FastAPI behind a proxy)</h3>
+    <pre><code class="language-python"># deps.py — verify RS256 JWTs offline with PyJWT's JWKS client (caches keys by kid)
+import jwt
+from jwt import PyJWKClient
+from fastapi import Depends, HTTPException, Request
+
+ISSUER   = "https://YOUR_TENANT.us.auth0.com/"
+AUDIENCE = "https://api.helios.example.com"
+# PyJWKClient caches the JWK set and re-fetches on unknown kid (rotation-safe).
+_jwk_client = PyJWKClient(f"{ISSUER}.well-known/jwks.json", cache_keys=True, lifespan=3600)
+
+def verify_jwt(request: Request) -&gt; dict:
+    auth = request.headers.get("authorization", "")
+    if not auth.startswith("Bearer "):
+        raise HTTPException(401, "missing bearer token")
+    token = auth.split(" ", 1)[1]
+    try:
+        signing_key = _jwk_client.get_signing_key_from_jwt(token).key
+        claims = jwt.decode(
+            token, signing_key, algorithms=["RS256"],
+            audience=AUDIENCE, issuer=ISSUER,
+            options={"require": ["exp", "iat", "aud", "iss"]},
+        )
+    except jwt.PyJWTError as e:
+        raise HTTPException(401, f"invalid token: {e}")
+    return claims
+
+def require_scope(scope: str):
+    def _checker(claims: dict = Depends(verify_jwt)):
+        if scope not in claims.get("scope", "").split():
+            raise HTTPException(403, f"missing scope {scope}")
+        return claims
+    return _checker
+</code></pre>
+
+    <div class="callout note"><span class="tag">Note</span><p>Notice the pattern across all three languages: a <em>library</em> owns the JWKS cache and rotation handling. You configure the issuer, audience, and required claims; you never fetch <code>jwks.json</code> by hand. Hand-rolled JWKS fetching is the #1 source of production identity outages.</p></div>
+  </section>
+
+  <!-- ============================================================= 7 -->
+  <section id="practical">
+    <h2>7. Practical Implementation — Wiring the Production Stack</h2>
+
+    <h3>7.1 API gateway pattern (Spring Cloud Gateway / Kong / Envoy)</h3>
+    <p>The gateway centralizes cross-cutting concerns so every downstream service doesn't re-implement them: TLS termination, JWT validation, rate limiting, request logging, and <strong>identity propagation</strong> (validate the JWT once, then inject trusted headers like <code>X-User-Id</code> for internal services). Internal services then trust the mesh — but only because the gateway is the sole ingress and the mesh is mutually authenticated (mTLS), which is the zero-trust part.</p>
+    <pre><code class="language-yaml"># Spring Cloud Gateway — validate JWT at the edge, strip incoming spoofable headers
+spring:
+  cloud:
+    gateway:
+      default-filters:
+        - RemoveRequestHeader=X-User-Id     # never trust client-supplied identity headers
+        - RemoveRequestHeader=X-User-Roles
+      routes:
+        - id: reports
+          uri: lb://reports-service
+          predicates: [ Path=/api/reports/** ]
+          filters:
+            - name: RequestRateLimiter        # token-bucket per principal (Redis-backed)
+              args:
+                redis-rate-limiter.replenishRate: 200
+                redis-rate-limiter.burstCapacity: 400
+      # The gateway is configured as an OAuth2 resource server (same JWKS config as 6.1).
+</code></pre>
+
+    <h3>7.2 Next.js server-side session at scale (App Router)</h3>
+    <pre><code class="language-javascript">// middleware.ts — protect routes; the SDK stores an encrypted, stateless session cookie.
+// At scale, point the session store at Redis so refresh-token rotation is consistent
+// across replicas instead of living in a single instance's memory.
+import { auth0 } from "@/lib/auth0";
+
+export const config = { matcher: ["/dashboard/:path*", "/api/private/:path*"] };
+
+export async function middleware(req) {
+  return auth0.middleware(req); // handles /auth/* routes, session, token refresh
+}
+</code></pre>
+    <pre><code class="language-javascript">// lib/auth0.ts — refresh tokens rotate; keep access-token TTL short (e.g. 10 min)
+import { Auth0Client } from "@auth0/nextjs-auth0/server";
+
+export const auth0 = new Auth0Client({
+  authorizationParameters: {
+    scope: "openid profile email offline_access", // offline_access => refresh token
+    audience: process.env.AUTH0_API_AUDIENCE,
+  },
+  // session is an encrypted cookie by default (stateless => any replica can read it).
+  session: { rolling: true, absoluteDuration: 60 * 60 * 24 * 7 },
+});
+</code></pre>
+
+    <h3>7.3 Log streaming to a SIEM</h3>
+    <p>Auth0 <strong>Log Streams</strong> push tenant events (logins, failures, MFA, admin changes, anomaly detections) in near-real-time to a destination: a generic HTTPS webhook, Datadog, Splunk, an AWS EventBridge bus, or Azure Sentinel. This is how you get <em>observability</em> over identity and feed your <strong>SIEM</strong> (Security Information and Event Management) for alerting and compliance. Configure it once via the Management API or dashboard.</p>
+    <pre><code class="language-bash"># Create an HTTPS log stream that POSTs every event to your SIEM ingest endpoint
+curl -s -X POST "https://YOUR_TENANT.us.auth0.com/api/v2/log-streams" \
+  -H "authorization: Bearer $MGMT_API_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{
+    "name": "siem-https",
+    "type": "http",
+    "sink": {
+      "httpEndpoint": "https://siem.helios.example.com/ingest/auth0",
+      "httpAuthorization": "Bearer '"$SIEM_INGEST_TOKEN"'",
+      "httpContentType": "application/json",
+      "httpContentFormat": "JSONLINES"
+    }
+  }'
+</code></pre>
+    <div class="callout tip"><span class="tag">Tip</span><p>Stream to your SIEM even in early stages. Auth0 retains tenant logs for a limited window (days, by plan); a log stream gives you <em>indefinite</em> retention and correlation with your other systems — essential for incident forensics and audits like SOC 2.</p></div>
+  </section>
+
+  <!-- ============================================================= 8 -->
+  <section id="prod-arch">
+    <h2>8. Production Architecture — Putting It All Together</h2>
+
+    <h3>8.1 Multi-region and latency</h3>
+    <p>Run <em>your</em> services in every region your users live in, routed by GeoDNS or Anycast so each user hits the nearest deployment. Your Auth0 <strong>tenant lives in one region</strong> (chosen for data residency — US, EU, AU, etc.). The interactive <em>login</em> flow round-trips to that region (a one-time cost, hidden behind the browser redirect), but every subsequent <em>API call</em> validates tokens <strong>locally</strong> using cached JWKS, so the cross-region distance never touches the hot path. For organizations with strict residency in multiple jurisdictions, use <strong>separate tenants per region</strong> and route users accordingly.</p>
+
+    <h3>8.2 CDN and edge authentication</h3>
+    <p>A CDN terminates TLS close to users, absorbs DDoS, serves static assets, and — increasingly — runs <strong>edge functions</strong> (Cloudflare Workers, Vercel Edge, Lambda@Edge) that can validate a JWT at the edge before a request ever reaches your origin. Edge validation rejects unauthenticated traffic at the door, shielding the origin from junk load. Keep the edge check simple (signature + exp + aud); do fine-grained authorization at the service that owns the resource.</p>
+
+    <h3>8.3 Disaster recovery and incident response</h3>
+    <p><strong>DR</strong> is planning for a region or component loss. Define two numbers: <strong>RTO</strong> (Recovery Time Objective — how fast you must be back) and <strong>RPO</strong> (Recovery Point Objective — how much data you can afford to lose). For identity specifically: export your tenant configuration as code (Auth0 <strong>Deploy CLI</strong> / Terraform provider) so you can recreate a tenant; keep <strong>multiple signing keys</strong> and <strong>overlapping secrets</strong> so a compromised key/secret is a rotation, not an outage; and have a runbook for revoking sessions and refresh tokens en masse. <strong>Incident response</strong> for identity: detect (SIEM alert on anomaly) → contain (rotate secret, revoke sessions, deny-list tokens) → eradicate → recover → post-mortem from the immutable audit log.</p>
+    <pre class="diagram">
+   DETECT ──▶ CONTAIN ──▶ ERADICATE ──▶ RECOVER ──▶ LEARN
+   (SIEM      (rotate     (close the     (restore    (blameless
+    alert,     secret,     vuln, patch)   service,    post-mortem,
+    anomaly)   revoke                     re-issue    update runbook)
+               sessions,                  config)
+               deny-list jti)
+    </pre>
+
+    <h3>8.4 Capacity and tenant suitability</h3>
+    <p>Architect for the limits: know your tenant's rate limits and quotas, do bulk user operations through the <strong>bulk import/export jobs</strong> (not one API call per user), batch Management API calls, and load-test login + token endpoints before launch. For very high scale or strict isolation, Auth0's <strong>Private Cloud / dedicated</strong> deployments raise limits and isolate your tenant.</p>
+  </section>
+
+  <!-- ============================================================= 9 -->
+  <section id="security">
+    <h2>9. Security Analysis — Zero-Trust and the Threat Model</h2>
+
+    <h3>9.1 Zero-trust architecture</h3>
+    <p>The old model was a hard perimeter and a soft interior: once inside the network, you were trusted. That fails the moment one machine is breached. <strong>Zero trust</strong> (codified in NIST SP 800-207) flips it: <em>never trust, always verify</em>. There is no trusted network. Every request — even service-to-service, even inside the VPC — must carry a verifiable identity and be authorized per-request, with the policy decision informed by context (device posture, location, MFA strength). Auth0 supplies the identity backbone for zero trust: strong AuthN with MFA/adaptive risk, fine-grained AuthZ (scopes + FGA), and continuous signals via log streams. The gateway/mesh enforces mTLS so even internal calls prove identity.</p>
+
+    <h3>9.2 Threats and mitigations</h3>
+    <table>
+      <thead><tr><th>Threat</th><th>Why it matters in production</th><th>Mitigation</th></tr></thead>
+      <tbody>
+        <tr><td>Stolen access token</td><td>Bearer tokens are usable by anyone holding them</td><td>Short TTL; <strong>Sender-Constrained tokens (DPoP / mTLS)</strong>; HTTPS only; never log tokens</td></tr>
+        <tr><td>Leaked signing key</td><td>Attacker can forge tokens</td><td>RS256 (public key only at APIs); rotate keys; monitor JWKS changes</td></tr>
+        <tr><td>Leaked client secret</td><td>Attacker mints M2M tokens</td><td><strong>Private Key JWT</strong> / mTLS for M2M; overlapping rotation; secrets in a vault, not env files in git</td></tr>
+        <tr><td>Token replay after logout</td><td>Issued tokens stay valid past sign-out</td><td>Short TTL; refresh-token rotation; revocation + <code>jti</code> deny-list for high-value ops</td></tr>
+        <tr><td>JWKS endpoint DoS / 429</td><td>Validation breaks if you fetch keys per request</td><td>Cache by <code>kid</code> with single-flight; fallback to last-known-good keys</td></tr>
+        <tr><td><code>alg: none</code> / algorithm confusion</td><td>Forged unsigned tokens accepted</td><td>Pin <code>algorithms=["RS256"]</code> explicitly; never accept <code>none</code></td></tr>
+        <tr><td>SSRF via JWKS / OIDC URLs</td><td>Attacker points key fetch at internal hosts</td><td>Hard-code trusted issuer; validate <code>iss</code>; egress allow-list</td></tr>
+      </tbody>
+    </table>
+
+    <div class="callout danger"><span class="tag">Danger</span><p>Two non-negotiables: (1) <strong>Always validate <code>iss</code>, <code>aud</code>, <code>exp</code> and pin the algorithm.</strong> A validator that skips audience will accept a token minted for a <em>different</em> API. (2) <strong>Never put secrets in client-side code or commit them to git.</strong> Use a secrets manager (Vault, AWS Secrets Manager) and rotate on leak. The leaked-secret incident in our story was survivable only because rotation was already designed in.</p></div>
+  </section>
+
+  <!-- ============================================================= 10 -->
+  <section id="performance">
+    <h2>10. Performance Considerations</h2>
+    <ul>
+      <li><strong>Validate offline.</strong> Local RS256 verification is ~microseconds; a network call to Auth0 is ~tens of milliseconds and rate-limited. Offline validation is 1000×+ faster and removes the bottleneck.</li>
+      <li><strong>Cache JWKS with single-flight.</strong> One fetch serves thousands of requests; coalescing prevents the stampede when the cache expires or rotates.</li>
+      <li><strong>Cache M2M tokens.</strong> Reusing a client-credentials token until ~60s before expiry turns thousands of <code>/oauth/token</code> calls into one — cheaper, faster, and rate-limit-safe.</li>
+      <li><strong>Keep tokens lean.</strong> Every byte of JWT travels on every request. Don't stuff large arrays of permissions or full profiles into the token; carry an identifier and resolve details from a cache. Watch header-size limits at proxies.</li>
+      <li><strong>Measure percentiles, not averages.</strong> p99 latency is what users feel during a stampede. An average hides the tail. Alert on p95/p99 for token validation and login.</li>
+      <li><strong>Connection pooling and HTTP/2 keep-alive</strong> to the IdP for the calls you <em>do</em> make (token exchange, JWKS) avoid TLS handshake overhead.</li>
+      <li><strong>Autoscale on the right signal.</strong> Scale your stateless services on RPS/CPU; because they're stateless, scaling out is linear and safe.</li>
+    </ul>
+    <div class="callout key"><span class="tag">Key</span><p>The biggest performance win in identity is architectural, not micro-optimization: move validation off the network and into the process via cached public keys. Everything else is a rounding error next to "don't call the IdP per request."</p></div>
+  </section>
+
+  <!-- ============================================================= 11 -->
+  <section id="mistakes">
+    <h2>11. Common Mistakes</h2>
+    <ol>
+      <li><strong>Fetching JWKS on every request</strong> (or disabling its cache "for freshness"). Causes 429 storms and latency. Cache by <code>kid</code>; refresh on unknown <code>kid</code>.</li>
+      <li><strong>Hand-rolling JWT validation.</strong> People forget audience, accept <code>alg: none</code>, or skip expiry. Use a vetted library and pin the algorithm.</li>
+      <li><strong>Storing sessions in a single pod's memory.</strong> Breaks horizontal scaling and dies on a deploy. Use stateless tokens or a shared store.</li>
+      <li><strong>Treating logout as instant global revocation.</strong> A JWT stays valid until it expires. Short TTLs + refresh rotation + (for high-value actions) a deny-list — not "I called /logout, we're safe."</li>
+      <li><strong>Caching M2M tokens past expiry or not at all.</strong> The first gives 401 storms; the second gives rate-limit storms.</li>
+      <li><strong>Long TTL on cached roles/permissions.</strong> A demoted user keeps elevated access until the cache expires. Use short TTL or event-driven invalidation.</li>
+      <li><strong>One signing key, one client secret, no rotation plan.</strong> A leak becomes an outage. Configure overlapping keys/secrets <em>before</em> you need them.</li>
+      <li><strong>Retrying 429s in a tight loop.</strong> Amplifies overload. Exponential backoff with jitter, honour <code>Retry-After</code>.</li>
+      <li><strong>Trusting client-supplied identity headers.</strong> The gateway must strip and re-inject <code>X-User-*</code>; never trust what the browser sent.</li>
+      <li><strong>No log stream / no monitoring.</strong> You can't respond to what you can't see. Stream to a SIEM from day one.</li>
+    </ol>
+  </section>
+
+  <!-- ============================================================= 12 -->
+  <section id="best-practices">
+    <h2>12. Best Practices</h2>
+    <ul>
+      <li><strong>Stateless services + JWT</strong> so any replica serves any request; autoscale freely.</li>
+      <li><strong>RS256</strong> tokens; APIs hold only public keys; validate <code>iss</code>, <code>aud</code>, <code>exp</code>, and pin <code>alg</code>.</li>
+      <li><strong>Cache JWKS</strong> (library-managed, single-flight) and <strong>M2M tokens</strong> (refresh ~60s early).</li>
+      <li><strong>Short access-token TTL</strong> (5–15 min) + <strong>refresh-token rotation</strong> for long sessions.</li>
+      <li><strong>Multiple signing keys + overlapping secrets</strong>; rehearse rotation; prefer <strong>Private Key JWT/mTLS</strong> over client secrets for M2M.</li>
+      <li><strong>API gateway</strong> for edge AuthN, rate limiting, and identity propagation; <strong>mTLS</strong> inside the mesh (zero trust).</li>
+      <li><strong>Multi-region app, region-pinned tenant</strong>; <strong>CDN/edge</strong> for static + edge token checks.</li>
+      <li><strong>Log streams to a SIEM</strong>; alert on anomalies; monitor p95/p99 of login and validation.</li>
+      <li><strong>Infrastructure as code</strong> for the tenant (Deploy CLI / Terraform); documented DR runbook with RTO/RPO.</li>
+      <li><strong>Backpressure</strong>: token-bucket limiters, bounded queues, circuit breakers, exponential backoff with jitter.</li>
+      <li><strong>Secrets in a vault</strong>, never in git; rotate on any suspicion of leak.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================= 13 -->
+  <section id="interview">
+    <h2>13. Interview Questions (with Model Answers)</h2>
+
+    <h4>Q1. How does a service validate an Auth0 access token without calling Auth0 on every request?</h4>
+    <p><strong>Model answer:</strong> Auth0 signs JWTs with an asymmetric key (RS256) and publishes the public key at <code>/.well-known/jwks.json</code>. The service fetches and caches the JWK set, keyed by the token header's <code>kid</code>. On each request it verifies the signature with the cached public key and checks <code>iss</code>, <code>aud</code>, and <code>exp</code> — entirely offline. It only calls the JWKS endpoint when it encounters an unknown <code>kid</code> (e.g. after key rotation), with a cooldown to avoid stampedes. This is what lets validation scale horizontally with zero IdP load per request.</p>
+
+    <h4>Q2. Why can't logout immediately invalidate an access token, and how do you handle "sign out everywhere"?</h4>
+    <p><strong>Model answer:</strong> An access token is self-contained and stateless — validators don't consult a central store, so there's nothing to flip to "revoked." It stays valid until <code>exp</code>. To approximate global sign-out: (1) call Auth0's logout to kill the central SSO session and clear the app session; (2) revoke and rotate refresh tokens so no new access tokens can be minted; (3) keep access-token TTL short so the window is small; (4) for high-value operations, check a short-TTL <code>jti</code> deny-list or introspect. Back-Channel Logout can notify registered RPs to kill their local sessions.</p>
+
+    <h4>Q3. Walk me through zero-downtime signing-key rotation.</h4>
+    <p><strong>Model answer:</strong> Auth0 introduces a new key and publishes it in JWKS <em>alongside</em> the current one. New tokens are signed with the new key (new <code>kid</code>); existing tokens still verify because the old key remains published. Services that cache keys by <code>kid</code> and refresh on unknown <code>kid</code> pick up the new key automatically. Once all tokens signed by the old key have expired, the old key is removed. No service restart, no downtime — provided nobody pinned a single key or disabled JWKS refresh.</p>
+
+    <h4>Q4. Your login endpoint starts returning 429. What's your response, and how do you prevent it?</h4>
+    <p><strong>Model answer:</strong> Immediately: stop tight-loop retries, apply exponential backoff with jitter honouring <code>Retry-After</code>, shed non-critical load, and confirm existing sessions still work (they should, since validation is offline). Root cause is usually per-request calls to Auth0 — JWKS fetched per request or M2M tokens not cached. Prevent it by caching JWKS and M2M tokens, batching Management API calls, using bulk jobs for user imports, adding a circuit breaker and a CDN/edge to absorb spikes, and load-testing against known limits before launch.</p>
+
+    <h4>Q5. Design a multi-region authentication architecture for a global app with EU data-residency requirements.</h4>
+    <p><strong>Model answer:</strong> Pin the Auth0 tenant to the EU region for residency. Deploy stateless app services in US/EU/APAC, routed by GeoDNS/Anycast to the nearest region. The interactive login round-trips to the EU tenant once (hidden behind the redirect); thereafter every API call validates tokens locally with cached JWKS, so cross-region distance never touches the hot path. Put a CDN/edge in front for TLS, static, DDoS, and edge token checks. For multiple strict-residency jurisdictions, use separate tenants per region. Stream logs from each to a central SIEM, and manage tenant config as code for DR.</p>
+
+    <h4>Q6. What is zero-trust and how does Auth0 fit?</h4>
+    <p><strong>Model answer:</strong> Zero trust (NIST 800-207) means no implicit trust based on network location; every request is authenticated and authorized per-request with context. Auth0 provides the identity backbone: strong, adaptive AuthN (MFA, risk signals), fine-grained AuthZ (scopes + FGA), and continuous telemetry via log streams. The gateway and service mesh enforce mTLS so even internal service-to-service calls carry verifiable identity. The result: a stolen credential or a breached host doesn't grant lateral access, because every hop re-verifies.</p>
+  </section>
+
+  <!-- ============================================================= 14 -->
+  <section id="cert-tips">
+    <h2>14. Certification Tips</h2>
+    <ul>
+      <li><strong>Know the two sessions cold:</strong> the Auth0 SSO session (central cookie) vs. the application session. Logout questions hinge on this distinction.</li>
+      <li><strong>RS256 vs HS256:</strong> the exam loves asking which to use and why (RS256 — APIs hold only the public key). HS256 secret must never reach a public client.</li>
+      <li><strong>JWKS + <code>kid</code> rotation</strong> is a frequent topic — understand why multiple keys are published and how clients pick the right one.</li>
+      <li><strong>Token validation checklist:</strong> signature, <code>iss</code>, <code>aud</code>, <code>exp</code>/<code>nbf</code>, algorithm. Be able to recite it.</li>
+      <li><strong>Log Streams</strong> targets (HTTP, Datadog, Splunk, EventBridge, Sentinel) and that they enable long-term retention beyond tenant log retention.</li>
+      <li><strong>Rate limits</strong>: recognize <code>429</code>, <code>Retry-After</code>, and the backoff-with-jitter answer.</li>
+      <li><strong>Data residency / tenant regions</strong>: one tenant = one region; multi-region apps validate tokens locally.</li>
+      <li><strong>Refresh-token rotation and reuse detection</strong> — know that reusing an old refresh token triggers revocation of the family.</li>
+      <li><strong>Private Cloud</strong> vs Public Cloud: when isolation/higher-limits/residency drive a dedicated deployment.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================= 15 -->
+  <section id="hands-on">
+    <h2>15. Hands-On Exercises</h2>
+    <ol>
+      <li><strong>Offline validation:</strong> Build a minimal API (any framework above) that validates an Auth0 RS256 token offline, checking <code>iss</code>, <code>aud</code>, and <code>exp</code>. Confirm with a curl call carrying a real access token.</li>
+      <li><strong>Prove the JWKS cache:</strong> Add logging to your JWKS fetch. Fire 50 concurrent requests and confirm the keys are fetched <em>once</em>, not 50 times. Then simulate an unknown <code>kid</code> and confirm exactly one refresh occurs.</li>
+      <li><strong>M2M token cache:</strong> Implement the cached client-credentials helper from §6.2. Log a cache-hit vs cache-miss and confirm a burst of 100 calls triggers a single <code>/oauth/token</code> request.</li>
+      <li><strong>Backoff under 429:</strong> Mock a 429 with a <code>Retry-After: 2</code> header and verify your client waits ~2s with jitter rather than retrying instantly.</li>
+      <li><strong>Log stream:</strong> Create an HTTPS log stream (§7.3) pointing at a request-bin / webhook.site URL. Log in, fail a login, and observe the events arriving.</li>
+      <li><strong>Secret rotation drill:</strong> Add a second client credential to an M2M app, deploy it, then disable the first — confirm zero failed token requests during the swap.</li>
+    </ol>
+  </section>
+
+  <!-- ============================================================= 16 -->
+  <section id="assignment">
+    <h2>16. Assignment</h2>
+    <p>Write a <strong>Production Readiness Review (PRR)</strong> document (2–3 pages) for "Helios Analytics" going to GA at 8M users across US/EU/APAC with EU data residency. It must include:</p>
+    <ul>
+      <li>An architecture diagram (CDN → gateway → stateless services → Auth0) and the region strategy with justification.</li>
+      <li>A caching plan: what you cache (JWKS, M2M tokens, user info), TTLs, and stampede protection.</li>
+      <li>A session &amp; logout strategy: token TTLs, refresh rotation, and your "sign out everywhere" approach with its limitations stated honestly.</li>
+      <li>A key/secret rotation runbook (zero-downtime steps) and the choice between client secret and Private Key JWT, with reasoning.</li>
+      <li>Observability: log-stream destination, the top 5 alerts you'd configure, and which p99 metrics you'd watch.</li>
+      <li>A DR plan with RTO/RPO targets and the identity-specific containment steps from the incident-response loop (§8.3).</li>
+      <li>A zero-trust statement: how internal service-to-service calls are authenticated.</li>
+    </ul>
+    <div class="callout note"><span class="tag">Note</span><p>Grade yourself against §12 (Best Practices). Every claim in your PRR should map to a first-principles reason — if you wrote "we cache JWKS," you must also write <em>why</em> (avoid per-request IdP calls / 429s) and <em>how it stays correct through rotation</em> (cache by <code>kid</code>, refresh on miss).</p></div>
+  </section>
+
+  <!-- ============================================================= 17 -->
+  <section id="mini-project">
+    <h2>17. Mini Project — A Resilient Identity Edge</h2>
+    <p>Build a small but production-shaped system that demonstrates the chapter end-to-end:</p>
+    <ol>
+      <li><strong>Gateway/edge:</strong> An API gateway (Spring Cloud Gateway, Kong, or an Express/Fastify proxy) that validates RS256 tokens offline, strips client-supplied <code>X-User-*</code> headers, injects trusted ones, and applies a Redis token-bucket rate limiter per principal.</li>
+      <li><strong>Two stateless services</strong> behind it (e.g. <code>reports</code> needing <code>read:reports</code>, <code>admin</code> needing <code>manage:tenant</code>), each verifying scopes from the validated token. Run 2+ replicas of each to prove statelessness (kill one mid-request; the other serves it).</li>
+      <li><strong>M2M caller:</strong> A worker that calls a service using a <em>cached</em> client-credentials token with backoff (§6.2).</li>
+      <li><strong>Resilience:</strong> Add a circuit breaker on the M2M caller and a JWKS fallback (serve last-known-good keys if the JWKS fetch fails). Demonstrate the system keeps validating existing tokens even when the IdP endpoint is unreachable.</li>
+      <li><strong>Observability:</strong> Configure a log stream to webhook.site, and emit structured logs (no tokens!) with a trace ID propagated from the gateway through both services.</li>
+      <li><strong>Rotation demo:</strong> Script a client-secret rotation with overlap and show zero failed requests.</li>
+    </ol>
+    <p><strong>Deliverable:</strong> a repo with <code>docker-compose.yml</code> bringing up the gateway, two services (2 replicas each), Redis, and the worker; plus a <code>README</code> with a load-test (e.g. <code>k6</code> or <code>hey</code>) showing stable p99 and a chaos test killing a replica.</p>
+  </section>
+
+  <!-- ============================================================= 18 -->
+  <section id="quiz">
+    <h2>18. Quiz — Test Yourself (25 Questions)</h2>
+    <ol>
+      <li>What does it mean for a service to be "stateless," and why does it enable horizontal scaling?</li>
+      <li>Why can an API validate a JWT without calling Auth0 on every request?</li>
+      <li>What is the <code>kid</code> claim and what role does it play in key rotation?</li>
+      <li>Name the four claims you must validate on every access token.</li>
+      <li>Why is RS256 preferred over HS256 for tokens your APIs validate?</li>
+      <li>What is a cache stampede / thundering herd, and how does single-flight prevent it?</li>
+      <li>Distinguish the Auth0 SSO session from the application session.</li>
+      <li>Why doesn't calling <code>/v2/logout</code> immediately invalidate an already-issued access token?</li>
+      <li>List three techniques to approximate "sign out everywhere."</li>
+      <li>Walk through the three phases of zero-downtime signing-key rotation.</li>
+      <li>What is the overlap pattern for rotating a client secret without downtime?</li>
+      <li>Why is Private Key JWT (or mTLS) safer than a shared client secret for M2M?</li>
+      <li>What does HTTP <code>429</code> mean, and what is the correct client response?</li>
+      <li>Define backpressure and name two mechanisms that implement it.</li>
+      <li>Why measure p99 latency rather than the average?</li>
+      <li>In a multi-region app, why does login round-trip cross-region but API validation does not?</li>
+      <li>What problem does data residency create, and how do separate tenants address it?</li>
+      <li>What can edge authentication at a CDN do, and what should it <em>not</em> do?</li>
+      <li>Why must a gateway strip client-supplied <code>X-User-*</code> headers before injecting its own?</li>
+      <li>What are RTO and RPO?</li>
+      <li>List the five stages of the incident-response loop.</li>
+      <li>What is a SIEM, and why stream Auth0 logs to one rather than relying on tenant log retention?</li>
+      <li>State the core principle of zero-trust architecture in one sentence.</li>
+      <li>Why should access tokens be kept lean, and what should travel in them instead of full data?</li>
+      <li>Why is caching roles/permissions with a long TTL a security risk, and what's the fix?</li>
+    </ol>
+
+    <details>
+      <summary>Show answer key</summary>
+      <ol>
+        <li><strong>Stateless</strong> = holds no per-user state between requests that another replica couldn't reconstruct. Any replica can serve any request, so you add identical replicas behind a load balancer to scale linearly without sticky sessions.</li>
+        <li>The JWT is self-contained and signed with an asymmetric key whose public half is published at JWKS. The API verifies the signature with the cached public key and checks claims locally — no IdP call needed.</li>
+        <li><code>kid</code> = key ID in the JWT header; it tells the validator which published JWKS key signed this token, so multiple keys can coexist during rotation and the validator picks the right one.</li>
+        <li>Signature (with pinned algorithm), <code>iss</code> (issuer), <code>aud</code> (audience), and <code>exp</code> (expiry; also <code>nbf</code>/<code>iat</code> where present).</li>
+        <li>RS256 is asymmetric: APIs hold only the public key, so a leaked API can't mint tokens. HS256 uses one shared secret to sign and verify, forcing every validator to hold the minting secret.</li>
+        <li>When a cached key expires, many concurrent requests all miss and fetch JWKS at once, overloading the endpoint. Single-flight (request coalescing) lets the first miss fetch while the rest wait for that single result.</li>
+        <li>SSO session = a cookie on the Auth0 domain enabling cross-app silent login; lives at Auth0. Application session = how your app remembers the user (stored tokens or an encrypted cookie / shared store); lives with your app.</li>
+        <li>Access tokens are stateless; validators don't consult a central store, so there's nothing to flip to "revoked." The token stays valid until <code>exp</code>. Logout only clears the central SSO session and your app session.</li>
+        <li>(1) Short access-token TTL; (2) revoke + rotate refresh tokens so none can be re-minted; (3) a <code>jti</code> deny-list / introspection for high-value operations; (Back-Channel Logout notifies RPs).</li>
+        <li>(1) New key introduced and published in JWKS alongside the old; (2) new tokens signed by the new key while old tokens still verify against the still-published old key; (3) after all old tokens expire, the old key is removed.</li>
+        <li>Provision a second valid secret, deploy it to all consumers, then disable the first — there's always at least one valid secret in flight, so no request fails.</li>
+        <li>There is no shared symmetric secret to leak; the client proves identity with a private key it never transmits (or a client certificate), so a compromised server log or env file doesn't expose minting capability.</li>
+        <li>Too Many Requests — you hit a rate limit. Respond with exponential backoff plus jitter, honour <code>Retry-After</code>, and shed load; never retry in a tight loop.</li>
+        <li>Backpressure = an overloaded downstream causes the upstream to slow down or shed load rather than pile on. Mechanisms: token-bucket rate limiters, bounded queues, circuit breakers, backoff.</li>
+        <li>The average hides the tail; p99 is what the slowest 1% of users experience, which is exactly who suffers during spikes and stampedes. SLOs are defined on percentiles.</li>
+        <li>Login is interactive and must reach the region-pinned tenant once; API calls validate tokens locally with cached public keys, so they never traverse regions.</li>
+        <li>Residency requires identity data to stay in a jurisdiction. A tenant lives in one region; for multiple strict jurisdictions you use separate per-region tenants and route users accordingly.</li>
+        <li>It can terminate TLS, absorb DDoS, serve static assets, and reject unauthenticated requests via a lightweight JWT check (signature/exp/aud). It should <em>not</em> do fine-grained authorization — that belongs at the resource-owning service.</li>
+        <li>Because clients could spoof identity by sending those headers themselves. The gateway strips anything inbound and injects only headers derived from the validated token, so internal services can trust them.</li>
+        <li>RTO = Recovery Time Objective (how fast you must restore service); RPO = Recovery Point Objective (how much data loss is tolerable).</li>
+        <li>Detect → Contain → Eradicate → Recover → Learn (blameless post-mortem).</li>
+        <li>SIEM = Security Information and Event Management — aggregates and correlates security events for alerting/forensics. You stream to it for indefinite retention and cross-system correlation beyond Auth0's limited tenant log window.</li>
+        <li>Never trust based on network location; authenticate and authorize every request per-request with context — there is no trusted interior.</li>
+        <li>Every byte travels on every request and counts against proxy header limits. Carry an identifier (e.g. user/tenant id) and resolve large/volatile details from a cache server-side.</li>
+        <li>A demoted/revoked user keeps stale elevated access until the cache expires. Fix with short TTLs or event-driven invalidation tied to permission-change events.</li>
+      </ol>
+      <p class="lead">Score 20+/25 before moving on. If §7–9 questions tripped you up, re-read the caching and zero-trust sections.</p>
+    </details>
+  </section>
+
+  <!-- ============================================================= 19 -->
+  <section id="cheatsheet">
+    <h2>19. Cheat Sheet</h2>
+    <table>
+      <thead><tr><th>Concern</th><th>Do this</th></tr></thead>
+      <tbody>
+        <tr><td>Token validation</td><td>Offline, RS256, library-managed JWKS cache by <code>kid</code>; check sig + <code>iss</code> + <code>aud</code> + <code>exp</code>; pin alg</td></tr>
+        <tr><td>JWKS caching</td><td>Cache all keys; refresh on unknown <code>kid</code> with cooldown; single-flight to avoid stampede; fallback to last-known-good</td></tr>
+        <tr><td>M2M tokens</td><td>Cache until ~60s before <code>exp</code>; backoff+jitter on 429; prefer Private Key JWT over secret</td></tr>
+        <tr><td>Sessions</td><td>Stateless cookie or shared Redis; never single-pod memory; short access TTL + refresh rotation</td></tr>
+        <tr><td>Logout</td><td>/v2/logout clears SSO; clear app session; revoke refresh tokens; deny-list <code>jti</code> for high-value</td></tr>
+        <tr><td>Key rotation</td><td>Multiple keys in JWKS; clients pick by <code>kid</code>; old key stays until old tokens expire</td></tr>
+        <tr><td>Secret rotation</td><td>Overlap: add new, deploy, retire old; vault-stored; rotate on leak</td></tr>
+        <tr><td>Rate limits</td><td>Respect <code>Retry-After</code>; exponential backoff + jitter; circuit breaker; cache to avoid them</td></tr>
+        <tr><td>Multi-region</td><td>App per region (GeoDNS/Anycast); region-pinned tenant; validate tokens locally</td></tr>
+        <tr><td>Edge/CDN</td><td>TLS, DDoS, static, lightweight JWT check; fine-grained authZ at the service</td></tr>
+        <tr><td>Gateway</td><td>Validate JWT once; strip + inject <code>X-User-*</code>; per-principal rate limit; mTLS to mesh</td></tr>
+        <tr><td>Observability</td><td>Log stream → SIEM; alert on anomalies; watch p95/p99 of login + validation; never log tokens</td></tr>
+        <tr><td>DR</td><td>Tenant config as code (Deploy CLI/Terraform); RTO/RPO; runbook: rotate, revoke, deny-list</td></tr>
+        <tr><td>Zero trust</td><td>No trusted network; per-request authN+authZ with context; mTLS internally; MFA + FGA</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- ============================================================= 20 -->
+  <section id="takeaways">
+    <h2>20. Key Takeaways</h2>
+    <div class="callout key"><span class="tag">Key</span><p><strong>1.</strong> Authenticate centrally, authorize locally. Self-contained RS256 tokens let every service validate offline with cached public keys — the foundation of identity that scales horizontally without an IdP bottleneck.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p><strong>2.</strong> Cache the three things — JWKS (by <code>kid</code>, single-flight), M2M tokens (refresh early), user info (short TTL) — and you eliminate almost all per-request IdP calls and the 429 storms they cause.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p><strong>3.</strong> Logout is not instant revocation. A JWT lives until it expires; "sign out everywhere" = clear SSO + app session, revoke/rotate refresh tokens, short TTLs, and a deny-list for high-value actions.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p><strong>4.</strong> Rotation is survivable only if designed in advance: multiple JWKS keys keyed by <code>kid</code>, overlapping secrets, and Private Key JWT/mTLS so a leaked key or secret is a routine rotation, not an outage.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p><strong>5.</strong> Multi-region means app-per-region with a region-pinned tenant; the CDN/edge and API gateway absorb load, enforce TLS, validate tokens at the door, and propagate trusted identity inward.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p><strong>6.</strong> Observability and zero trust are the safety net: stream logs to a SIEM, alert on anomalies, measure p99, authenticate every hop (mTLS, MFA, FGA), and keep a DR runbook with RTO/RPO so a 3 a.m. incident becomes a 30-minute footnote.</p></div>
+  </section>
+
+  <nav class="pager">
+    <a class="prev" href="chapter-26.html">← Previous</a>
+    <a class="next" href="chapter-28.html">Next →</a>
+  </nav>
+</main>
+<footer class="site-footer">Master Auth0 End-to-End · Chapter 27 of 32</footer>
+</body>
+</html>

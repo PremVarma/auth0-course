@@ -1,0 +1,839 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 32 — Real Enterprise Case Studies | Master Auth0</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">🔐 Master Auth0</a>
+  <nav class="topnav">
+    <a href="chapter-31.html">← Prev</a>
+    <a href="index.html">Contents</a>
+    <a href="index.html">Next →</a>
+  </nav>
+</header>
+<main class="container">
+  <div class="chapter-head">
+    <span class="phase">Phase 14 · Enterprise Case Studies</span>
+    <h1>Chapter 32 — Real Enterprise Case Studies</h1>
+    <p class="lead">Every concept in this course — OAuth 2.0, OIDC, MFA, RBAC, organizations, federation, token lifecycles, rules and actions — was built so that one day you could walk into a design review and architect identity for a company that actually exists. This final chapter is that review. We will take eleven very different organizations — Netflix, Amazon, Uber, Airbnb, Spotify, GitHub, Slack, a retail Bank, a Healthcare provider, a Government agency, and a Cinema booking platform — and for <em>each</em> reconstruct, from first principles, the identity requirements, the identity model, the key authentication and authorization flows, the trade-offs the architects must weigh, and the hard-won lessons. These are not official architecture disclosures; they are <strong>plausible, technically rigorous reconstructions</strong> of how a senior IAM architect would design each system with Auth0 (and where Auth0 is the wrong tool, we say so). By the end you will be able to reason about <em>any</em> company's identity needs the way an architect does: start from the threat model and the user population, and let the protocol fall out of the requirements.</p>
+  </div>
+
+  <!-- ============================================================= 1 -->
+  <section id="theory">
+    <h2>1. Theory — The First Principles Behind Every Case Study</h2>
+
+    <p>Before we look at any single company, we need a <strong>repeatable analysis framework</strong>. The mistake beginners make is to memorize "Netflix uses X." Companies change their stacks; the framework does not. A senior architect approaches every identity problem by answering the same eight questions in order. Memorize the questions, not the answers.</p>
+
+    <table>
+      <thead><tr><th>#</th><th>Question</th><th>Why it comes first</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td><strong>Who are the user populations?</strong> (B2C consumers, B2B business users, B2E employees, machines)</td><td>Population determines almost everything else: a consumer wants frictionless login; an employee must use corporate SSO; a machine needs client-credentials.</td></tr>
+        <tr><td>2</td><td><strong>What is the trust boundary?</strong> Whose identity provider authenticates the user — yours, theirs, or a social one?</td><td>Federation vs. self-managed identity is the single biggest architectural fork.</td></tr>
+        <tr><td>3</td><td><strong>What are the resources being protected and how sensitive?</strong></td><td>Sensitivity sets the assurance level (LOA/AAL): a movie thumbnail needs less protection than a wire transfer.</td></tr>
+        <tr><td>4</td><td><strong>What devices/clients exist?</strong> (Browser SPA, native mobile, smart TV, CLI, server-to-server, IoT)</td><td>Client type dictates the OAuth grant: PKCE for public clients, device flow for input-constrained TVs, client-credentials for servers.</td></tr>
+        <tr><td>5</td><td><strong>What is the scale and latency budget?</strong></td><td>100M users at p99 &lt; 50ms forces token-based stateless auth and edge validation.</td></tr>
+        <tr><td>6</td><td><strong>What regulations apply?</strong> (PCI-DSS, HIPAA, GDPR, FedRAMP, PSD2, SOC 2)</td><td>Compliance turns "nice to have" controls into mandatory ones and dictates data residency.</td></tr>
+        <tr><td>7</td><td><strong>What is the authorization model?</strong> (RBAC, ABAC, ReBAC, PBAC)</td><td>Determines whether you can encode access in a token or must call a policy engine per request.</td></tr>
+        <tr><td>8</td><td><strong>What is the failure/abuse model?</strong> (account takeover, credential stuffing, fraud, insider threat)</td><td>The threat model justifies every control you add; controls without threats are cargo cult.</td></tr>
+      </tbody>
+    </table>
+
+    <p>Three vocabulary anchors used throughout this chapter:</p>
+    <ul>
+      <li><strong>B2C / B2B / B2E:</strong> Business-to-Consumer (you own the identity, e.g. Netflix subscribers), Business-to-Business (your customer is an org whose users you partition, e.g. Slack workspaces), Business-to-Employee (internal workforce, e.g. Amazon staff tools).</li>
+      <li><strong>AAL (Authenticator Assurance Level, NIST 800-63B):</strong> AAL1 = single factor, AAL2 = MFA, AAL3 = hardware-bound phishing-resistant (FIDO2). Banks and government push toward AAL2/AAL3.</li>
+      <li><strong>ReBAC (Relationship-Based Access Control):</strong> "can user U do action A on object O?" answered by traversing a relationship graph (owner→editor→viewer). This is how GitHub, Airbnb, and Google Drive scale authorization. Auth0 ships this as <strong>Auth0 FGA</strong> (Fine-Grained Authorization, the OpenFGA / Zanzibar model).</li>
+    </ul>
+
+    <div class="callout key"><span class="tag">Key</span><p>Never start from the protocol. Start from <em>population × trust boundary × sensitivity × client × scale × regulation × authz model × threat</em>. The protocol (OIDC code+PKCE, SAML, device flow, client-credentials, CIBA) is the <em>output</em> of that analysis, never the input.</p></div>
+  </section>
+
+  <!-- ============================================================= 2 -->
+  <section id="story">
+    <h2>2. Story-Based Explanation — One Architect, Eleven War Rooms</h2>
+    <p>Imagine you are a fractional Principal IAM Architect. Over one intense quarter you are pulled into eleven war rooms. Each company hands you a one-line brief and a panicked deadline. Watch how the <em>same framework</em> produces eleven completely different blueprints.</p>
+    <ul>
+      <li><strong>Netflix:</strong> "300M profiles, people log in on a TV with a remote. Make it not painful." → device authorization flow + long-lived refresh tokens + profile sub-identities.</li>
+      <li><strong>Amazon:</strong> "One account, hundreds of services, plus AWS for engineers and a seller marketplace." → a central OIDC provider, service-to-service mTLS, and STS-style scoped tokens.</li>
+      <li><strong>Uber:</strong> "Riders, drivers, and Uber Eats merchants, all on phones, plus real-time trust signals." → multi-persona accounts, step-up MFA, risk-based auth.</li>
+      <li><strong>Airbnb:</strong> "Hosts and guests, and a host can give a co-host access to <em>some</em> listings." → ReBAC graph (FGA), verified identity, social login.</li>
+      <li><strong>Spotify:</strong> "Free and premium tiers, family plans, third-party app ecosystem, Sonos/car/console clients." → OAuth scopes as the product, device flow, family as an organization.</li>
+      <li><strong>GitHub:</strong> "Developers, orgs, fine-grained PATs, OAuth apps, GitHub Apps, and SSO for enterprises." → the canonical ReBAC + token-zoo + SAML enforcement story.</li>
+      <li><strong>Slack:</strong> "Workspaces are the unit. Enterprise Grid federates many workspaces. SCIM and SSO mandatory." → B2B organizations, SAML/SCIM, cross-workspace identity.</li>
+      <li><strong>Bank:</strong> "PSD2 open banking, AAL2 minimum, fraud everywhere, regulators auditing." → strong customer authentication (SCA), CIBA, transaction signing.</li>
+      <li><strong>Healthcare:</strong> "HIPAA, clinicians and patients, EHR via SMART on FHIR, break-glass access." → SMART on FHIR scopes, consent, audit, ABAC on patient relationship.</li>
+      <li><strong>Government:</strong> "FedRAMP, PIV/CAC smartcards, identity proofing IAL2, no commercial social login." → SAML/PIV federation, high assurance, on-prem or GovCloud tenant.</li>
+      <li><strong>Cinema booking:</strong> "Casual users, guest checkout, seat-hold race conditions, loyalty." → low-friction B2C, passwordless, idempotent reservation tokens.</li>
+    </ul>
+    <p>Same questions; radically different answers. That is the whole point of this chapter.</p>
+    <div class="callout note"><span class="tag">Note</span><p>These reconstructions are pedagogical. Real Netflix/Amazon/etc. run enormous bespoke identity platforms (Netflix's own, Amazon's internal "Identity," etc.). We model "how would <em>you</em> build the equivalent with Auth0 and standard protocols," which is exactly what an interview or a real green-field project asks of you.</p></div>
+  </section>
+
+  <!-- ============================================================= 3 -->
+  <section id="diagrams">
+    <h2>3. ASCII Diagrams — The Eleven Blueprints at a Glance</h2>
+
+    <h3>3.1 The decision tree: which grant for which client?</h3>
+    <pre class="diagram">
+                         ┌──────────────────────────────┐
+                         │   What kind of client is it?  │
+                         └───────────────┬──────────────┘
+            ┌────────────────┬───────────┼───────────────┬───────────────┐
+            ▼                ▼            ▼               ▼               ▼
+       Browser SPA      Native app    Smart TV /      Server /        Push to
+       (Netflix web,   (Uber, Spotify  console /      cron / backend  user's phone
+        Slack web)      mobile)        IoT (Netflix   (Amazon svc,    for approval
+            │                │          on Apple TV)   bank batch)     (bank payment)
+            ▼                ▼            ▼               ▼               ▼
+     Auth Code + PKCE  Auth Code+PKCE  Device Auth    Client          CIBA
+     (no client secret) + Refresh +    Flow (RFC      Credentials     (Client-Initiated
+                        biometric      8628)          (mTLS / private  Backchannel Auth)
+                        unlock                         _key_jwt)
+    </pre>
+
+    <h3>3.2 Netflix — device flow + profiles</h3>
+    <pre class="diagram">
+   ┌────────────┐   1. POST /device/code        ┌─────────────────┐
+   │  Smart TV  │ ─────────────────────────────▶│  Auth0 (Netflix │
+   │ (no kbd)   │ ◀──────────────────────────── │   tenant)       │
+   └─────┬──────┘   2. user_code + verify_uri    └────────┬────────┘
+         │  shows "Go to nflx.tv/activate, enter ABCD-1234"│
+         │                                                 │
+   ┌─────▼──────┐   3. user logs in on phone/laptop        │
+   │   Phone    │ ──────────────────────────────────────▶ │ approves
+   └────────────┘                                          │
+         TV polls /token  ◀────── 4. id_token + access_token + refresh_token
+                                     sub=acct_42  ───▶ then pick PROFILE
+                                     ┌──────────────────────────────┐
+                                     │  Account acct_42             │
+                                     │  ├─ profile: Mom  (PG-13)    │
+                                     │  ├─ profile: Kid  (kids-only)│
+                                     │  └─ profile: Dad  (no limit) │
+                                     └──────────────────────────────┘
+    </pre>
+
+    <h3>3.3 GitHub / Airbnb — ReBAC authorization graph (Zanzibar/FGA)</h3>
+    <pre class="diagram">
+        relationship tuples (object#relation@subject)
+        ──────────────────────────────────────────────
+        repo:acme/billing # owner   @ user:alice
+        repo:acme/billing # admin   @ team:acme/payments#member
+        team:acme/payments# member  @ user:bob
+        org:acme           # member @ user:carol
+
+        Query: can user:bob "push" to repo:acme/billing ?
+        ┌────────────┐   ┌───────────────┐   ┌──────────────┐
+        │ user:bob   │──▶│ team payments │──▶│ repo admin   │──▶ push ✓
+        │            │   │  (#member)    │   │ (admin⊇push) │
+        └────────────┘   └───────────────┘   └──────────────┘
+        Decision is a GRAPH TRAVERSAL, not a token claim.
+    </pre>
+
+    <h3>3.4 Bank — Strong Customer Authentication with CIBA (dynamic linking)</h3>
+    <pre class="diagram">
+   Merchant /          Bank ASPSP            Auth0 (CIBA)        Customer phone
+   TPP (PISP)          backend                                  (banking app)
+      │  initiate €420 payment to IBAN X                              │
+      │ ───────────────▶ │  POST /bc-authorize                       │
+      │                  │  binding_message="Pay €420 to IBAN X" ───▶│ push
+      │                  │ ◀── auth_req_id                           │ ── user
+      │                  │  poll /token ......................        │  sees amount,
+      │                  │ ◀── tokens (after approval) ◀─────────────│  Face ID ✓
+      │ ◀── payment authorized; consent + amount cryptographically bound │
+    </pre>
+
+    <h3>3.5 Slack Enterprise Grid — B2B organizations + federation</h3>
+    <pre class="diagram">
+        Corp IdP (Okta/Entra)            Auth0 Organizations
+        ┌───────────────────┐            ┌──────────────────────────┐
+        │  SAML / OIDC + SCIM│ ─provision▶│ org: acme-corp           │
+        └─────────┬─────────┘            │   ├─ workspace #eng       │
+                  │ SSO login            │   ├─ workspace #sales     │
+                  ▼                      │   └─ members (SCIM-synced)│
+        user@acme.com ──login via org──▶ │ org: acme-subsidiary      │
+                                         └──────────────────────────┘
+        One human → one identity → many workspaces under the Grid org.
+    </pre>
+
+    <div class="callout tip"><span class="tag">Tip</span><p>When you sketch any identity architecture on a whiteboard, draw exactly these three boxes first: <strong>(1) the user/client</strong>, <strong>(2) the authorization server</strong> (Auth0), <strong>(3) the resource server / API</strong>. Everything else hangs off those three. Interviewers love this clarity.</p></div>
+  </section>
+
+  <!-- ============================================================= 4 -->
+  <section id="analogy">
+    <h2>4. Real-World Analogy — A City of Buildings</h2>
+    <p>Think of identity as <strong>physical access control across a city of very different buildings</strong>. The same primitives (a door, a key, a guard, a logbook) appear everywhere, but each building configures them differently because of who enters and what is inside.</p>
+    <ul>
+      <li><strong>Netflix is a multiplex cinema lobby.</strong> Anyone can walk in cheaply; the friction is intentionally near-zero. The "TV device flow" is the kiosk where you scan a QR code instead of typing — input-constrained convenience.</li>
+      <li><strong>The Bank is a vault.</strong> Two-person rule, biometric on the inner door, a tamper-evident log, and the guard re-checks you (step-up) before the vault itself even though you already entered the lobby.</li>
+      <li><strong>GitHub/Airbnb are office buildings with sub-tenants.</strong> The landlord (org owner) issues master keys; a tenant (team) issues floor keys; a contractor (co-host) gets a key to one room for one week. That web of who-can-open-what is the ReBAC graph.</li>
+      <li><strong>Slack/Amazon are corporate campuses.</strong> Your single employee badge (corporate SSO) opens every building you're entitled to; HR deactivates the badge centrally the moment you leave (SCIM deprovisioning).</li>
+      <li><strong>Government is a secure facility.</strong> A commercial credit card (social login) is meaningless at the gate; only a government-issued PIV smartcard inserted into a reader gets you in, and your identity was proven in person before the card was ever issued (IAL2 proofing).</li>
+    </ul>
+    <p>The architect's job is to pick the right door, key, guard, and logbook for the building — not to install a vault door on a cinema (kills the business with friction) nor a cinema turnstile on a vault (catastrophic breach).</p>
+  </section>
+
+  <!-- ============================================================= 5 -->
+  <section id="internal">
+    <h2>5. Internal Working — Eleven Case Studies in Depth</h2>
+
+    <h3>5.1 Netflix — frictionless B2C at planetary scale</h3>
+    <p><strong>Requirements:</strong> 300M+ subscribers; login on TVs, consoles, phones, browsers, fridges; near-zero friction (every login screen costs subscribers); shared accounts with per-person <em>profiles</em>; parental controls; offline downloads; global low latency.</p>
+    <p><strong>Identity model:</strong> B2C — Netflix owns the identity (email/password or passwordless, plus social). The <em>account</em> is the billing+auth unit (the OIDC <code>sub</code>). <em>Profiles</em> are sub-identities <em>inside</em> the account, not separate logins; they are an authorization/personalization concept carried as a custom claim, never as separate credentials. Maturity rating (kids vs adult) is an attribute on the profile → ABAC gate on content.</p>
+    <p><strong>Key flows:</strong> (1) <em>Device Authorization Flow (RFC 8628)</em> for TVs — the TV cannot show a good keyboard, so it shows a code and the user authenticates on a phone. (2) <em>Auth Code + PKCE</em> for web/mobile. (3) <em>Long-lived refresh tokens with rotation</em> so a TV stays signed in for months but a stolen token is detectable via reuse detection.</p>
+    <p><strong>Trade-offs:</strong> Long-lived sessions maximize convenience but widen the theft window → mitigated by refresh-token rotation + reuse detection + device binding. Profiles-as-claims keep login frictionless but mean the API must <em>trust</em> the profile claim → it must be signed and re-validated server-side for parental-control enforcement, never trusted from the client.</p>
+    <p><strong>Lessons:</strong> For massive B2C, the conversion-killing enemy is friction. Device flow, passwordless, and long sessions are not luxuries — they protect revenue. But every convenience must be paired with a detection control (reuse detection, anomaly detection) because you cannot ask 300M people to use hardware keys.</p>
+
+    <h3>5.2 Amazon — one retail identity + an internal/cloud workforce + sellers</h3>
+    <p><strong>Requirements:</strong> a single consumer "Amazon account" usable across retail, Prime Video, Alexa, Kindle, Audible (one login, many services); a <em>seller</em> marketplace (B2B); a huge internal workforce + AWS console (B2E, very high assurance); and machine-to-machine across thousands of microservices.</p>
+    <p><strong>Identity model:</strong> Three planes. (1) <em>Consumer plane</em>: one OIDC identity provider issuing tokens consumed by all consumer apps ("Login with Amazon" externalizes this to third parties). (2) <em>Workforce plane</em>: federated corporate SSO with mandatory phishing-resistant MFA for AWS/internal tools; AWS itself maps federated identities to STS short-lived role credentials. (3) <em>Service plane</em>: mutual-TLS + signed JWT (client-credentials) between services, with scoped, short-TTL tokens.</p>
+    <p><strong>Key flows:</strong> Consumer = OIDC code+PKCE. Workforce → AWS = SAML/OIDC federation → <code>AssumeRoleWithWebIdentity</code> → short-lived STS creds (the cloud analogue of token exchange). Service-to-service = OAuth client-credentials with mTLS-bound tokens; least-privilege scopes per service.</p>
+    <p><strong>Trade-offs:</strong> One consumer identity across many products is great UX and great for personalization but concentrates blast radius — a single account takeover hits Prime, Kindle, payments. Hence aggressive risk-based auth + step-up before payment/address change. Short-lived STS creds add complexity (constant refresh) but bound the damage of a leaked credential to minutes.</p>
+    <p><strong>Lessons:</strong> Separate your planes. Never let workforce and consumer identity share a trust domain. Make machine credentials short-lived and least-privilege by default; long-lived static keys are the #1 cloud breach vector.</p>
+
+    <h3>5.3 Uber — multi-persona, risk-based, real-time trust</h3>
+    <p><strong>Requirements:</strong> riders, drivers, and Eats merchants/couriers — the <em>same human</em> may be several personas; everything on mobile; high-value real-money actions (payouts, ride trust); fraud and account-takeover are constant; phone number is the primary identifier in many markets.</p>
+    <p><strong>Identity model:</strong> B2C with <em>multiple personas</em> per identity. Login is typically <em>passwordless via SMS/phone OTP</em> (phone-first markets) plus social. Driver onboarding requires <em>identity proofing</em> (document + biometric liveness) because money and safety are involved → higher assurance than a rider.</p>
+    <p><strong>Key flows:</strong> Passwordless OTP for sign-in; <em>step-up MFA / re-authentication</em> before sensitive actions (changing payout bank account, withdrawing earnings); <em>risk-based / adaptive authentication</em> using signals (new device, impossible travel, velocity) to demand more proof. Auth0 <em>Actions</em> at the post-login trigger compute a risk score and force step-up.</p>
+    <p><strong>Trade-offs:</strong> Phone-as-identity is frictionless and fits emerging markets but is vulnerable to SIM-swap → mitigate with device binding and risk signals, and require step-up (not just SMS) for money movement. Multiple personas in one account simplify the human's life but complicate authorization — each action must check the <em>active persona's</em> entitlements.</p>
+    <p><strong>Lessons:</strong> Tie assurance to the <em>action</em>, not the session. Logging in to see your ride history is low-stakes; changing the bank account that receives your earnings must trigger fresh, strong authentication regardless of how you logged in.</p>
+
+    <h3>5.4 Airbnb — two-sided marketplace with delegated access</h3>
+    <p><strong>Requirements:</strong> hosts and guests; trust between strangers (identity verification, reviews); a host can grant a <em>co-host</em> access to <em>specific</em> listings; payments; social login for low-friction signup.</p>
+    <p><strong>Identity model:</strong> B2C marketplace. Core authn is social + email/passwordless. The interesting part is <strong>authorization</strong>: "co-host of listing L can edit calendar but not change payout account" is a <em>relationship</em>, not a global role → <strong>ReBAC via Auth0 FGA</strong>. Verified-identity status (government ID checked) is an attribute used in ABAC trust gates.</p>
+    <p><strong>Key flows:</strong> Social/passwordless login → coarse session. Per-resource decisions ("can user U edit listing L?") are answered by FGA <code>check</code> calls. Identity verification is a separate proofing flow whose result becomes a verified claim.</p>
+    <p><strong>Trade-offs:</strong> RBAC would explode here (you cannot have a global "co-host" role; co-host is always relative to a listing). ReBAC solves it elegantly but adds a network call per authorization check → mitigate with check batching and caching. Social login lowers signup friction but you must still proof identity for trust.</p>
+    <p><strong>Lessons:</strong> When access is "X relative to a specific object," reach for ReBAC, not roles. Roles answer "what kind of user"; relationships answer "what can this user do to <em>this</em> thing."</p>
+
+    <h3>5.5 Spotify — scopes-as-product and a device ecosystem</h3>
+    <p><strong>Requirements:</strong> free vs premium tiers; family plans; a huge third-party developer ecosystem (apps that read your playlists, control playback); playback on phones, web, consoles, cars, Sonos, smart speakers.</p>
+    <p><strong>Identity model:</strong> B2C for end users; an <em>OAuth platform</em> for third parties. <strong>Scopes are the product surface</strong>: <code>user-read-private</code>, <code>playlist-modify-public</code>, <code>streaming</code>, etc. Premium/free is an <em>entitlement</em> claim. A family plan is naturally modeled as an <em>organization</em> with member sub-accounts.</p>
+    <p><strong>Key flows:</strong> Third-party apps use Auth Code + PKCE and request only the scopes they need (consent screen). Input-constrained devices (speakers, some cars) use the <em>Device Authorization Flow</em>. The user's consent grant is durable and revocable from account settings.</p>
+    <p><strong>Trade-offs:</strong> A rich scope catalog enables a developer ecosystem but creates over-permissioning risk → enforce least privilege and incremental consent. Entitlement-as-claim is fast (no DB hit at playback time) but must be short-lived enough that a downgrade from premium→free takes effect quickly.</p>
+    <p><strong>Lessons:</strong> If third parties integrate with you, your <em>scope design is your API design</em>. Granular, well-named, least-privilege scopes are a product feature, not an afterthought.</p>
+
+    <h3>5.6 GitHub — the canonical token zoo + ReBAC + enterprise SSO</h3>
+    <p><strong>Requirements:</strong> individual developers, organizations, and enterprises; programmatic access (Git over HTTPS, API); third-party OAuth apps; first-class automation (GitHub Apps / installation tokens); enterprises that demand SAML SSO enforcement and SCIM.</p>
+    <p><strong>Identity model:</strong> B2C identity for developers, B2B <em>organizations</em> on top. Authorization is deeply <strong>ReBAC</strong>: org → team → repo with relations owner/admin/maintain/write/triage/read that <em>imply</em> one another (admin ⊇ write ⊇ read). The "token zoo": classic PATs, fine-grained PATs (scoped to specific repos + permissions), OAuth-app tokens (user-delegated), and GitHub App installation tokens (short-lived, act-as-app).</p>
+    <p><strong>Key flows:</strong> Browser login = session. CLI/Git = PAT or device flow. Third-party apps = OAuth code flow with scopes. Automation = GitHub App → short-lived installation access token (machine identity scoped to one installation). Enterprise users = SAML SSO; an enterprise can <em>require</em> SSO, and PATs/SSH keys must be SSO-authorized before they can touch org resources.</p>
+    <p><strong>Trade-offs:</strong> Classic PATs are convenient but over-broad and long-lived → fine-grained PATs (least privilege, expiring) reduce blast radius at the cost of UX. ReBAC gives precise per-repo control but every access check is a graph query → heavy caching. SAML enforcement protects enterprises but can lock out automation unless tokens are SSO-authorized.</p>
+    <p><strong>Lessons:</strong> Different clients need different credentials — do not force one token type to serve humans, CLIs, and bots. Make machine tokens short-lived and narrowly scoped. ReBAC is the right model the moment "access depends on which repo."</p>
+
+    <h3>5.7 Slack — B2B workspaces and Enterprise Grid</h3>
+    <p><strong>Requirements:</strong> the <em>workspace</em> is the unit of collaboration; large enterprises run many workspaces under one <em>Grid</em>; IT demands SSO (SAML/OIDC) and automated user lifecycle (SCIM); guests/external shared channels add cross-org identity.</p>
+    <p><strong>Identity model:</strong> B2B. Map cleanly to <strong>Auth0 Organizations</strong>: a Grid = an organization; workspaces = sub-groupings; members are provisioned by the customer's IdP via SCIM and authenticate via their corporate SSO. A single human has one identity that spans the workspaces they belong to.</p>
+    <p><strong>Key flows:</strong> User clicks "Sign in to acme.slack.com" → routed to the org's connection (SAML/OIDC to Okta/Entra). SCIM keeps membership in sync (hire → account appears; terminate → account disabled within minutes). Cross-workspace/guest access is a controlled federation/invite flow.</p>
+    <p><strong>Trade-offs:</strong> Centralized SSO/SCIM delights IT and is mandatory for enterprise deals, but it pushes you into per-org connection management (each customer's IdP is configured separately). Organizations isolate tenants cleanly but you must prevent identity leakage across orgs.</p>
+    <p><strong>Lessons:</strong> For B2B SaaS, "Organizations + SAML/OIDC + SCIM" is the table-stakes trio. If you cannot offer enterprise SSO and automated deprovisioning, you cannot sell to enterprises. Build the org abstraction early.</p>
+
+    <h3>5.8 Banking — strong customer authentication and open banking</h3>
+    <p><strong>Requirements:</strong> regulatory (PSD2/SCA in EU, FFIEC in US), PCI-DSS for card data; AAL2 minimum, often phishing-resistant; fraud and account-takeover are existential; open-banking APIs let licensed third parties (TPPs) initiate payments and read accounts <em>with customer consent</em>; full audit and non-repudiation.</p>
+    <p><strong>Identity model:</strong> B2C for retail customers with very high assurance, plus a B2B/partner plane for TPPs (each a registered OAuth client, often with mTLS and signed software statements). <strong>Strong Customer Authentication</strong> requires two of three factors (knowledge, possession, inherence). <strong>Dynamic linking</strong>: the authentication must be cryptographically bound to the <em>specific</em> amount and payee.</p>
+    <p><strong>Key flows:</strong> Consumer login = OIDC code+PKCE + mandatory MFA (passkey/app push). Payment authorization = <strong>CIBA</strong> (Client-Initiated Backchannel Authentication): the bank pushes "Approve €420 to IBAN X" to the customer's phone; the <code>binding_message</code> ties the approval to that transaction. TPP access = OAuth with consent + mTLS-bound tokens; tokens are short-lived; everything is logged for non-repudiation.</p>
+    <p><strong>Trade-offs:</strong> SCA adds friction to every payment, hurting conversion → regulators allow risk-based exemptions (low-value, trusted-beneficiary) to claw friction back. CIBA decouples the consumption device from the authentication device (great for security and for phone-call/agent channels) but adds a polling/notification round-trip.</p>
+    <p><strong>Lessons:</strong> In regulated finance, authentication strength and <em>transaction binding</em> are not optional. Design for non-repudiation from day one: every consent and approval must be reconstructable in an audit years later. Auth0 is a strong fit for the customer-facing SCA/CIBA layer; core ledger auth often stays in dedicated regulated systems.</p>
+
+    <h3>5.9 Healthcare — HIPAA, SMART on FHIR, consent and break-glass</h3>
+    <p><strong>Requirements:</strong> HIPAA (US) / equivalent; protect PHI (protected health information); clinicians, patients, and third-party health apps; access governed by the clinical relationship and consent; emergency "break-glass" access; immutable audit; patient apps integrate via the <strong>SMART on FHIR</strong> standard (OAuth2 profile for EHRs).</p>
+    <p><strong>Identity model:</strong> Multiple populations. Clinicians = workforce identity (often federated from the hospital IdP, high assurance). Patients = B2C identity (patient portal). Apps = SMART on FHIR OAuth clients requesting fine-grained scopes like <code>patient/Observation.read</code> or <code>user/Patient.read</code>. Authorization is heavily <strong>ABAC/ReBAC</strong>: a doctor may read a chart only if they are on the patient's care team (relationship) <em>and</em> consent permits it (attribute), with break-glass as an audited override.</p>
+    <p><strong>Key flows:</strong> SMART app launch = OAuth code+PKCE with FHIR-specific scopes and launch context (which patient). Clinician SSO from hospital IdP. Break-glass = a special elevated grant that logs heavily and notifies privacy officers. Every access to PHI is recorded in an append-only audit log.</p>
+    <p><strong>Trade-offs:</strong> Consent + relationship checks per resource are expensive but legally required. Break-glass is necessary for patient safety yet is the biggest insider-threat surface → must be tightly audited. Granular FHIR scopes give patients control but complicate consent UX.</p>
+    <p><strong>Lessons:</strong> In healthcare, <em>audit and consent are first-class features</em>, not logging. Authorization is contextual (relationship + consent + purpose-of-use), so plan for ABAC/ReBAC plus a robust, tamper-evident audit trail from the start.</p>
+
+    <h3>5.10 Government — high assurance, identity proofing, FedRAMP</h3>
+    <p><strong>Requirements:</strong> NIST 800-63 IAL2/IAL3 identity proofing (prove the human is who they claim, often in person), AAL2/AAL3 authentication (PIV/CAC smartcards, FIDO2); FedRAMP-authorized infrastructure; no reliance on commercial social login for citizen-to-government high-assurance services; accessibility and equity mandates; long retention and auditability.</p>
+    <p><strong>Identity model:</strong> Workforce/agency users authenticate with <strong>PIV/CAC smartcards</strong> (certificate-based, phishing-resistant) federated via SAML/OIDC. Citizens use a government identity broker (e.g., a Login.gov-style service) that performs identity proofing once and federates to many agencies. Assurance levels are explicit and enforced per service.</p>
+    <p><strong>Key flows:</strong> Smartcard → mutual-TLS / certificate auth → SAML assertion to the agency app. Citizen → identity broker (proofing + MFA) → OIDC to the agency. Step-up to AAL3 for the most sensitive functions. Everything in a FedRAMP boundary (for Auth0, a government/GovCloud-style tenant or on-prem deployment).</p>
+    <p><strong>Trade-offs:</strong> Highest assurance maximizes security but also exclusion risk (not everyone has a smartcard or can complete proofing) → equity-driven fallbacks must be designed carefully. FedRAMP authorization is slow and expensive but non-negotiable.</p>
+    <p><strong>Lessons:</strong> Government identity is assurance-first. Choose authenticators by NIST AAL, prove identity to the required IAL, and run only inside an authorized compliance boundary. This is where Auth0's commercial multi-tenant cloud may not qualify and a dedicated/private deployment is required — knowing <em>when not to use</em> the standard cloud is senior-level judgment.</p>
+
+    <h3>5.11 Cinema booking — low-friction B2C with concurrency hazards</h3>
+    <p><strong>Requirements:</strong> casual, infrequent users; guest checkout (don't force account creation); fast seat selection with <em>seat-hold</em> concurrency (two users must not buy the same seat); loyalty accounts; payment; minimal personal data.</p>
+    <p><strong>Identity model:</strong> Lightweight B2C. <em>Passwordless</em> (email/SMS magic link or OTP) and social login dominate because password friction kills casual conversion. Guest checkout issues an ephemeral identity that can be "claimed" into a real account later. Loyalty is an entitlement/points attribute.</p>
+    <p><strong>Key flows:</strong> Passwordless or guest. The auth concern that bites teams is <em>not</em> login — it's the <strong>seat-hold</strong>: a short-lived, idempotent reservation token tied to the (authenticated or guest) session that locks seats for, say, 8 minutes, with the booking API enforcing idempotency so a double-submit or retry never double-charges or double-books.</p>
+    <p><strong>Trade-offs:</strong> Guest checkout maximizes conversion but you lose durable identity and history → offer post-purchase account claim. Passwordless removes password risk but depends on email/SMS deliverability.</p>
+    <p><strong>Lessons:</strong> For casual B2C, identity must get out of the way. The real engineering risk lives at the <em>seam between identity and business logic</em> (idempotent, time-boxed seat holds), which is where you spend your design budget — a reminder that "identity" includes how tokens/sessions interact with critical state, not just login.</p>
+
+    <h3>5.12 Side-by-side summary</h3>
+    <table>
+      <thead><tr><th>Company</th><th>Population</th><th>Primary grant(s)</th><th>AuthZ model</th><th>Signature control</th></tr></thead>
+      <tbody>
+        <tr><td>Netflix</td><td>B2C, devices</td><td>Device flow, code+PKCE</td><td>ABAC (profile maturity)</td><td>Refresh rotation + reuse detection</td></tr>
+        <tr><td>Amazon</td><td>B2C + B2E + M2M</td><td>code+PKCE, SAML→STS, client-creds</td><td>RBAC + scopes</td><td>Short-lived STS, plane separation</td></tr>
+        <tr><td>Uber</td><td>B2C multi-persona</td><td>Passwordless OTP, step-up</td><td>RBAC per persona</td><td>Risk-based adaptive auth</td></tr>
+        <tr><td>Airbnb</td><td>B2C marketplace</td><td>Social/passwordless</td><td>ReBAC (FGA)</td><td>Identity verification claim</td></tr>
+        <tr><td>Spotify</td><td>B2C + dev platform</td><td>code+PKCE, device flow</td><td>Scopes + entitlement</td><td>Incremental consent</td></tr>
+        <tr><td>GitHub</td><td>B2C + B2B</td><td>code+PKCE, device, App tokens</td><td>ReBAC</td><td>Fine-grained, short-lived tokens</td></tr>
+        <tr><td>Slack</td><td>B2B</td><td>SAML/OIDC SSO</td><td>RBAC in org</td><td>SCIM lifecycle</td></tr>
+        <tr><td>Bank</td><td>B2C high-assurance + TPP</td><td>code+PKCE+MFA, CIBA</td><td>RBAC + policy</td><td>SCA + dynamic linking</td></tr>
+        <tr><td>Healthcare</td><td>Clinician + patient + app</td><td>SMART on FHIR (code+PKCE)</td><td>ABAC/ReBAC + consent</td><td>Audit + break-glass</td></tr>
+        <tr><td>Government</td><td>Workforce + citizen</td><td>PIV/CAC SAML, broker OIDC</td><td>RBAC + clearance</td><td>IAL2/AAL3, FedRAMP</td></tr>
+        <tr><td>Cinema</td><td>Casual B2C + guest</td><td>Passwordless, guest</td><td>Minimal</td><td>Idempotent seat-hold</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- ============================================================= 6 -->
+  <section id="walkthrough">
+    <h2>6. Code Walkthrough — Representative Snippets per Case</h2>
+
+    <h3>6.1 Netflix-style device flow (Node.js, smart TV)</h3>
+    <pre><code class="language-javascript">// On the TV: 1) request a device code, 2) poll until the user approves on their phone.
+const TENANT = "https://netflix-demo.us.auth0.com";
+
+async function startDeviceLogin() {
+  const res = await fetch(`${TENANT}/oauth/device/code`, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      client_id: process.env.TV_CLIENT_ID,        // a PUBLIC client (no secret on a TV)
+      scope: "openid profile offline_access",      // offline_access => long-lived refresh token
+      audience: "https://api.netflix-demo.com"
+    })
+  });
+  const dc = await res.json();
+  // Render on screen: "Go to {verification_uri} and enter {user_code}"
+  console.log(`Visit ${dc.verification_uri} and enter ${dc.user_code}`);
+  return pollForToken(dc.device_code, dc.interval);
+}
+
+async function pollForToken(deviceCode, interval) {
+  while (true) {
+    await new Promise(r =&gt; setTimeout(r, interval * 1000));
+    const res = await fetch(`${TENANT}/oauth/token`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "urn:ietf:params:oauth:grant-type:device_code",
+        device_code: deviceCode,
+        client_id: process.env.TV_CLIENT_ID
+      })
+    });
+    const data = await res.json();
+    if (data.access_token) return data;          // success: store refresh_token securely
+    if (data.error === "authorization_pending") continue;
+    if (data.error === "slow_down") { interval += 5; continue; }
+    throw new Error(data.error);                  // expired_token / access_denied
+  }
+}</code></pre>
+    <p><strong>Why:</strong> the TV is a <em>public</em> client with no safe place for a secret, so we use the device flow and PKCE-equivalent device-code exchange. <code>offline_access</code> yields a refresh token so the user authenticates once, not every time the TV turns on.</p>
+
+    <h3>6.2 GitHub/Airbnb-style ReBAC check (Auth0 FGA, Node.js)</h3>
+    <pre><code class="language-javascript">import { OpenFgaClient } from "@openfga/sdk";
+const fga = new OpenFgaClient({
+  apiUrl: process.env.FGA_API_URL,
+  storeId: process.env.FGA_STORE_ID,
+  authorizationModelId: process.env.FGA_MODEL_ID
+});
+
+// Authorization model (DSL excerpt):
+//   type repo
+//     relations
+//       define owner: [user]
+//       define admin: [user, team#member] or owner
+//       define writer: [user, team#member] or admin
+//       define reader: [user, team#member] or writer
+// "writer" INHERITS from admin which inherits from owner.
+
+export async function canPush(userId, repoId) {
+  const { allowed } = await fga.check({
+    user: `user:${userId}`,
+    relation: "writer",
+    object: `repo:${repoId}`
+  });
+  return allowed; // true if user is writer/admin/owner directly OR via a team
+}
+
+// Express middleware
+export const requirePush = (getRepo) =&gt; async (req, res, next) =&gt; {
+  const ok = await canPush(req.auth.sub, getRepo(req));
+  return ok ? next() : res.status(403).json({ error: "insufficient_relationship" });
+};</code></pre>
+    <p><strong>Why:</strong> "can edit this repo/listing" is a relationship, not a global role. FGA answers it by traversing the graph (user → team → repo), and inheritance (<code>owner ⊇ admin ⊇ writer ⊇ reader</code>) means we write one check, not four.</p>
+
+    <h3>6.3 Bank-style step-up + CIBA trigger (Auth0 Action, post-login)</h3>
+    <pre><code class="language-javascript">/** Post-login Action: enforce MFA and risk-based step-up for money movement. */
+exports.onExecutePostLogin = async (event, api) =&gt; {
+  const highRisk =
+    event.request.geoip?.countryCode !== event.user.app_metadata?.home_country ||
+    event.authentication?.riskAssessment?.confidence === "low";
+
+  // Always require AAL2 for a banking app; force MFA if not already satisfied.
+  const usedMfa = (event.authentication?.methods || []).some(m =&gt; m.name === "mfa");
+  if (!usedMfa || highRisk) {
+    api.multifactor.enable("any", { allowRememberBrowser: false });
+  }
+
+  // Stamp the assurance level into the token so the API can gate transactions.
+  api.idToken.setCustomClaim("https://bank/aal", usedMfa ? "aal2" : "aal1");
+  api.accessToken.setCustomClaim("https://bank/aal", usedMfa ? "aal2" : "aal1");
+};</code></pre>
+    <pre><code class="language-bash"># CIBA: backend asks the bank to push an approval bound to the exact transaction.
+curl -s -X POST "https://bank-demo.us.auth0.com/bc-authorize" \
+  --data-urlencode "client_id=$CLIENT_ID" \
+  --data-urlencode "scope=openid payments" \
+  --data-urlencode "login_hint=sub:auth0|customer_42" \
+  --data-urlencode "binding_message=Pay EUR 420 to IBAN DE89..." \
+  --data-urlencode "audience=https://api.bank-demo.com"
+# -> { "auth_req_id": "1c2...", "expires_in": 120, "interval": 5 }
+# Then poll /oauth/token with grant_type=urn:openid:params:grant-type:ciba</code></pre>
+    <p><strong>Why:</strong> SCA demands MFA and that the approval be <em>bound</em> to the amount/payee — the <code>binding_message</code> the customer sees on their phone is the dynamic link. The Action stamps an assurance claim so the API can refuse a transfer unless <code>aal2</code> is present.</p>
+
+    <h3>6.4 Slack-style B2B org login (React SPA)</h3>
+    <pre><code class="language-jsx">import { Auth0Provider } from "@auth0/auth0-react";
+
+// Route the user to THEIR organization's connection (Okta/Entra SSO).
+function App({ orgId }) {
+  return (
+    &lt;Auth0Provider
+      domain="acme.us.auth0.com"
+      clientId={import.meta.env.VITE_CLIENT_ID}
+      authorizationParams={{
+        redirect_uri: window.location.origin,
+        organization: orgId,                 // e.g. "org_acmeCorp" -> Grid org
+        audience: "https://api.slack-demo.com",
+        scope: "openid profile email"
+      }}
+    &gt;
+      &lt;Workspace /&gt;
+    &lt;/Auth0Provider&gt;
+  );
+}</code></pre>
+    <p><strong>Why:</strong> passing <code>organization</code> tells Auth0 to authenticate the user against that org's enterprise connection (SAML/OIDC), enforcing the customer's SSO. SCIM (configured server-side) keeps the org's membership in sync automatically.</p>
+
+    <h3>6.5 Resource-server token validation (Java Spring Boot) — used by all of them</h3>
+    <pre><code class="language-java">// Every API above validates the JWT the same way: verify signature, issuer,
+// audience, expiry, then authorize on scopes/claims. This is the universal pattern.
+@Configuration
+@EnableWebSecurity
+public class ResourceServerConfig {
+
+  @Bean
+  SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+    http
+      .authorizeHttpRequests(auth -&gt; auth
+        .requestMatchers(HttpMethod.GET, "/catalog/**").permitAll()
+        .requestMatchers(HttpMethod.POST, "/payments/**")
+            .hasAuthority("SCOPE_payments")            // scope gate
+        .anyRequest().authenticated())
+      .oauth2ResourceServer(oauth2 -&gt; oauth2.jwt(jwt -&gt;
+        jwt.jwtAuthenticationConverter(converter())));
+    return http.build();
+  }
+
+  // issuer-uri auto-discovers JWKS; Spring validates iss, exp, signature.
+  // application.yml:
+  //   spring.security.oauth2.resourceserver.jwt.issuer-uri: https://bank-demo.us.auth0.com/
+  //   spring.security.oauth2.resourceserver.jwt.audiences: https://api.bank-demo.com
+
+  private JwtAuthenticationConverter converter() {
+    JwtGrantedAuthoritiesConverter scopes = new JwtGrantedAuthoritiesConverter();
+    scopes.setAuthorityPrefix("SCOPE_");
+    JwtAuthenticationConverter c = new JwtAuthenticationConverter();
+    c.setJwtGrantedAuthoritiesConverter(scopes);
+    return c;
+  }
+}</code></pre>
+    <p><strong>Why:</strong> no matter the company, the resource server's job is identical — <em>validate the token cryptographically and locally</em> (fetch JWKS once, cache it), then authorize on claims/scopes. Never call the auth server per request; that is what stateless JWTs buy you at scale.</p>
+  </section>
+
+  <!-- ============================================================= 7 -->
+  <section id="practical">
+    <h2>7. Practical Implementation — A Reusable Decision Worksheet</h2>
+    <p>Turn the framework into something you can fill in for any client. Here it is applied to a worked "Cinema booking" example (FastAPI + Next.js), the smallest case, so you see the full loop.</p>
+
+    <h4>Step 1 — Fill the worksheet</h4>
+    <pre class="diagram">
+   Population : casual consumers + guests        -> B2C, passwordless + guest
+   Trust      : we own identity (+ social)        -> Auth0 DB + Google/Apple
+   Sensitivity: payment, low PII                  -> AAL1 login, PCI via PSP
+   Clients    : web SPA, mobile web               -> Auth Code + PKCE
+   Scale      : spiky (blockbuster nights)        -> stateless JWT, cache JWKS
+   Regulation : PCI (delegated to Stripe), GDPR   -> minimize stored PII
+   AuthZ      : trivial (own your booking)         -> claim 'sub' ownership check
+   Threat     : double-book, double-charge        -> idempotent seat-hold token
+    </pre>
+
+    <h4>Step 2 — Guest-or-login, then an idempotent seat hold (FastAPI)</h4>
+    <pre><code class="language-python">from fastapi import FastAPI, Header, HTTPException, Depends
+from jose import jwt
+import time, httpx, uuid
+
+app = FastAPI()
+ISSUER = "https://cinema-demo.us.auth0.com/"
+AUDIENCE = "https://api.cinema-demo.com"
+_jwks = None
+
+async def jwks():
+    global _jwks
+    if _jwks is None:  # fetch once, cache (refresh on kid miss in production)
+        async with httpx.AsyncClient() as c:
+            _jwks = (await c.get(f"{ISSUER}.well-known/jwks.json")).json()
+    return _jwks
+
+async def current_subject(authorization: str | None = Header(default=None)):
+    # Guests are allowed: no token => ephemeral guest id.
+    if not authorization:
+        return f"guest:{uuid.uuid4()}"
+    token = authorization.removeprefix("Bearer ").strip()
+    claims = jwt.decode(token, await jwks(), algorithms=["RS256"],
+                        audience=AUDIENCE, issuer=ISSUER)
+    return claims["sub"]
+
+HOLDS: dict[str, dict] = {}   # seat -> {sub, expires, idem}
+
+@app.post("/holds")
+async def hold_seats(seats: list[str], idempotency_key: str = Header(...),
+                     sub: str = Depends(current_subject)):
+    now = time.time()
+    # Idempotency: same key + same caller => return the SAME hold, never double-book.
+    for s in seats:
+        h = HOLDS.get(s)
+        if h and h["expires"] > now and h["idem"] != idempotency_key:
+            raise HTTPException(409, f"seat {s} is held")
+    expires = now + 8 * 60
+    for s in seats:
+        HOLDS[s] = {"sub": sub, "expires": expires, "idem": idempotency_key}
+    return {"held": seats, "expires_at": expires, "owner": sub}</code></pre>
+
+    <h4>Step 3 — Next.js login button (App Router)</h4>
+    <pre><code class="language-jsx">// app/components/LoginCta.tsx  (uses @auth0/nextjs-auth0 v4)
+import Link from "next/link";
+
+export default function LoginCta() {
+  return (
+    &lt;div&gt;
+      {/* Login is OPTIONAL: guests can book. Passwordless connection keeps it 1-tap. */}
+      &lt;Link href="/auth/login?connection=email"&gt;Continue with email link&lt;/Link&gt;
+      &lt;Link href="/auth/login?connection=google-oauth2"&gt;Continue with Google&lt;/Link&gt;
+      &lt;Link href="/checkout?guest=1"&gt;Continue as guest&lt;/Link&gt;
+    &lt;/div&gt;
+  );
+}</code></pre>
+    <div class="callout tip"><span class="tag">Tip</span><p>The worksheet is the deliverable. In a real design review you present the filled worksheet first and the code second — it proves your protocol choices are <em>derived</em>, not guessed.</p></div>
+  </section>
+
+  <!-- ============================================================= 8 -->
+  <section id="production">
+    <h2>8. Production Architecture — Patterns That Recur Across All Eleven</h2>
+
+    <h3>8.1 The canonical production topology</h3>
+    <pre class="diagram">
+                    ┌──────────────────────────────────────────┐
+   Clients ───────▶ │  CDN / API Gateway (edge JWT validation)  │
+  (web, mobile,     └───────────────┬──────────────────────────┘
+   TV, server)                      │ validated, scoped token
+            ▲                       ▼
+            │              ┌──────────────────┐   check (ReBAC)   ┌─────────┐
+   login    │              │  Microservices   │ ───────────────▶ │  FGA /  │
+   ┌────────┴───────┐      │  (resource srvs) │ ◀─────────────── │  OPA    │
+   │  Auth0 tenant  │ ◀──── validate JWKS ────┘                   └─────────┘
+   │  (AS / IdP)    │
+   │  Actions, MFA, │ ──webhooks/log streaming──▶  SIEM / audit lake
+   │  Organizations │ ──SCIM◀── corporate IdPs (Okta/Entra) [B2B/B2E cases]
+   └────────────────┘
+    </pre>
+    <ul>
+      <li><strong>Edge validation:</strong> validate JWT signature/exp/aud at the gateway/CDN (Netflix, Spotify scale) so invalid traffic never reaches services.</li>
+      <li><strong>Externalized fine-grained authz:</strong> FGA/OPA for ReBAC/PBAC (GitHub, Airbnb, Healthcare) — keep authz <em>out</em> of business code.</li>
+      <li><strong>Federation + SCIM:</strong> for B2B/B2E (Slack, Amazon workforce, Government) connect customer/corporate IdPs and auto-provision.</li>
+      <li><strong>Log streaming to a SIEM:</strong> every case needs it; banking/healthcare/government legally require immutable audit.</li>
+      <li><strong>Multi-region / data residency:</strong> EU/US tenants for GDPR; GovCloud/private deploy for FedRAMP.</li>
+    </ul>
+
+    <h3>8.2 Token strategy by case</h3>
+    <table>
+      <thead><tr><th>Concern</th><th>Low-assurance B2C (Netflix, Cinema)</th><th>High-assurance (Bank, Gov, Health)</th></tr></thead>
+      <tbody>
+        <tr><td>Access token TTL</td><td>10–60 min</td><td>2–5 min (short)</td></tr>
+        <tr><td>Refresh token</td><td>Long-lived + rotation + reuse detection</td><td>Short, rotation, often per-action re-auth</td></tr>
+        <tr><td>MFA</td><td>Optional / risk-based</td><td>Mandatory AAL2/AAL3, phishing-resistant</td></tr>
+        <tr><td>Sender constraint</td><td>Usually none</td><td>mTLS / DPoP-bound tokens</td></tr>
+        <tr><td>Audit retention</td><td>Operational</td><td>Years, tamper-evident</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- ============================================================= 9 -->
+  <section id="security">
+    <h2>9. Security Analysis — Threat Models per Case</h2>
+    <table>
+      <thead><tr><th>Case</th><th>Top threat</th><th>Primary mitigation</th></tr></thead>
+      <tbody>
+        <tr><td>Netflix</td><td>Stolen long-lived refresh token; credential sharing/stuffing</td><td>Refresh rotation + reuse detection; bot/credential-stuffing protection; device binding</td></tr>
+        <tr><td>Amazon</td><td>Account takeover (blast radius across services); leaked static cloud keys</td><td>Risk-based step-up before payment; short-lived STS; plane isolation</td></tr>
+        <tr><td>Uber</td><td>SIM-swap on phone-based login; payout-account fraud</td><td>Adaptive auth; step-up + cooldown on bank-account change</td></tr>
+        <tr><td>Airbnb</td><td>Over-broad co-host access; fake identities</td><td>Least-privilege ReBAC tuples; identity verification gate</td></tr>
+        <tr><td>Spotify</td><td>Over-permissioned third-party apps</td><td>Least-privilege scopes; revocable consent; incremental consent</td></tr>
+        <tr><td>GitHub</td><td>Leaked long-lived PAT; OAuth-app over-scope; supply-chain via App tokens</td><td>Fine-grained, expiring PATs; secret scanning; short-lived installation tokens; SSO enforcement</td></tr>
+        <tr><td>Slack</td><td>Orphaned accounts after offboarding; cross-org leakage</td><td>SCIM deprovisioning; strict org isolation</td></tr>
+        <tr><td>Bank</td><td>Phishing, transaction tampering, consent fraud</td><td>Phishing-resistant MFA; CIBA dynamic linking; mTLS-bound tokens; non-repudiation logs</td></tr>
+        <tr><td>Healthcare</td><td>Insider snooping; break-glass abuse; PHI leakage</td><td>ABAC on care-relationship; heavy break-glass audit + alerts; minimum-necessary scopes</td></tr>
+        <tr><td>Government</td><td>Credential phishing; identity fraud at proofing</td><td>PIV/CAC (phishing-resistant); IAL2 proofing; FedRAMP boundary</td></tr>
+        <tr><td>Cinema</td><td>Double-charge/double-book on retry; payment fraud</td><td>Idempotency keys; time-boxed seat holds; delegate PCI to PSP</td></tr>
+      </tbody>
+    </table>
+    <div class="callout danger"><span class="tag">Danger</span><p>The recurring lethal mistake across <em>all</em> these systems is <strong>trusting a token's claims without re-validating sensitive ones server-side</strong>. A profile maturity rating, a premium entitlement, an <code>aal</code> level, or an FGA result must be enforced by the resource server — never by the client. Client-side enforcement is UX, not security.</p></div>
+  </section>
+
+  <!-- ============================================================= 10 -->
+  <section id="performance">
+    <h2>10. Performance Considerations</h2>
+    <ul>
+      <li><strong>Validate JWTs locally, cache JWKS.</strong> At Netflix/Spotify scale you cannot call the auth server per request. Fetch the signing keys once, cache by <code>kid</code>, refresh on miss. This is the single biggest scaling lever.</li>
+      <li><strong>Keep tokens small.</strong> Every byte of a JWT travels on every request. Put coarse claims (roles, entitlement, <code>aal</code>) in the token; fetch fine-grained data on demand. Bloated tokens hit header-size limits and slow every call.</li>
+      <li><strong>Cache ReBAC checks.</strong> GitHub/Airbnb authorization is a graph query. Cache <code>check</code> results with short TTLs and invalidate on tuple writes; batch checks (<code>batch-check</code>) when rendering a list of objects.</li>
+      <li><strong>Edge-terminate auth.</strong> Validate at the CDN/gateway so 401s never consume backend capacity — critical for spiky loads (cinema blockbuster nights, ticket on-sales).</li>
+      <li><strong>Right-size token TTLs.</strong> Too short = constant refresh storms; too long = stale entitlements and bigger theft window. Banks accept refresh chatter for security; consumer apps lengthen TTLs for fewer round-trips.</li>
+      <li><strong>CIBA/device flow polling:</strong> respect <code>interval</code> and back off on <code>slow_down</code> to avoid hammering the token endpoint at scale.</li>
+    </ul>
+    <div class="callout note"><span class="tag">Note</span><p>There is an eternal tension between <em>freshness</em> (short TTL, per-request authz check) and <em>throughput</em> (long TTL, cached claims). Senior architects state the trade-off explicitly per system: a bank chooses freshness, Netflix chooses throughput.</p></div>
+  </section>
+
+  <!-- ============================================================= 11 -->
+  <section id="mistakes">
+    <h2>11. Common Mistakes</h2>
+    <ul>
+      <li><strong>Using roles where you need relationships.</strong> Trying to model "co-host of listing 7" as a global role (Airbnb/GitHub) leads to a role explosion. Use ReBAC.</li>
+      <li><strong>One token type for everything.</strong> Forcing humans, CLIs, TVs, and bots through the same credential (GitHub lesson) creates either insecure long-lived tokens or terrible UX. Match the grant to the client.</li>
+      <li><strong>Mixing workforce and consumer identity in one trust domain</strong> (Amazon lesson) — an account-takeover in one plane should never reach the other.</li>
+      <li><strong>Treating authentication strength as a session property, not an action property</strong> (Uber/bank lesson). Step up <em>per sensitive action</em>.</li>
+      <li><strong>Skipping deprovisioning</strong> (Slack lesson). Logins get attention; <em>off</em>-boarding via SCIM is forgotten and leaves orphaned access.</li>
+      <li><strong>Putting fine-grained authz in business code.</strong> Scatter <code>if (user.role === ...)</code> everywhere and you can never audit or change policy. Externalize to FGA/OPA.</li>
+      <li><strong>Trusting client-asserted claims</strong> (profile maturity, premium, <code>aal</code>) without server re-validation.</li>
+      <li><strong>Forgetting idempotency at the identity/business seam</strong> (cinema lesson) — double-submits double-book.</li>
+      <li><strong>Assuming the commercial multi-tenant cloud is always allowed</strong> (government lesson) — sometimes FedRAMP/data-residency forces a private/GovCloud deployment.</li>
+      <li><strong>No audit/log streaming</strong> until an incident or auditor demands it — too late for banking/healthcare.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================= 12 -->
+  <section id="bestpractices">
+    <h2>12. Best Practices</h2>
+    <ul>
+      <li><strong>Derive the protocol from the worksheet.</strong> Population × trust × sensitivity × client × scale × regulation × authz × threat → grant type. Always.</li>
+      <li><strong>Separate identity planes</strong> (consumer / workforce / machine) into distinct tenants or clearly isolated configurations.</li>
+      <li><strong>Least privilege everywhere:</strong> minimal scopes, fine-grained expiring tokens, narrow ReBAC tuples.</li>
+      <li><strong>Short-lived machine credentials</strong> with rotation; never static long-lived secrets in services.</li>
+      <li><strong>Externalize authorization</strong> to a policy/relationship engine (FGA/OPA) so policy is auditable and changeable without redeploys.</li>
+      <li><strong>Tie assurance to action.</strong> Step-up MFA before money, PHI, payout changes, admin actions.</li>
+      <li><strong>Automate lifecycle</strong> with SCIM for B2B/B2E; deprovisioning is as important as provisioning.</li>
+      <li><strong>Stream all auth events to a SIEM/audit lake</strong>; make high-stakes systems tamper-evident.</li>
+      <li><strong>Plan data residency and compliance boundaries</strong> before launch, not after the deal.</li>
+      <li><strong>Bind tokens</strong> (mTLS/DPoP) and bind transactions (CIBA dynamic linking) in high-assurance contexts.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================= 13 -->
+  <section id="interview">
+    <h2>13. Interview Questions (with Model Answers)</h2>
+
+    <h3>Q1. "Design login for a smart-TV streaming app."</h3>
+    <p><strong>Model answer:</strong> The TV is an input-constrained <em>public</em> client, so use the <strong>OAuth 2.0 Device Authorization Flow (RFC 8628)</strong>: the TV requests a device code, displays a short user code + verification URL, the user authenticates on a phone/laptop, and the TV polls the token endpoint until approval, respecting <code>interval</code>/<code>slow_down</code>. Request <code>offline_access</code> for a refresh token so the user logs in once; pair long-lived refresh tokens with <strong>rotation + reuse detection</strong> for security. Profiles are sub-identities carried as a claim, enforced server-side for parental controls.</p>
+
+    <h3>Q2. "How do you model 'a host can let a co-host manage one specific listing'?"</h3>
+    <p><strong>Model answer:</strong> This is relationship-based, not role-based — a global "co-host" role can't express "for listing 7 only." Use <strong>ReBAC (Auth0 FGA / Zanzibar)</strong>: write a tuple <code>listing:7#manager@user:bob</code> and define relations with inheritance (owner ⊇ manager ⊇ viewer). Authorization becomes a <code>check(user, relation, object)</code> graph traversal, cached with short TTLs and invalidated on tuple writes.</p>
+
+    <h3>Q3. "Why CIBA for bank payments instead of redirect-based auth?"</h3>
+    <p><strong>Model answer:</strong> CIBA <em>decouples</em> the consumption device from the authentication device — useful for call-center/agent/POS channels and for pushing approval to the customer's trusted phone. Crucially, PSD2 <strong>dynamic linking</strong> requires the authentication be bound to the specific amount and payee; CIBA's <code>binding_message</code> shows "Pay €420 to IBAN X" on the phone, providing that cryptographic binding and non-repudiation. Redirect flows don't naturally bind to the transaction or support the backchannel/agent case.</p>
+
+    <h3>Q4. "Consumer vs workforce identity — should they share a tenant?"</h3>
+    <p><strong>Model answer:</strong> No. They have different trust models, lifecycles, assurance levels, and threat profiles. Keep separate planes/tenants so an account-takeover in the consumer plane cannot reach internal/cloud tooling, and so workforce can enforce phishing-resistant MFA and SCIM lifecycle without imposing that on consumers. This is exactly the Amazon three-plane pattern.</p>
+
+    <h3>Q5. "How does enterprise SSO work for a B2B SaaS, end to end?"</h3>
+    <p><strong>Model answer:</strong> Model each customer as an <strong>Organization</strong> with its own enterprise connection (SAML or OIDC) to the customer's IdP (Okta/Entra). At login you pass the <code>organization</code> so Auth0 routes to that connection. <strong>SCIM</strong> from the customer's IdP provisions/deprovisions members automatically. Tokens carry org context; the resource server isolates data per org. This is the Slack Enterprise Grid pattern.</p>
+
+    <h3>Q6. "Where would you NOT use Auth0's standard cloud?"</h3>
+    <p><strong>Model answer:</strong> High-assurance government workloads requiring FedRAMP authorization, PIV/CAC smartcard auth, IAL2 in-person proofing, or strict data residency may exceed the commercial multi-tenant offering, calling for a private/GovCloud deployment or a specialized identity broker. Knowing the boundary of the tool is part of the design.</p>
+  </section>
+
+  <!-- ============================================================= 14 -->
+  <section id="certification">
+    <h2>14. Certification Tips</h2>
+    <ul>
+      <li><strong>Match grant to client</strong> is heavily tested: Device flow → input-constrained devices; Auth Code + PKCE → SPAs and native; Client Credentials → M2M; CIBA → decoupled/backchannel; Implicit is deprecated (don't pick it).</li>
+      <li><strong>Organizations</strong> are the B2B answer; <strong>Connections</strong> (enterprise/SAML/OIDC, database, social) are how identities authenticate; <strong>SCIM</strong> is lifecycle. Know which solves which.</li>
+      <li><strong>Actions vs Rules/Hooks:</strong> Actions are the current extensibility model (post-login, M2M, etc.); know the triggers and that secrets/tokens live in the Action context.</li>
+      <li><strong>Refresh token rotation + reuse detection</strong> is the expected answer for long-lived public-client sessions.</li>
+      <li><strong>RBAC vs ABAC vs ReBAC/FGA:</strong> roles for "kind of user," attributes for context, relationships for "X relative to a specific object."</li>
+      <li><strong>Token validation:</strong> validate signature (JWKS), <code>iss</code>, <code>aud</code>, <code>exp</code> locally; never introspect per request unless using opaque tokens.</li>
+      <li><strong>Log streaming / tenant settings / custom domains</strong> appear in operational questions — link them to audit/compliance cases.</li>
+    </ul>
+    <div class="callout tip"><span class="tag">Tip</span><p>If an exam scenario mentions a <em>device with no keyboard</em>, the answer is almost always the Device Authorization Flow. If it mentions <em>backchannel</em>, <em>decoupled</em>, or <em>amount-bound approval</em>, it's CIBA. Pattern-match the keyword to the grant.</p></div>
+  </section>
+
+  <!-- ============================================================= 15 -->
+  <section id="handson">
+    <h2>15. Hands-On Exercises</h2>
+    <ol>
+      <li><strong>Device flow:</strong> In a free Auth0 tenant, create a native (public) client, enable the Device Code grant, and run the Node snippet from §6.1. Observe the <code>verification_uri</code>, approve on another tab, and capture the tokens. Decode the access token at jwt.io and identify <code>aud</code>, <code>scope</code>, <code>exp</code>.</li>
+      <li><strong>ReBAC:</strong> Spin up Auth0 FGA (or OpenFGA locally). Author the repo model from §6.2, write tuples for a user, a team, and a repo, and run <code>check</code> for direct, inherited, and denied cases.</li>
+      <li><strong>Step-up Action:</strong> Add the post-login Action from §6.3. Log in normally, then with a VPN to a different country, and confirm MFA is forced for the "high risk" path. Inspect the <code>aal</code> claim in the token.</li>
+      <li><strong>B2B org:</strong> Create an Organization, add an enterprise (OIDC/SAML, you can mock with another Auth0 tenant), and log in passing <code>organization</code> from the React snippet in §6.4.</li>
+      <li><strong>Idempotent seat-hold:</strong> Run the FastAPI service from §7. Fire two concurrent <code>POST /holds</code> with the <em>same</em> idempotency key (expect one hold) and with <em>different</em> keys for the same seat (expect a 409).</li>
+    </ol>
+  </section>
+
+  <!-- ============================================================= 16 -->
+  <section id="assignment">
+    <h2>16. Assignment</h2>
+    <p>Pick <strong>two</strong> companies from this chapter that are <em>not</em> the cinema example — one low-assurance B2C (Netflix or Spotify) and one high-assurance or B2B (Bank, Healthcare, Government, Slack, or GitHub). For each, produce:</p>
+    <ol>
+      <li>A completed <strong>8-question worksheet</strong> from §1.</li>
+      <li>An <strong>ASCII architecture diagram</strong> showing client → Auth0 → resource server, plus any federation/FGA/SCIM/CIBA components.</li>
+      <li>A <strong>token strategy table</strong> (TTLs, MFA policy, sender constraint, audit retention) justified by the threat model.</li>
+      <li>A one-page <strong>threat model</strong>: top three threats and the specific control mitigating each.</li>
+      <li>A short <strong>"when this design breaks"</strong> note: at what scale, regulation change, or new client type would you revisit it?</li>
+    </ol>
+    <p>Deliverable: a single document that a hiring panel could read in five minutes and conclude "this person reasons like an architect."</p>
+  </section>
+
+  <!-- ============================================================= 17 -->
+  <section id="miniproject">
+    <h2>17. Mini Project — "Marketplace-in-a-Box"</h2>
+    <p>Build a tiny two-sided marketplace (think mini-Airbnb) that exercises the hardest patterns from this chapter end to end.</p>
+    <h4>Requirements</h4>
+    <ul>
+      <li><strong>Auth:</strong> social + passwordless login via Auth0 (React or Next.js front end).</li>
+      <li><strong>Resources:</strong> <code>listing</code> objects owned by a host; a host can grant <code>co-host</code> on a <em>specific</em> listing.</li>
+      <li><strong>Authorization:</strong> Auth0 FGA model with relations <code>owner</code>, <code>cohost</code>, <code>viewer</code> and inheritance; API endpoints gated by <code>check</code>.</li>
+      <li><strong>Step-up:</strong> require fresh MFA before "change payout account" (post-login Action stamps <code>aal</code>; API rejects without <code>aal2</code>).</li>
+      <li><strong>Backend:</strong> Spring Boot or FastAPI resource server validating JWTs via JWKS and enforcing scopes + FGA.</li>
+      <li><strong>Audit:</strong> stream Auth0 logs (or log every authz decision) to a file/console "audit lake."</li>
+    </ul>
+    <h4>Acceptance tests</h4>
+    <ol>
+      <li>A co-host can edit the listing they were granted but gets <code>403</code> on a listing they weren't.</li>
+      <li>Changing payout without recent MFA returns <code>403 step_up_required</code>; after step-up it succeeds.</li>
+      <li>Revoking the co-host tuple immediately denies access (cache invalidation works).</li>
+      <li>Every allow/deny appears in the audit log with subject, object, relation, and decision.</li>
+    </ol>
+    <p>Ship it with a README that includes your filled worksheet and architecture diagram. This single project demonstrates ReBAC, step-up, JWT validation, scopes, and audit — the exact muscles senior interviews probe.</p>
+  </section>
+
+  <!-- ============================================================= 18 -->
+  <section id="quiz">
+    <h2>18. Quiz — 24 Questions</h2>
+    <ol>
+      <li>Which OAuth grant suits a smart TV with no keyboard, and why?</li>
+      <li>What two controls make long-lived refresh tokens safe for a TV/native client?</li>
+      <li>Why are Netflix "profiles" modeled as claims/sub-identities rather than separate logins?</li>
+      <li>Name Amazon's three identity planes and one reason to keep them separate.</li>
+      <li>Why are short-lived STS-style credentials preferred for cloud/service access?</li>
+      <li>What attack does phone-number-as-identity expose Uber to, and how is it mitigated?</li>
+      <li>Why must "change payout account" trigger step-up regardless of how the user logged in?</li>
+      <li>Why is RBAC the wrong model for Airbnb co-hosts, and what replaces it?</li>
+      <li>In a ReBAC model, what does relation inheritance (owner ⊇ admin ⊇ writer) buy you?</li>
+      <li>How do scopes function as a "product surface" for Spotify's developer ecosystem?</li>
+      <li>List three of GitHub's token types and the client each serves.</li>
+      <li>What does SSO enforcement add for a GitHub enterprise, and what can it break?</li>
+      <li>Map Slack's Grid, workspaces, and members onto Auth0 Organizations concepts.</li>
+      <li>Which two mechanisms make B2B enterprise integration "table stakes"?</li>
+      <li>What is PSD2 "dynamic linking" and which flow provides it?</li>
+      <li>Why use CIBA instead of a redirect flow for a call-center payment approval?</li>
+      <li>What is a "break-glass" access in healthcare and what control must accompany it?</li>
+      <li>Why is authorization in healthcare typically ABAC/ReBAC rather than pure RBAC?</li>
+      <li>Which NIST levels describe authentication strength vs. identity proofing strength?</li>
+      <li>Give one reason a government workload might not use Auth0's commercial cloud.</li>
+      <li>What is the real engineering risk in cinema booking, and how is it solved?</li>
+      <li>Why must a resource server re-validate sensitive claims instead of trusting the client?</li>
+      <li>Why validate JWTs locally (cached JWKS) rather than introspect per request?</li>
+      <li>State the freshness-vs-throughput trade-off and how a bank vs Netflix resolves it.</li>
+    </ol>
+
+    <details>
+      <summary>Show answer key</summary>
+      <ol>
+        <li><strong>Device Authorization Flow (RFC 8628)</strong> — the TV is input-constrained and a public client; the user authenticates on a second device while the TV polls for the token.</li>
+        <li><strong>Refresh-token rotation</strong> (a new refresh token each use) and <strong>reuse detection</strong> (revoke the family if an old token is replayed); optionally device binding.</li>
+        <li>To keep login frictionless (one account login, many profiles) and because profiles are an <strong>authorization/personalization</strong> concept (maturity rating, recommendations), not separate credentials.</li>
+        <li><strong>Consumer, workforce, and machine/service.</strong> Separation limits blast radius — an ATO in one plane can't reach the others — and lets each enforce its own assurance and lifecycle.</li>
+        <li>They bound the damage of a leaked credential to minutes and enforce least privilege per assumed role, versus long-lived static keys (a top cloud-breach vector).</li>
+        <li><strong>SIM-swap</strong> account takeover; mitigated with device binding, risk-based/adaptive auth, and stronger step-up (not just SMS) for money movement.</li>
+        <li>Because <strong>assurance should track the action, not the session</strong> — a low-stakes login should not implicitly authorize high-value money movement.</li>
+        <li>Co-host is "relative to a specific listing," which a global role can't express; <strong>ReBAC (Auth0 FGA / Zanzibar)</strong> replaces it with relationship tuples + graph checks.</li>
+        <li>You write one check (e.g., "writer") and an admin/owner automatically passes, avoiding duplicated checks and keeping policy DRY and consistent.</li>
+        <li>Each capability (read playlists, modify, stream) is a named, least-privilege, revocable scope third-party apps request via consent — the scope catalog <em>is</em> the API surface.</li>
+        <li>Examples: classic/fine-grained <strong>PATs</strong> (CLI/scripts), <strong>OAuth-app tokens</strong> (user-delegated third-party apps), <strong>GitHub App installation tokens</strong> (short-lived automation/bots). Browser sessions for humans.</li>
+        <li>Adds enforced corporate SSO (and SSO-authorized PATs/keys) for security/compliance; can break <strong>automation</strong> whose tokens aren't SSO-authorized.</li>
+        <li>Grid → <strong>Organization</strong>; workspaces → sub-groupings within the org; members → org members provisioned via <strong>SCIM</strong> and authenticated via the org's <strong>enterprise connection</strong>.</li>
+        <li><strong>Enterprise SSO (SAML/OIDC) + SCIM</strong> provisioning/deprovisioning (often plus Organizations for tenant isolation).</li>
+        <li>The requirement that authentication be cryptographically <strong>bound to the specific amount and payee</strong>; provided by <strong>CIBA</strong>'s <code>binding_message</code> approval.</li>
+        <li>CIBA <strong>decouples</strong> consumption and authentication devices (push approval to the customer's phone) and supports backchannel/agent channels with transaction binding; a redirect can't do that cleanly.</li>
+        <li>An audited <strong>emergency override</strong> for access not normally permitted; it must be accompanied by heavy, tamper-evident <strong>audit logging and alerts</strong> (it's a top insider-threat surface).</li>
+        <li>Because access depends on <strong>context</strong> (care relationship, consent, purpose-of-use) and per-object relationships, which roles alone can't capture.</li>
+        <li><strong>AAL</strong> (Authenticator Assurance Level) = authentication strength; <strong>IAL</strong> (Identity Assurance Level) = identity-proofing strength (NIST 800-63).</li>
+        <li><strong>FedRAMP</strong> authorization, PIV/CAC smartcard auth, IAL2 in-person proofing, or data-residency rules may require a private/GovCloud deployment.</li>
+        <li>The <strong>seat-hold concurrency / double-charge</strong> problem at the identity↔business seam; solved with <strong>idempotency keys</strong> and time-boxed, owner-scoped seat holds.</li>
+        <li>Because client-side enforcement is only UX; a client can forge/replay claims, so security-relevant decisions (maturity, entitlement, <code>aal</code>, authz) must be enforced server-side.</li>
+        <li>Local validation (verify signature via cached JWKS, plus <code>iss</code>/<code>aud</code>/<code>exp</code>) is <strong>stateless and fast</strong>; per-request introspection adds a network call and a bottleneck at scale.</li>
+        <li><strong>Freshness</strong> (short TTL/per-request checks, stale data minimized) vs <strong>throughput</strong> (long TTL/cached claims, fewer round-trips). A bank picks freshness (security); Netflix picks throughput (scale/UX).</li>
+      </ol>
+      <p class="lead">Score 20+/24 and you can confidently reason about enterprise identity in an interview.</p>
+    </details>
+  </section>
+
+  <!-- ============================================================= 19 -->
+  <section id="cheatsheet">
+    <h2>19. Cheat Sheet</h2>
+    <pre class="diagram">
+  GRANT  →  CLIENT
+  ─────────────────────────────────────────────
+  Auth Code + PKCE  →  SPA, native, web (default)
+  Device Flow       →  TV, console, IoT, no-keyboard
+  Client Creds      →  server-to-server (M2M)
+  CIBA              →  backchannel / decoupled / amount-bound approval
+  (Implicit         →  DEPRECATED — never choose)
+
+  AUTHZ MODEL  →  USE WHEN
+  ─────────────────────────────────────────────
+  RBAC   →  "what KIND of user" (admin/member)
+  ABAC   →  decision depends on attributes/context (time, geo, maturity)
+  ReBAC  →  "X relative to a SPECIFIC object" (FGA/Zanzibar)
+  PBAC   →  externalized governed policy (OPA/Cedar)
+
+  B2B/B2E TRIO  →  Organizations + SAML/OIDC SSO + SCIM
+  HIGH ASSURANCE →  MFA(AAL2/3) + mTLS/DPoP-bound tokens + audit + dynamic linking
+  LONG SESSIONS  →  refresh rotation + reuse detection
+  SCALE          →  validate JWT at edge, cache JWKS, small tokens
+  STEP-UP        →  per ACTION (money/PHI/admin), not per session
+
+  KEYWORD → ANSWER (exam shortcut)
+  ─────────────────────────────────────────────
+  "no keyboard"           → Device Flow
+  "decoupled / backchannel / amount-bound" → CIBA
+  "specific object / co-host / per-repo"    → ReBAC (FGA)
+  "enterprise / workspace / many tenants"   → Organizations + SSO + SCIM
+  "FedRAMP / PIV / in-person proofing"      → high assurance, private deploy
+  "double-book / retry"                     → idempotency keys
+    </pre>
+  </section>
+
+  <!-- ============================================================= 20 -->
+  <section id="takeaways">
+    <h2>20. Key Takeaways</h2>
+    <ul>
+      <li><strong>Framework over facts.</strong> Population × trust boundary × sensitivity × client × scale × regulation × authz model × threat → the protocol. Memorize the questions, not "company X uses Y."</li>
+      <li><strong>Match the grant to the client:</strong> PKCE for apps, device flow for TVs, client-credentials for servers, CIBA for backchannel/amount-bound approvals.</li>
+      <li><strong>Pick the right authz model:</strong> RBAC for "kind of user," ABAC for context, ReBAC for "relative to a specific object," PBAC for governed policy.</li>
+      <li><strong>Separate identity planes</strong> (consumer/workforce/machine) and isolate B2B tenants with Organizations.</li>
+      <li><strong>Tie assurance to the action,</strong> not the session; step up before money, PHI, and admin operations.</li>
+      <li><strong>Least privilege + short-lived credentials</strong> everywhere; long-lived static secrets are the enemy.</li>
+      <li><strong>Validate tokens locally and never trust client-asserted security claims;</strong> enforce on the resource server.</li>
+      <li><strong>Lifecycle and audit are features:</strong> SCIM deprovisioning and tamper-evident logs matter as much as login.</li>
+      <li><strong>Know the tool's limits:</strong> sometimes (FedRAMP/PIV/residency) the standard cloud isn't allowed — that judgment is what makes you senior.</li>
+    </ul>
+    <div class="callout key"><span class="tag">Key</span><p>You now have a portable mental engine: hand it any company, and it outputs a defensible identity architecture, the right protocols, the trade-offs, and the threats. That is exactly what certification, senior interviews, and real production launches demand. You've reached the end of the course — go build it.</p></div>
+  </section>
+
+  <nav class="pager">
+    <a class="prev" href="chapter-31.html">← Previous</a>
+    <a class="next" href="index.html">Next →</a>
+  </nav>
+</main>
+<footer class="site-footer">Master Auth0 End-to-End · Chapter 32 of 32</footer>
+</body>
+</html>

@@ -1,0 +1,717 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 14 — Hands-On Auth0: Actions, Custom Claims, M2M and Management API | Master Auth0</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">🔐 Master Auth0</a>
+  <nav class="topnav">
+    <a href="chapter-13.html">← Prev</a>
+    <a href="index.html">Contents</a>
+    <a href="chapter-15.html">Next →</a>
+  </nav>
+</header>
+<main class="container">
+  <div class="chapter-head">
+    <span class="phase">Phase 6 · Hands-On Auth0</span>
+    <h1>Chapter 14 — Hands-On Auth0: Actions, Custom Claims, M2M and Management API</h1>
+    <p class="lead">Up to now you have learned the <em>theory</em> of OAuth, OIDC, JWTs and the Auth0 platform. This chapter is where you finally <strong>make Auth0 do work for you</strong>. You will write a real post-login Action that injects a user's roles and permissions into their ID and access tokens as namespaced custom claims; test it and decode the resulting token; stand up a machine-to-machine (M2M) application; obtain a Management API token via the client-credentials grant; and then drive the Management API from curl, Postman and code to create users and assign roles. Along the way you will learn the crucial difference between <code>user_metadata</code> and <code>app_metadata</code>, how to bulk import and export users, and how to safely promote configuration from a development tenant to production. By the end you will be able to automate identity the way real backend engineers do.</p>
+  </div>
+
+  <!-- ===================== 1. THEORY ===================== -->
+  <section id="theory">
+    <h2>1. Theory — First Principles</h2>
+    <p>Auth0 is, at its core, an <strong>identity pipeline</strong>. A user (or a machine) presents credentials, Auth0 authenticates them, and then it emits <strong>tokens</strong> — signed JSON Web Tokens that your applications and APIs trust. Everything in this chapter is about <em>shaping</em> that pipeline and <em>programming</em> Auth0 from the outside.</p>
+
+    <p>There are exactly two ways to influence Auth0 at runtime, and you must understand the distinction from first principles:</p>
+    <ul>
+      <li><strong>Inbound extensibility — Actions.</strong> Code that Auth0 runs <em>inside its own pipeline</em>, at well-defined moments (a "trigger") such as right after a user logs in. Actions cannot reach out and change Auth0's configuration; they can only enrich the request flowing through them — most importantly, by adding claims to the tokens about to be minted.</li>
+      <li><strong>Outbound extensibility — the Management API.</strong> A REST API <em>you call</em> to read and mutate the tenant's configuration: users, roles, connections, clients, rules, email templates. This is how you create users, assign roles, rotate secrets, and export data programmatically.</li>
+    </ul>
+
+    <p><strong>Why custom claims must be namespaced.</strong> The OpenID Connect specification reserves a set of standard claim names (<code>sub</code>, <code>iss</code>, <code>aud</code>, <code>exp</code>, <code>email</code>, <code>name</code>...). To prevent your private claims from ever colliding with a future standard claim — and to make it unambiguous that <em>you</em> defined them — Auth0 <strong>requires</strong> that any non-standard claim you add to an OIDC token be a fully-qualified URI, e.g. <code>https://myapp.example.com/roles</code>. Auth0 silently drops any non-namespaced custom claim. This is not Auth0 being fussy; it is enforcing OIDC §5.1, which says private claims SHOULD be collision-resistant.</p>
+
+    <p><strong>Why machines need their own identity (M2M).</strong> The Authorization Code flow assumes there is a <em>human</em> at a browser to consent and type a password. A nightly batch job, a backend service, or a CLI has no human. For these, OAuth defines the <strong>client-credentials grant</strong>: the application authenticates as <em>itself</em> using a client ID + secret and receives an access token whose subject is the application, not a person. The Management API is itself just an Auth0 API (audience <code>https://YOUR_TENANT/api/v2/</code>), so to call it you obtain an M2M token scoped to it.</p>
+
+    <div class="callout key"><span class="tag">Key</span><p>Actions <em>enrich tokens inside the pipeline</em>; the Management API <em>changes configuration from outside</em>. Custom claims must be namespaced URIs or Auth0 drops them. Machines authenticate with the client-credentials grant, not a user login.</p></div>
+  </section>
+
+  <!-- ===================== 2. STORY ===================== -->
+  <section id="story">
+    <h2>2. Story-Based Explanation</h2>
+    <p>Imagine you have just joined <strong>"CineBook"</strong>, a cinema-booking startup. The login screen already works (Chapter 13). But on day one the lead engineer hands you two tickets:</p>
+    <blockquote>"Our React app needs to hide the <em>Admin</em> menu unless the logged-in user is an admin — but the token doesn't say what role the user has. Fix it."</blockquote>
+    <blockquote>"Our nightly cron imports 5,000 partner users from a CSV and assigns them the <em>partner</em> role. Right now an intern does it by hand in the dashboard. Automate it."</blockquote>
+
+    <p>The first ticket is an <strong>Action</strong> problem. The role lives in Auth0, but it is not in the token, so the front-end is blind. You will write a post-login Action that copies the user's roles into a namespaced claim. After deploying it, the React app reads <code>token['https://cinebook.com/roles']</code> and shows the Admin menu only to admins. No backend change, no redeploy — just a small piece of code running inside Auth0's login pipeline.</p>
+
+    <p>The second ticket is a <strong>Management API</strong> problem. There is no human in a nightly cron, so you create an <strong>M2M application</strong> called "CineBook Importer", authorize it for the Management API with the scopes <code>create:users</code> and <code>update:users</code>, and your cron exchanges its client secret for a token. With that token it loops over the CSV, calls <code>POST /api/v2/users</code> and <code>POST /api/v2/users/{id}/roles</code>, and the intern is freed forever. Better still, for 5,000 users you switch to the <strong>bulk import job</strong> so you do not hit rate limits.</p>
+
+    <p>These two tickets are the whole chapter. Every concept below exists to solve one of them well, securely, and in production.</p>
+  </section>
+
+  <!-- ===================== 3. ASCII DIAGRAMS ===================== -->
+  <section id="diagrams">
+    <h2>3. ASCII Diagrams</h2>
+
+    <h3>3.1 Where an Action runs in the login pipeline</h3>
+    <pre class="diagram">
+  Browser            Auth0 Authorization Server                 Your App
+    |                                                               |
+    |  1. GET /authorize (user clicks Login)                        |
+    |-------------------------------------------------------------->|
+    |                                                               |
+    |        +-----------------------------------------------+      |
+    |        |          AUTH0 LOGIN PIPELINE                  |      |
+    |        |                                               |      |
+    |        |  [authenticate user against connection]       |      |
+    |        |                  |                            |      |
+    |        |                  v                            |      |
+    |        |   +--------------------------------+          |      |
+    |        |   |  POST-LOGIN ACTION  (your code)|          |      |
+    |        |   |  api.idToken.setCustomClaim()  |  <--- YOU|      |
+    |        |   |  api.accessToken.setCustomClaim|     are  |      |
+    |        |   +--------------------------------+     here |      |
+    |        |                  |                            |      |
+    |        |                  v                            |      |
+    |        |   [mint &amp; SIGN id_token + access_token]        |      |
+    |        +-----------------------------------------------+      |
+    |                                                               |
+    |  2. 302 redirect back with code -> tokens with custom claims  |
+    |&lt;--------------------------------------------------------------&gt;|
+    </pre>
+
+    <h3>3.2 Client-credentials grant for a Management API token</h3>
+    <pre class="diagram">
+  +------------------+                              +----------------------+
+  |  M2M App         |   POST /oauth/token          |  Auth0 Token         |
+  |  (CineBook       |   grant_type=                |  Endpoint            |
+  |   Importer)      |     client_credentials       |                      |
+  |                  |   client_id + client_secret  |                      |
+  |  client_id=...   |----------------------------->|  verify secret       |
+  |  client_secret=  |   audience=                  |  check app is        |
+  |     ********      |     .../api/v2/              |  authorized for API  |
+  |                  |                              |  &amp; granted scopes    |
+  |                  |&lt;-----------------------------|  mint access_token    |
+  |                  |   { access_token, expires_in}|  (aud = mgmt API)    |
+  +--------+---------+                              +----------------------+
+           |
+           | Authorization: Bearer &lt;access_token&gt;
+           v
+  +----------------------------------------------------+
+  |  Management API   https://TENANT/api/v2/users      |
+  |  POST /users  ->  creates user                     |
+  |  POST /users/{id}/roles -> assigns role            |
+  +----------------------------------------------------+
+    </pre>
+
+    <h3>3.3 The two metadata stores vs. the token</h3>
+    <pre class="diagram">
+            USER PROFILE in Auth0
+   +-----------------------------------------------+
+   |  user_metadata     |   app_metadata           |
+   |  (user CAN edit)    |   (user CANNOT edit)     |
+   |  preferences, theme |   roles, plan, flags     |
+   +----------+----------+-----------+--------------+
+              |                      |
+        [safe to expose]      [authorization data]
+              |                      |
+              v                      v
+        Action copies the bits you choose into a
+        NAMESPACED claim -> goes into the JWT
+              |
+              v
+   {  "https://cinebook.com/roles": ["admin"],
+      "https://cinebook.com/theme": "dark"        }
+    </pre>
+  </section>
+
+  <!-- ===================== 4. ANALOGY ===================== -->
+  <section id="analogy">
+    <h2>4. Real-World Analogy</h2>
+    <p>Think of an <strong>airport</strong>.</p>
+    <ul>
+      <li><strong>The Action is the gate agent's stamp machine.</strong> As you walk through the boarding gate (the login pipeline), the agent looks up your booking and stamps your boarding pass with "Priority", "Lounge access", "Seat 3A". The stamp travels <em>with you</em> on the pass (the token). The agent cannot change the airline's database — they can only stamp the pass in front of them, at that one moment.</li>
+      <li><strong>The Management API is the airline's back-office system.</strong> Staff there create passenger records, upgrade tickets, and assign frequent-flyer tiers. They never stand at the gate; they change the underlying data that the gate agent will later read.</li>
+      <li><strong>The M2M app is a service account badge.</strong> The automated check-in kiosk is not a person, so it carries its own badge (client ID + secret) to talk to the back office.</li>
+      <li><strong><code>user_metadata</code> vs <code>app_metadata</code>:</strong> <code>user_metadata</code> is the "meal preference" you yourself filled in — harmless if you change it. <code>app_metadata</code> is your "frequent-flyer tier" — if passengers could edit that, everyone would be Platinum. So only the airline writes it.</li>
+    </ul>
+    <div class="callout note"><span class="tag">Note</span><p>A namespaced custom claim is exactly the stamp on the boarding pass: it is information the airport vouches for, carried by the traveller, and trusted downstream <em>because it is signed</em>.</p></div>
+  </section>
+
+  <!-- ===================== 5. INTERNAL WORKING ===================== -->
+  <section id="internals">
+    <h2>5. Internal Working</h2>
+    <h3>5.1 How an Action executes</h3>
+    <p>An Action is a Node.js (currently Node 18/20 LTS on the Auth0 runtime as of 2026) module that exports an <code>onExecutePostLogin(event, api)</code> function. When a login completes, Auth0 spins up a short-lived, sandboxed serverless container, injects the <code>event</code> (read-only facts about this login: the user, the client, the request, the connection) and the <code>api</code> (the levers you can pull: set claims, deny access, redirect, etc.), and runs your function. Actions in a flow run <strong>in sequence</strong>, top to bottom, sharing nothing except what you explicitly write. Each Action has a hard execution budget (a few seconds) — exceed it and the login fails.</p>
+
+    <h3>5.2 Why <code>roles</code> are not in the token by default</h3>
+    <p>Auth0's RBAC stores roles and permissions in its database, associated with the user. Tokens are deliberately <strong>lean</strong> — Auth0 will only auto-include permissions in the <em>access token</em> if you enable "Add Permissions in the Access Token" on the API. Roles are <em>never</em> auto-included. So the canonical pattern is: read <code>event.authorization.roles</code> (populated when RBAC is enabled) and copy it into a namespaced claim yourself.</p>
+
+    <h3>5.3 How the Management API token is verified</h3>
+    <p>When your M2M app calls <code>/oauth/token</code>, Auth0 verifies the client secret, confirms the app is authorized for the requested <code>audience</code> (the Management API), intersects the requested scopes with the scopes <em>granted</em> to that app, and mints a signed JWT whose <code>aud</code> is the Management API and whose <code>scope</code> claim lists the granted permissions. The Management API then, on every request, validates that JWT's signature (RS256, via the tenant's JWKS), expiry, audience, and required scope before performing the operation.</p>
+
+    <pre class="diagram">
+  Token lifetime &amp; caching (M2M)
+  ------------------------------
+  t0   request token  -->  { expires_in: 86400 }   (default 24h)
+  t0..t+86400s   REUSE the same token (cache it!)
+  t+86400s       token expired -> request a NEW one
+  Anti-pattern: requesting a fresh token on EVERY call
+                = wasted /oauth/token quota + latency
+    </pre>
+  </section>
+
+  <!-- ===================== 6. CODE WALKTHROUGH ===================== -->
+  <section id="walkthrough">
+    <h2>6. Code Walkthrough — The Post-Login Action</h2>
+    <p>Here is the complete, runnable post-login Action that solves ticket #1. Create it in the Auth0 Dashboard under <strong>Actions → Library → Build Custom → Login / Post Login</strong>, paste the code, then add it to the <strong>Login</strong> flow.</p>
+
+    <pre><code class="language-javascript">/**
+ * Post-Login Action: add roles + permissions as namespaced custom claims.
+ * Trigger: post-login
+ */
+exports.onExecutePostLogin = async (event, api) =&gt; {
+  // 1) A namespace MUST be a URI you control. It does NOT need to resolve.
+  //    Convention: your app's https URL. NEVER use an auth0.com domain
+  //    (Auth0 forbids namespaces under its own domains).
+  const namespace = 'https://cinebook.com';
+
+  // 2) Roles are populated by Auth0 ONLY when RBAC is enabled on the API.
+  const roles = event.authorization?.roles ?? [];
+
+  // 3) Add the same claim to BOTH tokens:
+  //    - id_token  -> consumed by the front-end (UI decisions)
+  //    - access_token -> consumed by your API (authorization decisions)
+  api.idToken.setCustomClaim(`${namespace}/roles`, roles);
+  api.accessToken.setCustomClaim(`${namespace}/roles`, roles);
+
+  // 4) Optionally surface a non-sensitive user_metadata value to the UI.
+  const theme = event.user.user_metadata?.theme;
+  if (theme) {
+    api.idToken.setCustomClaim(`${namespace}/theme`, theme);
+  }
+
+  // 5) Surface a tenant/plan flag stored in app_metadata (user cannot edit it).
+  const plan = event.user.app_metadata?.plan ?? 'free';
+  api.accessToken.setCustomClaim(`${namespace}/plan`, plan);
+};
+</code></pre>
+
+    <p><strong>Line-by-line, why each line exists:</strong></p>
+    <ul>
+      <li><strong>namespace</strong> — a URI you own. It is a <em>label</em>, not a URL that gets fetched. Using <code>https://cinebook.com</code> guarantees no collision with OIDC standard claims.</li>
+      <li><strong><code>event.authorization?.roles</code></strong> — the optional chaining (<code>?.</code>) protects against logins where authorization context is absent (e.g. an M2M token has no user). Defaulting to <code>[]</code> means the claim is always present and always an array — predictable for the consumer.</li>
+      <li><strong>setting both tokens</strong> — the front-end reads the ID token to render UI; your API must <em>never</em> trust the ID token for authorization and instead reads the access token. Putting roles in both keeps each layer self-sufficient.</li>
+      <li><strong><code>user_metadata.theme</code></strong> — safe to expose because it is a user preference, not a security decision.</li>
+      <li><strong><code>app_metadata.plan</code></strong> — an authorization-relevant flag; it lives in <code>app_metadata</code> precisely because the user must not be able to edit it.</li>
+    </ul>
+
+    <div class="callout warn"><span class="tag">Warn</span><p><code>event.authorization.roles</code> is empty unless <strong>RBAC</strong> is enabled on the API the user is logging in for (API → Settings → "Enable RBAC"). If your roles claim is always <code>[]</code>, that toggle is the first thing to check.</p></div>
+  </section>
+
+  <!-- ===================== 7. PRACTICAL IMPLEMENTATION ===================== -->
+  <section id="practical">
+    <h2>7. Practical Implementation — Test the Action &amp; Inspect the Token</h2>
+
+    <h3>7.1 Test inside the dashboard</h3>
+    <p>The Action editor has a <strong>Run</strong> tab with a mock <code>event</code>. Edit the mock so <code>event.authorization.roles = ["admin"]</code> and click Run — the console shows the claims your code set. This is a fast unit test before you touch a real login.</p>
+
+    <h3>7.2 Get a real token and decode it</h3>
+    <p>Trigger a real login from your app (or use the <strong>Try</strong> button on a connection). Then decode the JWT. You can paste it into jwt.io, but here is a CLI way that never sends your token to a website:</p>
+
+    <pre><code class="language-bash"># Decode the PAYLOAD of a JWT locally (base64url -> JSON). Read-only, no verify.
+TOKEN="eyJhbGciOi...your.jwt.here"
+echo "$TOKEN" | cut -d '.' -f2 | tr '_-' '/+' \
+  | awk '{ l=length($0)%4; if(l){ for(i=0;i&lt;4-l;i++) $0=$0"=" } print }' \
+  | base64 -d 2&gt;/dev/null | python3 -m json.tool
+</code></pre>
+
+    <p>You should see your namespaced claims in the decoded payload:</p>
+    <pre><code class="language-json">{
+  "iss": "https://your-tenant.us.auth0.com/",
+  "sub": "auth0|6650f0c1a2b3c4d5e6f7a8b9",
+  "aud": ["https://api.cinebook.com", "https://your-tenant.us.auth0.com/userinfo"],
+  "exp": 1718900000,
+  "https://cinebook.com/roles": ["admin"],
+  "https://cinebook.com/plan": "pro"
+}
+</code></pre>
+
+    <h3>7.3 Read the claim in a React front-end</h3>
+    <pre><code class="language-javascript">import { useAuth0 } from '@auth0/auth0-react';
+
+const NAMESPACE = 'https://cinebook.com';
+
+function AdminMenu() {
+  const { user, isAuthenticated } = useAuth0();
+  // ID-token claims are flattened onto `user` by the SDK.
+  const roles = (isAuthenticated &amp;&amp; user?.[`${NAMESPACE}/roles`]) || [];
+  if (!roles.includes('admin')) return null;
+  return &lt;a href="/admin"&gt;Admin&lt;/a&gt;;
+}
+</code></pre>
+
+    <h3>7.4 Enforce the claim in a Spring Boot resource server (the real gate)</h3>
+    <p>UI hiding is cosmetic; the API must enforce. Map the namespaced claim to Spring authorities:</p>
+    <pre><code class="language-java">@Bean
+SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+  http
+    .authorizeHttpRequests(auth -&gt; auth
+        .requestMatchers("/admin/**").hasAuthority("ROLE_admin")
+        .anyRequest().authenticated())
+    .oauth2ResourceServer(o -&gt; o.jwt(j -&gt; j.jwtAuthenticationConverter(rolesConverter())));
+  return http.build();
+}
+
+private JwtAuthenticationConverter rolesConverter() {
+  JwtAuthenticationConverter conv = new JwtAuthenticationConverter();
+  conv.setJwtGrantedAuthoritiesConverter(jwt -&gt; {
+    List&lt;String&gt; roles =
+        jwt.getClaimAsStringList("https://cinebook.com/roles");
+    return roles == null ? List.of()
+        : roles.stream()
+               .map(r -&gt; new SimpleGrantedAuthority("ROLE_" + r))
+               .collect(Collectors.toList());
+  });
+  return conv;
+}
+</code></pre>
+  </section>
+
+  <!-- ===================== 8. PRODUCTION ARCHITECTURE ===================== -->
+  <section id="architecture">
+    <h2>8. Production Architecture — M2M, Management API &amp; Tenants</h2>
+
+    <h3>8.1 Create the M2M application &amp; get a token</h3>
+    <p><strong>Dashboard → Applications → Create Application → Machine to Machine</strong>, then authorize it for "Auth0 Management API" and tick only the scopes you need (least privilege). Then exchange the secret for a token:</p>
+
+    <pre><code class="language-bash">curl --request POST \
+  --url 'https://YOUR_TENANT.us.auth0.com/oauth/token' \
+  --header 'content-type: application/json' \
+  --data '{
+    "grant_type": "client_credentials",
+    "client_id": "YOUR_M2M_CLIENT_ID",
+    "client_secret": "YOUR_M2M_CLIENT_SECRET",
+    "audience": "https://YOUR_TENANT.us.auth0.com/api/v2/"
+  }'
+# -> { "access_token": "eyJ...", "expires_in": 86400, "token_type": "Bearer" }
+</code></pre>
+
+    <h3>8.2 Call the Management API — create user &amp; assign role (curl)</h3>
+    <pre><code class="language-bash">MGMT_TOKEN="eyJ...from step 8.1..."
+BASE="https://YOUR_TENANT.us.auth0.com/api/v2"
+
+# Create a user in the Username-Password-Authentication db connection
+USER=$(curl -s --request POST --url "$BASE/users" \
+  --header "authorization: Bearer $MGMT_TOKEN" \
+  --header 'content-type: application/json' \
+  --data '{
+    "connection": "Username-Password-Authentication",
+    "email": "partner1@example.com",
+    "password": "A-Str0ng-Passw0rd!",
+    "email_verified": false,
+    "app_metadata": { "plan": "partner" }
+  }')
+
+USER_ID=$(echo "$USER" | python3 -c 'import sys,json;print(json.load(sys.stdin)["user_id"])')
+
+# Assign a role (get the role id once from GET /roles)
+curl -s --request POST --url "$BASE/users/$USER_ID/roles" \
+  --header "authorization: Bearer $MGMT_TOKEN" \
+  --header 'content-type: application/json' \
+  --data '{ "roles": ["rol_ABC123partner"] }'
+</code></pre>
+
+    <h3>8.3 Postman setup</h3>
+    <ol>
+      <li>Create an environment with variables <code>tenant</code>, <code>m2m_id</code>, <code>m2m_secret</code>, <code>mgmt_token</code>.</li>
+      <li>Request 1: <code>POST https://{{tenant}}/oauth/token</code> with the JSON body from 8.1. In the <strong>Tests</strong> tab, save the token:
+        <pre><code class="language-javascript">// Postman Tests tab — auto-cache the Management token
+const json = pm.response.json();
+pm.environment.set("mgmt_token", json.access_token);
+</code></pre>
+      </li>
+      <li>Request 2: <code>POST https://{{tenant}}/api/v2/users</code> with Authorization type <em>Bearer Token</em> = <code>{{mgmt_token}}</code>. Now every Management call reuses the cached token.</li>
+    </ol>
+
+    <h3>8.4 Doing it from a backend (Node.js, with token caching)</h3>
+    <pre><code class="language-javascript">import { ManagementClient } from 'auth0';
+
+// The SDK fetches AND caches the M2M token for you (renews before expiry).
+const mgmt = new ManagementClient({
+  domain: 'YOUR_TENANT.us.auth0.com',
+  clientId: process.env.M2M_CLIENT_ID,
+  clientSecret: process.env.M2M_CLIENT_SECRET,
+  // audience defaults to the Management API
+});
+
+export async function onboardPartner(email) {
+  const { data: user } = await mgmt.users.create({
+    connection: 'Username-Password-Authentication',
+    email,
+    password: crypto.randomUUID() + 'Aa1!',
+    app_metadata: { plan: 'partner' },
+  });
+  await mgmt.users.assignRoles(
+    { id: user.user_id },
+    { roles: ['rol_ABC123partner'] }
+  );
+  return user.user_id;
+}
+</code></pre>
+
+    <h3>8.5 FastAPI / Python equivalent</h3>
+    <pre><code class="language-python">import os, time, httpx
+
+_token_cache = {"value": None, "exp": 0}
+TENANT = os.environ["AUTH0_TENANT"]      # e.g. your-tenant.us.auth0.com
+BASE   = f"https://{TENANT}/api/v2"
+
+async def mgmt_token() -&gt; str:
+    if _token_cache["value"] and time.time() &lt; _token_cache["exp"] - 60:
+        return _token_cache["value"]            # reuse cached token
+    async with httpx.AsyncClient() as c:
+        r = await c.post(f"https://{TENANT}/oauth/token", json={
+            "grant_type": "client_credentials",
+            "client_id": os.environ["M2M_CLIENT_ID"],
+            "client_secret": os.environ["M2M_CLIENT_SECRET"],
+            "audience": f"https://{TENANT}/api/v2/",
+        })
+    r.raise_for_status()
+    data = r.json()
+    _token_cache.update(value=data["access_token"],
+                        exp=time.time() + data["expires_in"])
+    return data["access_token"]
+
+async def create_user(email: str) -&gt; str:
+    tok = await mgmt_token()
+    async with httpx.AsyncClient() as c:
+        r = await c.post(f"{BASE}/users",
+            headers={"authorization": f"Bearer {tok}"},
+            json={"connection": "Username-Password-Authentication",
+                  "email": email, "password": "A-Str0ng-Passw0rd!1"})
+    r.raise_for_status()
+    return r.json()["user_id"]
+</code></pre>
+
+    <h3>8.6 Promoting config to production — tenants &amp; environments</h3>
+    <p>A "tenant" is an isolated Auth0 instance. The production pattern is <strong>one tenant per environment</strong>: <code>cinebook-dev</code>, <code>cinebook-staging</code>, <code>cinebook-prod</code>. You never click around in prod. Instead you treat tenant configuration as <strong>code</strong> using the <code>auth0-deploy-cli</code> or the Terraform Auth0 provider, and promote tested config forward.</p>
+
+    <pre><code class="language-bash"># Export the dev tenant to versioned YAML/JSON (config-as-code)
+a0deploy export --format yaml \
+  --output_folder ./tenant-dev \
+  --config_file dev.config.json
+
+# Review the diff in git, then import into staging/prod
+a0deploy import --input_file ./tenant-dev/tenant.yaml \
+  --config_file prod.config.json
+</code></pre>
+
+    <pre class="diagram">
+   DEV tenant            STAGING tenant           PROD tenant
+   (free play)            (test like prod)        (locked down)
+       |                       ^                        ^
+       | a0deploy export       | a0deploy import        | a0deploy import
+       v                       |                        |
+   git repo (tenant.yaml) -----+------------------------+
+   - Actions code               keyword replace per env:
+   - clients, APIs, conns       client secrets, callback URLs, namespaces
+   (secrets EXCLUDED from git, injected from a vault)
+    </pre>
+
+    <div class="callout tip"><span class="tag">Tip</span><p>Use <strong>keyword replacement</strong> in the deploy CLI so the same <code>tenant.yaml</code> produces different callback URLs and audiences per environment, and inject secrets from a vault at deploy time — never commit a client secret to git.</p></div>
+  </section>
+
+  <!-- ===================== 9. SECURITY ===================== -->
+  <section id="security">
+    <h2>9. Security Analysis</h2>
+    <table>
+      <thead><tr><th>Threat</th><th>Why it happens</th><th>Mitigation</th></tr></thead>
+      <tbody>
+        <tr><td>M2M secret leaked in git / front-end</td><td>Client-credentials secret treated like an API key</td><td>Store in a secret manager; rotate; NEVER ship to a browser. M2M is backend-only.</td></tr>
+        <tr><td>Over-privileged M2M app</td><td>Granted all Management scopes "to be safe"</td><td>Least privilege: grant only <code>create:users</code>, <code>update:users</code>, etc. One narrow M2M app per job.</td></tr>
+        <tr><td>Trusting roles from the <em>ID</em> token in the API</td><td>ID token is for the client, not the API</td><td>APIs authorize on the <strong>access token</strong> only; validate <code>aud</code> = your API.</td></tr>
+        <tr><td>Non-namespaced or sensitive claims</td><td>PII or secrets stuffed into the JWT</td><td>Namespace all custom claims; never put passwords/SSNs in tokens — tokens are not encrypted, only signed.</td></tr>
+        <tr><td>User escalates own role</td><td>Role written to <code>user_metadata</code></td><td>Authorization data lives in <code>app_metadata</code> / Auth0 RBAC, which users cannot edit.</td></tr>
+        <tr><td>Action leaks data across flows</td><td>Logging the whole <code>event</code> object</td><td>Log identifiers only; the <code>event</code> contains PII and tokens.</td></tr>
+      </tbody>
+    </table>
+    <div class="callout danger"><span class="tag">Danger</span><p>A JWT is <strong>signed, not encrypted</strong>. Anyone holding the token can read every claim. Treat each claim as public information.</p></div>
+  </section>
+
+  <!-- ===================== 10. PERFORMANCE ===================== -->
+  <section id="performance">
+    <h2>10. Performance Considerations</h2>
+    <ul>
+      <li><strong>Cache the M2M token.</strong> It is valid ~24h. Requesting a new one per call wastes latency and burns your <code>/oauth/token</code> quota. The official SDKs cache automatically; if you hand-roll, cache with a 60s safety margin (see 8.5).</li>
+      <li><strong>Keep Actions fast.</strong> Every Action runs on the critical login path — its latency is added to every user's login. Avoid network calls inside an Action; if you must, set tight timeouts and fail open or closed deliberately.</li>
+      <li><strong>Respect Management API rate limits.</strong> The Management API is rate-limited (per tenant, returned in <code>X-RateLimit-Remaining</code> headers). For more than a handful of users, use the <strong>bulk import job</strong>, not a loop of <code>POST /users</code>.</li>
+      <li><strong>Don't bloat tokens.</strong> Large claim arrays inflate every request that carries the token. Put only what the consumer needs; fetch the rest from your DB by <code>sub</code>.</li>
+      <li><strong>Use search wisely.</strong> <code>GET /users?q=...</code> uses Lucene over an eventually-consistent index. For exact-by-email use <code>GET /users-by-email</code>, which is strongly consistent.</li>
+    </ul>
+
+    <h3>10.1 Bulk import (the right way for 5,000 users)</h3>
+    <pre><code class="language-bash"># 1) users.json: an array of user objects matching the import schema
+# 2) Kick off an async import job (assign a connection_id, not a name)
+curl -s --request POST --url "$BASE/jobs/users-imports" \
+  --header "authorization: Bearer $MGMT_TOKEN" \
+  --form users=@users.json \
+  --form connection_id="con_XXXXXXXX" \
+  --form upsert=true \
+  --form send_completion_email=false
+# -> returns { "id": "job_abc", "status": "pending" }
+
+# 3) Poll the job until status = "completed"
+curl -s --url "$BASE/jobs/job_abc" \
+  --header "authorization: Bearer $MGMT_TOKEN"
+</code></pre>
+
+    <h3>10.2 Bulk export</h3>
+    <pre><code class="language-bash"># Export all users of a connection as a gzipped JSON file (async job).
+curl -s --request POST --url "$BASE/jobs/users-exports" \
+  --header "authorization: Bearer $MGMT_TOKEN" \
+  --header 'content-type: application/json' \
+  --data '{
+    "connection_id": "con_XXXXXXXX",
+    "format": "json",
+    "fields": [{"name":"user_id"},{"name":"email"},{"name":"app_metadata"}]
+  }'
+# Poll the returned job id; when done it gives a signed download "location" URL.
+</code></pre>
+    <div class="callout note"><span class="tag">Note</span><p>Bulk export <strong>cannot</strong> export password hashes via this endpoint. To migrate hashes out of Auth0 you must open a support request; this is a deliberate security control.</p></div>
+  </section>
+
+  <!-- ===================== 11. COMMON MISTAKES ===================== -->
+  <section id="mistakes">
+    <h2>11. Common Mistakes</h2>
+    <ol>
+      <li><strong>Forgetting the namespace.</strong> <code>api.idToken.setCustomClaim('roles', ...)</code> silently does nothing for OIDC tokens. Always use a URI.</li>
+      <li><strong>Expecting roles without RBAC.</strong> <code>event.authorization.roles</code> is empty unless RBAC is enabled on the API.</li>
+      <li><strong>Not adding the Action to the flow.</strong> Deploying an Action only saves it to the Library — you must drag it onto the Login flow and click Apply.</li>
+      <li><strong>Putting roles in <code>user_metadata</code>.</strong> Users can edit <code>user_metadata</code> via the self-service Management endpoints — instant privilege escalation. Use <code>app_metadata</code> / RBAC.</li>
+      <li><strong>Requesting a Management token on every request.</strong> Cache it.</li>
+      <li><strong>Authorizing on the ID token in the API.</strong> The API must use the access token and validate <code>aud</code>.</li>
+      <li><strong>Looping <code>POST /users</code> for thousands of users.</strong> You will hit rate limits; use the import job.</li>
+      <li><strong>Shipping the M2M client secret to the browser.</strong> Client credentials are confidential — backend only.</li>
+      <li><strong>Hardcoding role IDs across tenants.</strong> Role IDs differ per tenant; resolve them at deploy time or via <code>GET /roles</code>.</li>
+      <li><strong>Editing config directly in prod.</strong> Promote via export/import so changes are reviewed and reproducible.</li>
+    </ol>
+  </section>
+
+  <!-- ===================== 12. BEST PRACTICES ===================== -->
+  <section id="best-practices">
+    <h2>12. Best Practices</h2>
+    <ul>
+      <li><strong>One namespace per app, defined once</strong> as a constant, reused in Action and consumers.</li>
+      <li><strong>Always default arrays</strong> (<code>?? []</code>) so claim consumers never special-case "missing".</li>
+      <li><strong>Set roles in both ID and access tokens</strong> — UI from ID, enforcement from access.</li>
+      <li><strong>Least-privilege M2M apps</strong>, one per responsibility, with rotation.</li>
+      <li><strong>Cache and proactively refresh</strong> the Management token (60s margin).</li>
+      <li><strong>app_metadata for authorization</strong>, user_metadata for preferences — never mix.</li>
+      <li><strong>Idempotent imports</strong> using <code>upsert=true</code> so re-runs are safe.</li>
+      <li><strong>Config as code</strong> with <code>a0deploy</code>/Terraform; secrets from a vault; keyword replacement per environment.</li>
+      <li><strong>Separate tenants per environment</strong>; never test in prod.</li>
+      <li><strong>Pin role assignment to role IDs resolved per tenant</strong>, not hardcoded strings.</li>
+    </ul>
+  </section>
+
+  <!-- ===================== 13. INTERVIEW QUESTIONS ===================== -->
+  <section id="interview">
+    <h2>13. Interview Questions (with Model Answers)</h2>
+
+    <h3>Q1. Why must custom claims be namespaced in Auth0?</h3>
+    <p><strong>Model answer:</strong> OIDC reserves standard claim names; private claims should be collision-resistant (OIDC §5.1). Auth0 enforces this by requiring custom claims to be URIs and silently dropping non-namespaced ones, so your data never clashes with current or future standard claims and is unambiguously yours.</p>
+
+    <h3>Q2. An Action sets <code>roles</code> but the API still sees none. Walk me through debugging.</h3>
+    <p><strong>Model answer:</strong> (1) Is RBAC enabled on the API so <code>event.authorization.roles</code> is populated? (2) Is the claim namespaced? (3) Is the Action actually in the Login flow and applied? (4) Is the API reading the <em>access</em> token (not ID) and the right namespace? (5) Decode a fresh token to confirm the claim is present.</p>
+
+    <h3>Q3. Difference between an Action and the Management API?</h3>
+    <p><strong>Model answer:</strong> An Action runs <em>inside</em> Auth0's pipeline to enrich the in-flight login/token; it cannot change tenant config. The Management API is an external REST API you call to read/mutate config (users, roles, clients). Actions = inbound enrichment; Management API = outbound administration.</p>
+
+    <h3>Q4. How does a backend authenticate to the Management API?</h3>
+    <p><strong>Model answer:</strong> Via the client-credentials grant: an M2M app exchanges its client ID + secret at <code>/oauth/token</code> with <code>audience</code> = the Management API, receiving an access token scoped to the granted Management permissions. The token is cached and reused until near expiry.</p>
+
+    <h3>Q5. <code>user_metadata</code> vs <code>app_metadata</code> — and a security implication?</h3>
+    <p><strong>Model answer:</strong> <code>user_metadata</code> is user-editable preferences; <code>app_metadata</code> is app-controlled and users cannot edit it. Authorization data (roles, plan, flags) must live in <code>app_metadata</code> or RBAC; putting it in <code>user_metadata</code> lets a user escalate their own privileges via the self-service profile update endpoint.</p>
+
+    <h3>Q6. You must import 100k users from a legacy DB. Approach?</h3>
+    <p><strong>Model answer:</strong> Use the bulk <code>users-imports</code> job in batches, with <code>upsert=true</code> for idempotency, mapping fields to the import schema. If the legacy passwords use a supported hash, import the hashes so users keep their passwords; otherwise enable custom-database "lazy migration" to migrate on first login. Avoid per-user POSTs (rate limits).</p>
+
+    <h3>Q7. How do you promote Auth0 config to production safely?</h3>
+    <p><strong>Model answer:</strong> Separate tenants per environment; treat config as code with <code>a0deploy</code> or Terraform; export dev to versioned files, review the diff in git, use keyword replacement for per-env values, inject secrets from a vault, and import into staging then prod. No manual prod edits.</p>
+
+    <h3>Q8. Why is the M2M secret more dangerous than an ID token?</h3>
+    <p><strong>Model answer:</strong> An ID token is short-lived and scoped to one user/session. The M2M secret is a long-lived credential that can mint tokens able to administer the whole tenant (create users, change roles). Leaking it is a full administrative compromise; hence vault storage, rotation, and backend-only use.</p>
+  </section>
+
+  <!-- ===================== 14. CERTIFICATION TIPS ===================== -->
+  <section id="certification">
+    <h2>14. Certification Tips</h2>
+    <ul>
+      <li><strong>Know the trigger names cold:</strong> <code>onExecutePostLogin</code>, <code>onExecuteCredentialsExchange</code> (M2M), <code>onExecutePreUserRegistration</code>, <code>onExecutePostUserRegistration</code>.</li>
+      <li>The exam tests that <strong>custom claims must be namespaced URIs</strong> and that <strong>roles need RBAC enabled</strong>.</li>
+      <li>Remember the <strong>API objects</strong>: <code>api.idToken.setCustomClaim</code>, <code>api.accessToken.setCustomClaim</code>, <code>api.access.deny</code>, <code>api.redirect.sendUserTo</code>, <code>api.user.setAppMetadata</code>.</li>
+      <li>Management API auth is <strong>client-credentials</strong> with <code>audience = https://TENANT/api/v2/</code>; tokens carry <strong>scopes</strong> like <code>read:users</code>, <code>create:users</code>.</li>
+      <li><code>app_metadata</code> = not user-editable; <code>user_metadata</code> = user-editable. Expect a question contrasting them.</li>
+      <li>Bulk operations are <strong>asynchronous jobs</strong> you poll; <code>upsert</code> makes imports idempotent.</li>
+      <li>Config promotion uses <strong>auth0-deploy-cli</strong> / Terraform across <strong>separate tenants per environment</strong>.</li>
+    </ul>
+  </section>
+
+  <!-- ===================== 15. HANDS-ON EXERCISES ===================== -->
+  <section id="exercises">
+    <h2>15. Hands-On Exercises</h2>
+    <ol>
+      <li>Create the post-login Action from §6, add it to the Login flow, log in, and decode your token to confirm the <code>roles</code> claim appears.</li>
+      <li>Add a second claim <code>.../permissions</code> from <code>event.authorization.permissions</code> and verify it.</li>
+      <li>Create an M2M app, grant only <code>read:users</code>, get a token, and call <code>GET /api/v2/users</code> via curl.</li>
+      <li>In Postman, build the two-request collection (token → create user) with the auto-cache test script from §8.3.</li>
+      <li>Write a 5-line script that creates a user and assigns a role using the Node or Python SDK.</li>
+      <li>Set a value in <code>user_metadata</code> via the dashboard and surface it as a claim; then try (and observe Auth0 refuse) to escalate a role by writing it to <code>user_metadata</code>.</li>
+      <li>Bulk-import 3 users from a JSON file with <code>upsert=true</code>; re-run it and confirm idempotency.</li>
+    </ol>
+  </section>
+
+  <!-- ===================== 16. ASSIGNMENT ===================== -->
+  <section id="assignment">
+    <h2>16. Assignment</h2>
+    <p>Build an <strong>idempotent partner-onboarding script</strong> (Node, Python, Java, or curl) that:</p>
+    <ol>
+      <li>Obtains a Management API token via client-credentials and caches it.</li>
+      <li>Reads a CSV of partners (<code>email,company,plan</code>).</li>
+      <li>For each row: upserts the user (bulk import job for &gt;50 rows, otherwise per-user), sets <code>app_metadata.plan</code>, and assigns the <code>partner</code> role (resolve its ID via <code>GET /roles</code>, do not hardcode).</li>
+      <li>Logs only user IDs and outcomes (no PII), and is safe to re-run.</li>
+    </ol>
+    <p><strong>Deliverable:</strong> the script, a sample CSV, and a short README explaining how secrets are supplied (env/vault) and why roles live in <code>app_metadata</code>/RBAC.</p>
+  </section>
+
+  <!-- ===================== 17. MINI PROJECT ===================== -->
+  <section id="mini-project">
+    <h2>17. Mini Project — "Role-Aware CineBook Admin Tools"</h2>
+    <p>Combine everything into a small end-to-end slice:</p>
+    <ul>
+      <li><strong>Action:</strong> post-login Action injecting <code>roles</code> + <code>plan</code> as namespaced claims into both tokens.</li>
+      <li><strong>Front-end (React or Next.js):</strong> shows an <em>Admin</em> link only when the ID token's roles include <code>admin</code>.</li>
+      <li><strong>API (Spring Boot or FastAPI):</strong> protects <code>/admin/**</code> using the access token's roles claim (real enforcement).</li>
+      <li><strong>Admin endpoint:</strong> <code>POST /admin/invite</code> that, server-side, uses an M2M token to create a user and assign a role via the Management API.</li>
+      <li><strong>Ops:</strong> export your dev tenant with <code>a0deploy</code>, commit the YAML (secrets excluded), and document the promotion path to staging.</li>
+    </ul>
+    <p><strong>Success criteria:</strong> a non-admin cannot reach <code>/admin/**</code> even by calling the API directly with a valid non-admin token; a created user can log in and receive correct claims; re-running the export produces no surprising diff.</p>
+  </section>
+
+  <!-- ===================== 18. QUIZ ===================== -->
+  <section id="quiz">
+    <h2>18. Quiz (25 Questions)</h2>
+    <ol>
+      <li>Why must Auth0 custom claims be namespaced?</li>
+      <li>What function does a post-login Action export?</li>
+      <li>Which two objects are passed into <code>onExecutePostLogin</code>?</li>
+      <li>Why might <code>event.authorization.roles</code> be empty?</li>
+      <li>Which token should an API use for authorization, ID or access?</li>
+      <li>What grant type does an M2M app use?</li>
+      <li>What is the <code>audience</code> value when requesting a Management API token?</li>
+      <li>Name two Management API scopes needed to create users and assign roles.</li>
+      <li>True/False: a JWT is encrypted, so claims are private.</li>
+      <li>Where should role/authorization data be stored, <code>user_metadata</code> or <code>app_metadata</code>? Why?</li>
+      <li>What does <code>upsert=true</code> do in a bulk import job?</li>
+      <li>Why cache the Management API token?</li>
+      <li>What is the default lifetime of a client-credentials access token in Auth0?</li>
+      <li>Which API call is strongly consistent for finding a user by email?</li>
+      <li>What does the deploy CLI's "keyword replacement" solve?</li>
+      <li>Why one tenant per environment?</li>
+      <li>What happens if you set a non-namespaced custom claim?</li>
+      <li>Can an Action change tenant configuration (e.g. create a client)?</li>
+      <li>Which API method denies a login from within an Action?</li>
+      <li>Why shouldn't the M2M secret reach a browser?</li>
+      <li>What is the risk of granting an M2M app all Management scopes?</li>
+      <li>How do you make a partner-onboarding script idempotent?</li>
+      <li>Why are bulk import/export modeled as asynchronous jobs?</li>
+      <li>Why set the roles claim on both the ID and access tokens?</li>
+      <li>Can you export password hashes via the bulk export endpoint?</li>
+    </ol>
+
+    <details>
+      <summary>Show answer key</summary>
+      <ol>
+        <li>To be collision-resistant with OIDC standard claims (OIDC §5.1); Auth0 drops non-namespaced custom claims.</li>
+        <li><code>onExecutePostLogin(event, api)</code>.</li>
+        <li><code>event</code> (read-only facts) and <code>api</code> (levers like <code>setCustomClaim</code>).</li>
+        <li>RBAC is not enabled on the API, or the login has no user/authorization context (e.g. M2M).</li>
+        <li>The access token. The ID token is for the client only.</li>
+        <li>Client-credentials.</li>
+        <li><code>https://YOUR_TENANT/api/v2/</code>.</li>
+        <li><code>create:users</code> and <code>update:users</code> (and <code>read:roles</code> to resolve role IDs).</li>
+        <li>False — a JWT is signed, not encrypted; claims are readable by anyone holding it.</li>
+        <li><code>app_metadata</code>, because users cannot edit it; <code>user_metadata</code> is user-editable and would allow self-escalation.</li>
+        <li>Updates existing users (matched by email/identifier) instead of failing, making re-runs safe.</li>
+        <li>It is valid ~24h; refetching per call wastes latency and quota.</li>
+        <li>86400 seconds (24 hours) by default.</li>
+        <li><code>GET /api/v2/users-by-email</code>.</li>
+        <li>It substitutes per-environment values (URLs, audiences) into one shared config so the same file deploys to dev/staging/prod.</li>
+        <li>Isolation: changes, data, and outages in one environment cannot affect another, especially production.</li>
+        <li>Auth0 silently drops it; the claim does not appear in OIDC tokens.</li>
+        <li>No. Actions only enrich the in-flight pipeline; config changes require the Management API.</li>
+        <li><code>api.access.deny(reason)</code>.</li>
+        <li>It is a long-lived confidential credential that can administer the whole tenant; exposure = full compromise.</li>
+        <li>Over-privilege: a leak or bug can do far more damage; violates least privilege.</li>
+        <li>Use <code>upsert=true</code> and/or check existence first; resolve role IDs dynamically; make writes safe to repeat.</li>
+        <li>They can process large volumes beyond a single request's time/rate limits; you poll for completion.</li>
+        <li>The front-end reads roles from the ID token for UI; the API reads them from the access token for enforcement.</li>
+        <li>No — password hashes cannot be exported via the bulk export endpoint; migration requires a support request.</li>
+      </ol>
+    </details>
+  </section>
+
+  <!-- ===================== 19. CHEAT SHEET ===================== -->
+  <section id="cheat-sheet">
+    <h2>19. Cheat Sheet</h2>
+    <table>
+      <thead><tr><th>Task</th><th>How</th></tr></thead>
+      <tbody>
+        <tr><td>Add custom claim</td><td><code>api.idToken.setCustomClaim('https://app/roles', roles)</code></td></tr>
+        <tr><td>Get roles in Action</td><td><code>event.authorization?.roles ?? []</code> (needs RBAC)</td></tr>
+        <tr><td>Deny login</td><td><code>api.access.deny('reason')</code></td></tr>
+        <tr><td>Set app_metadata</td><td><code>api.user.setAppMetadata('plan','pro')</code></td></tr>
+        <tr><td>M2M token</td><td><code>POST /oauth/token</code> grant=<code>client_credentials</code>, audience=<code>.../api/v2/</code></td></tr>
+        <tr><td>Create user</td><td><code>POST /api/v2/users</code> (connection, email, password)</td></tr>
+        <tr><td>Assign role</td><td><code>POST /api/v2/users/{id}/roles</code> body <code>{"roles":["rol_.."]}</code></td></tr>
+        <tr><td>Find by email</td><td><code>GET /api/v2/users-by-email?email=..</code> (strong consistency)</td></tr>
+        <tr><td>Bulk import</td><td><code>POST /api/v2/jobs/users-imports</code> (<code>upsert=true</code>), poll job</td></tr>
+        <tr><td>Bulk export</td><td><code>POST /api/v2/jobs/users-exports</code>, poll, download location</td></tr>
+        <tr><td>Export tenant</td><td><code>a0deploy export --format yaml</code></td></tr>
+        <tr><td>Import tenant</td><td><code>a0deploy import --input_file tenant.yaml</code></td></tr>
+      </tbody>
+    </table>
+    <div class="callout key"><span class="tag">Key</span><p>Namespace every claim · enable RBAC for roles · access token for APIs · cache the M2M token · app_metadata for authorization · bulk jobs for scale · config-as-code across tenants.</p></div>
+  </section>
+
+  <!-- ===================== 20. KEY TAKEAWAYS ===================== -->
+  <section id="takeaways">
+    <h2>20. Key Takeaways</h2>
+    <ul>
+      <li><strong>Actions enrich; the Management API administers.</strong> One runs inside the pipeline, the other is called from outside.</li>
+      <li><strong>Custom claims must be namespaced URIs</strong> or Auth0 drops them — this prevents collisions with OIDC standard claims.</li>
+      <li><strong>Roles need RBAC enabled</strong> to populate <code>event.authorization.roles</code>; copy them into both ID and access tokens.</li>
+      <li><strong>Machines use the client-credentials grant</strong>; the Management API is just an audience you request a token for.</li>
+      <li><strong>Cache the Management token</strong> (~24h) — never refetch per call.</li>
+      <li><strong><code>app_metadata</code> holds authorization data</strong> (user-uneditable); <code>user_metadata</code> holds preferences (user-editable).</li>
+      <li><strong>Use bulk import/export jobs</strong> for volume; <code>upsert=true</code> makes them idempotent.</li>
+      <li><strong>Promote config as code across separate tenants</strong> per environment; never click around in production.</li>
+      <li><strong>A JWT is signed, not encrypted</strong> — never put secrets or sensitive PII in a claim.</li>
+    </ul>
+    <div class="callout tip"><span class="tag">Tip</span><p>Next chapter dives into enterprise SSO, Single Logout, and multi-tenant SaaS — building on the Actions and Management API skills you just gained.</p></div>
+  </section>
+
+  <nav class="pager">
+    <a class="prev" href="chapter-13.html">← Previous</a>
+    <a class="next" href="chapter-15.html">Next →</a>
+  </nav>
+</main>
+<footer class="site-footer">Master Auth0 End-to-End · Chapter 14 of 32</footer>
+</body>
+</html>

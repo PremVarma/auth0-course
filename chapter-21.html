@@ -1,0 +1,727 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 21 — Project 5 — Node.js Express API | Master Auth0</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">🔐 Master Auth0</a>
+  <nav class="topnav">
+    <a href="chapter-20.html">← Prev</a>
+    <a href="index.html">Contents</a>
+    <a href="chapter-22.html">Next →</a>
+  </nav>
+</header>
+<main class="container">
+  <div class="chapter-head">
+    <span class="phase">Phase 8 · Integration Projects</span>
+    <h1>Chapter 21 — Project 5 — Node.js Express API</h1>
+    <p class="lead">Every front-end you have built so far — the SPA, the regular web app, the mobile client — eventually needs to call a <em>backend</em>. That backend must answer one question on every single request: <strong>"Who is calling me, and are they allowed to do this?"</strong> In this chapter you will build a production-grade Express API that answers that question by validating Auth0-issued JWT access tokens, enforcing scopes and fine-grained permissions, and returning the correct HTTP status (401 for "I don't know who you are" versus 403 for "I know who you are, but you may not do that"). We start from first principles — what a token actually <em>is</em>, why the API must verify a cryptographic signature rather than "ask Auth0," and how a single library, <code>express-oauth2-jwt-bearer</code>, turns that theory into three lines of middleware — then go all the way to curl/Postman testing, threat analysis, and a runnable mini-project.</p>
+  </div>
+
+  <!-- ============ 1. THEORY ============ -->
+  <section id="theory">
+    <h2>1. Theory — First Principles of Protecting an API</h2>
+    <p>An <strong>API</strong> (Application Programming Interface) is a server that exposes operations — <code>GET /api/orders</code>, <code>POST /api/orders</code>, <code>DELETE /api/orders/42</code> — to programs rather than to humans clicking buttons. Because there is no human session, the API cannot rely on a browser cookie set after a login form. Instead, the caller must present a <strong>bearer token</strong> on every request, and the API must decide, statelessly, whether to honor it.</p>
+
+    <p>To reason about this we need three precise terms from OAuth 2.0 / OpenID Connect (formalized in chapters 4–9):</p>
+    <ul>
+      <li><strong>Authentication</strong> (AuthN) — proving <em>who</em> you are. The result is an <code>id_token</code>, consumed by the <em>client</em>, never sent to the API.</li>
+      <li><strong>Authorization</strong> (AuthZ) — proving <em>what you may do</em>. The result is an <code>access_token</code>, sent to the API in the <code>Authorization: Bearer &lt;token&gt;</code> header.</li>
+      <li><strong>Resource Server</strong> — the OAuth name for your API. It is the thing the access token grants <em>access</em> to.</li>
+    </ul>
+
+    <p>The access token Auth0 issues is a <strong>JWT</strong> (JSON Web Token, RFC 7519): three Base64URL segments — <code>header.payload.signature</code> — joined by dots. The header names the signing algorithm and key id; the payload carries <em>claims</em> (issuer, audience, expiry, subject, scopes, permissions); the signature is an RSA signature over <code>header.payload</code> produced with Auth0's <strong>private key</strong>.</p>
+
+    <p><strong>The single most important first-principle of this entire chapter:</strong> the API never contacts Auth0 to validate a request. Auth0 signs tokens with a private key it never shares; it publishes the matching <em>public</em> key at a well-known URL (the JWKS endpoint). Your API downloads that public key once, caches it, and verifies the signature locally on every request. This is <strong>asymmetric cryptography</strong> (RS256): only the holder of the private key can <em>create</em> a valid signature, but anyone with the public key can <em>verify</em> one. That is why a JWT can be trusted without a database lookup or a network round-trip per request.</p>
+
+    <div class="callout key"><span class="tag">Key</span><p>Validating a JWT means checking four things, in order: (1) the <strong>signature</strong> is valid for Auth0's published public key; (2) the token has not <strong>expired</strong> (<code>exp</code>); (3) the <strong>issuer</strong> (<code>iss</code>) is exactly your Auth0 tenant; (4) the <strong>audience</strong> (<code>aud</code>) is exactly your API's identifier. Skip any one of these and you have a vulnerability, not an API.</p></div>
+
+    <p>Why issuer and audience matter so much deserves a sentence each. The <strong>issuer</strong> check stops a token minted by a <em>different</em> Auth0 tenant (or a malicious IdP) from being accepted — a valid signature alone is not enough if it was signed by the wrong party. The <strong>audience</strong> check stops a "confused deputy": a token your user legitimately obtained for <em>API A</em> must not be replayable against <em>API B</em>. The audience pins each token to exactly one resource server.</p>
+  </section>
+
+  <!-- ============ 2. STORY ============ -->
+  <section id="story">
+    <h2>2. Story-Based Explanation — The Nightclub, the Bouncer, and the Wristband</h2>
+    <p>Picture an exclusive nightclub, <em>Club Resource Server</em>. There are two doors and two staff members.</p>
+    <p>At the <strong>front door</strong> stands <em>Auth0</em>, the box office. You show ID (you log in), pay (consent), and the box office issues you a <strong>holographic wristband</strong> (the access token). Crucially, the box office does not phone the inner rooms to announce you — it simply gives you a wristband that is impossible to forge because of its hologram (the cryptographic signature).</p>
+    <p>At the <strong>inner door</strong> stands the <em>bouncer</em> — that is your Express middleware. The bouncer never calls the box office. Instead, the club received, that morning, a single laminated card showing exactly what a genuine hologram looks like under UV light (the JWKS public key). The bouncer holds your wristband under the light:</p>
+    <ul>
+      <li>No wristband at all? <strong>"You can't come in"</strong> → <code>401 Unauthorized</code>.</li>
+      <li>Wristband, but the hologram is fake or the date has passed? Still <strong>401</strong> — you have not proven you are a legitimate guest.</li>
+      <li>Genuine wristband, but it is a "general admission" band and you are trying to enter the <em>VIP lounge</em>? <strong>"I know exactly who you are — and you may not enter here"</strong> → <code>403 Forbidden</code>.</li>
+    </ul>
+    <p>The wristband also has tiny printed icons — <em>bar access</em>, <em>coat check</em>, <em>VIP</em>. Those are the <strong>scopes and permissions</strong>. The VIP-lounge bouncer checks for the VIP icon specifically; the bartender checks for the bar icon. One wristband, many doors, each door enforcing only the icon it cares about. That is exactly how the <code>auth()</code> middleware (our <code>checkJwt</code> guard) answers "is this a real guest at all" and a scope/permission check (<code>requiredScopes</code> / <code>claimCheck</code>) answers "may this specific guest do this specific thing."</p>
+    <div class="callout note"><span class="tag">Note</span><p>A naming caution: in the API world (this chapter) the "is this a real guest?" guard is <code>auth()</code> from <code>express-oauth2-jwt-bearer</code>. Do not confuse it with <code>requiresAuth()</code>, which is the equivalent guard in the <em>different</em> <code>express-openid-connect</code> SDK used for server-rendered <em>web apps</em> (Chapter 19). Same job — "must be logged in" — but two distinct libraries: tokens-for-an-API here, session-cookies-for-a-web-app there.</p></div>
+    <div class="callout note"><span class="tag">Note</span><p>The whole magic is that the bouncer is <strong>offline-capable</strong>. Even if the box office burns down for ten minutes, the bouncer keeps admitting valid wristbands because verification is local. That resilience is the business reason behind stateless JWT validation.</p></div>
+  </section>
+
+  <!-- ============ 3. ASCII DIAGRAMS ============ -->
+  <section id="diagrams">
+    <h2>3. ASCII Diagrams — The Full Request Lifecycle</h2>
+
+    <h3>3.1 End-to-end token flow (client → Auth0 → API)</h3>
+    <pre class="diagram">
+   +-----------+        1. login / get token       +------------------+
+   |           |  ------------------------------->  |     Auth0        |
+   |  CLIENT   |        (Authorization Code         |  (Authorization  |
+   |  (SPA /   |         or Client Credentials)     |     Server)      |
+   |  mobile / |  &lt;-------------------------------   |                  |
+   |  service) |        2. access_token (JWT)        |  signs w/ PRIVATE|
+   +-----------+                                     |  key (RS256)     |
+        |                                            +--------+---------+
+        | 3. GET /api/orders                                  |
+        |    Authorization: Bearer eyJ...                     | publishes
+        v                                                     v PUBLIC key
+   +--------------------------------------------------+   +---------------+
+   |            EXPRESS API (Resource Server)         |   |  JWKS URI     |
+   |  +--------------------------------------------+  |   |  /.well-known |
+   |  | express-oauth2-jwt-bearer middleware       |--+---|  /jwks.json   |
+   |  |  verify signature (cached public key)      |  |   +---------------+
+   |  |  check exp / iss / aud                     |  |   (fetched once,
+   |  |  check scope / permissions                 |  |    cached ~10 min)
+   |  +--------------------------------------------+  |
+   |        |  ok                |  bad token         |
+   |        v                    v                    |
+   |   route handler        401 / 403 JSON error      |
+   +--------------------------------------------------+
+    </pre>
+
+    <h3>3.2 The decision tree inside the middleware</h3>
+    <pre class="diagram">
+                 incoming request
+                        |
+            +-----------v-----------+
+            | Authorization header? |
+            +-----+-----------+-----+
+              no  |           | yes
+                  v           v
+              401         +---------------------+
+          (no token)      | signature valid?    |
+                          | (JWKS public key)   |
+                          +----+-----------+----+
+                            no |           | yes
+                               v           v
+                             401      +-----------------------+
+                       (bad signature) | exp / iss / aud ok?  |
+                                       +----+------------+----+
+                                         no |            | yes
+                                            v            v
+                                          401     +-----------------+
+                                  (expired/wrong   | required scope  |
+                                   iss or aud)     | / permission?   |
+                                                   +----+--------+---+
+                                                     no |        | yes
+                                                        v        v
+                                                      403     route runs
+                                              (insufficient_scope)  (200)
+    </pre>
+
+    <h3>3.3 401 vs 403 at a glance</h3>
+    <pre class="diagram">
+   +------------------+------------------------------+----------------------+
+   |  Situation       |  Meaning                     |  HTTP status         |
+   +------------------+------------------------------+----------------------+
+   |  No / bad / old  |  "I do not know who you are" |  401 Unauthorized    |
+   |  token           |  -> authenticate first       |  WWW-Authenticate:   |
+   |                  |                              |  Bearer error=...    |
+   +------------------+------------------------------+----------------------+
+   |  Valid token,    |  "I know you, you lack the   |  403 Forbidden       |
+   |  missing scope   |   right" -> do not retry     |  error=              |
+   |  /permission     |   the same way               |  insufficient_scope  |
+   +------------------+------------------------------+----------------------+
+    </pre>
+  </section>
+
+  <!-- ============ 4. ANALOGY ============ -->
+  <section id="analogy">
+    <h2>4. Real-World Analogy — The Passport and the Visa</h2>
+    <p>Think of international travel. Your <strong>passport</strong> is the <code>id_token</code>: it proves <em>who you are</em> to your own country (the client). You never hand your passport to a foreign shop — it is not for them.</p>
+    <p>To enter another country you obtain a <strong>visa</strong> stamped <em>specifically</em> for that country — that is the <code>access_token</code>, and the country name on the visa is the <strong>audience</strong>. A visa for France (API A) does not work at the German border (API B), even though both are genuine. The <strong>issuing embassy</strong> printed on the visa is the <strong>issuer</strong>; a border officer who sees a visa "issued" by an embassy that does not exist rejects it instantly.</p>
+    <p>The border officer (your middleware) does not phone the embassy on every traveler. The embassy long ago distributed the security features of genuine visas (the JWKS public key) to all border posts. The officer checks the hologram locally. Inside the visa, endorsements like "work permitted" or "study permitted" are your <strong>scopes/permissions</strong> — and the labor inspector inside the country checks the "work" endorsement specifically, just as your <code>checkScopes('write:orders')</code> guard checks one capability.</p>
+    <div class="callout tip"><span class="tag">Tip</span><p>The analogy also explains <strong>expiry</strong>: a visa has a validity window (<code>exp</code>). After it lapses you are not a criminal — you simply need to renew (the client uses a refresh token to get a fresh access token). The border officer rejecting an expired visa returns the equivalent of a <code>401</code>, not a <code>403</code>.</p></div>
+  </section>
+
+  <!-- ============ 5. INTERNAL WORKING ============ -->
+  <section id="internals">
+    <h2>5. Internal Working — What Happens Microsecond by Microsecond</h2>
+    <p>When <code>express-oauth2-jwt-bearer</code> sees a request, it performs a precise sequence. Understanding it lets you debug any "why was I rejected?" question.</p>
+    <ol>
+      <li><strong>Extract the token.</strong> It reads the <code>Authorization</code> header, confirms the <code>Bearer </code> prefix, and strips it. No header → it throws an <code>UnauthorizedError</code> (401). Per RFC 6750 the scheme is case-insensitive and there is exactly one space.</li>
+      <li><strong>Decode the header.</strong> Base64URL-decode the first segment to read <code>alg</code> (must be <code>RS256</code>) and <code>kid</code> (the key id). If <code>alg</code> is <code>none</code> or <code>HS256</code> when RS256 is expected, it rejects — this defeats the classic "alg=none" and "algorithm confusion" attacks.</li>
+      <li><strong>Fetch the public key.</strong> Using <code>kid</code>, it looks up the matching key in the JWKS document downloaded from <code>https://YOUR_DOMAIN/.well-known/jwks.json</code>. The JWKS is cached (with rate-limiting and an LRU cache) so it is fetched roughly once, not per request. If the <code>kid</code> is unknown, it refetches once (Auth0 rotates keys), then fails if still unknown.</li>
+      <li><strong>Verify the signature.</strong> It recomputes the RSA-SHA256 signature over <code>header.payload</code> using the public key and compares. A single flipped bit anywhere in the token fails this step.</li>
+      <li><strong>Validate registered claims.</strong> <code>exp</code> (not in the past, allowing a small clock-skew leeway), <code>nbf</code> (not before), <code>iss</code> === your configured <code>issuerBaseURL</code> + trailing slash, and <code>aud</code> includes your configured <code>audience</code>.</li>
+      <li><strong>Attach the result.</strong> On success it sets <code>req.auth = { header, payload, token }</code> and calls <code>next()</code>. Downstream guards read <code>req.auth.payload.scope</code> or <code>req.auth.payload.permissions</code>.</li>
+    </ol>
+    <p>The <code>scope</code> claim is a single <strong>space-delimited string</strong> (e.g. <code>"read:orders write:orders"</code>), an OAuth convention from RFC 6749. <strong>Permissions</strong> are different: when you enable RBAC and "Add Permissions in the Access Token" in your Auth0 API settings, Auth0 adds a <code>permissions</code> claim that is a JSON <em>array</em> (e.g. <code>["read:orders","write:orders"]</code>). Knowing which one your token carries is the most common source of "my scope check fails even though it shouldn't."</p>
+
+    <div class="callout note"><span class="tag">Note</span><p>The library is a thin, security-hardened wrapper over the proven <code>jose</code> / <code>express-jwt</code> + <code>jwks-rsa</code> stack. It exists so you do not hand-roll caching, clock-skew, key rotation, and algorithm pinning — each a place where a naive implementation introduces a CVE.</p></div>
+  </section>
+
+  <!-- ============ 6. CODE WALKTHROUGH ============ -->
+  <section id="walkthrough">
+    <h2>6. Code Walkthrough — Reading Every Line</h2>
+    <p>Let us build the middleware piece by piece before assembling the full server. First, configuration via environment variables — <strong>never hard-code these</strong>.</p>
+
+    <pre><code class="language-bash"># .env  (never commit this file — add it to .gitignore)
+AUTH0_ISSUER_BASE_URL=https://your-tenant.us.auth0.com/
+AUTH0_AUDIENCE=https://orders.example.com/api
+PORT=3000</code></pre>
+
+    <p>Now the core authentication middleware. <code>auth()</code> returns an Express middleware that performs every check from Section 5.</p>
+
+    <pre><code class="language-javascript">// src/middleware/auth.js
+const { auth } = require('express-oauth2-jwt-bearer');
+
+// checkJwt = "is this a real, valid token for THIS api?"
+const checkJwt = auth({
+  // The trailing slash MUST match your tenant's iss claim exactly.
+  issuerBaseURL: process.env.AUTH0_ISSUER_BASE_URL,
+  // The unique identifier you set when you created the API in Auth0.
+  audience: process.env.AUTH0_AUDIENCE,
+  // Pin the algorithm. Auth0 APIs use RS256 by default. Never allow HS256
+  // for an externally-issued token, and never allow "none".
+  tokenSigningAlg: 'RS256',
+});
+
+module.exports = { checkJwt };</code></pre>
+
+    <p>Next, the authorization guards. The library ships two helpers; we wrap them with friendly names.</p>
+
+    <pre><code class="language-javascript">// src/middleware/authz.js
+const {
+  requiredScopes,   // checks the space-delimited `scope` claim
+  claimCheck,       // generic predicate over the whole payload
+} = require('express-oauth2-jwt-bearer');
+
+// 1) Scope-based guard (works with the OAuth `scope` string claim)
+//    Usage: router.post('/', checkJwt, requireScope('write:orders'), handler)
+const requireScope = (scope) =&gt; requiredScopes(scope);
+
+// 2) Permission-based guard (works with the RBAC `permissions` ARRAY claim).
+//    requiredScopes only reads `scope`, so for permissions we use claimCheck.
+const requirePermission = (permission) =&gt;
+  claimCheck((payload) =&gt; {
+    const perms = payload.permissions || [];
+    const ok = Array.isArray(perms) &amp;&amp; perms.includes(permission);
+    if (!ok) {
+      // Throwing here yields a 403 with error=insufficient_scope
+      throw new Error(`Missing required permission: ${permission}`);
+    }
+    return true;
+  });
+
+module.exports = { requireScope, requirePermission };</code></pre>
+
+    <div class="callout warn"><span class="tag">Warn</span><p><code>requiredScopes('a b')</code> means the token needs scope <code>a</code> AND scope <code>b</code>. If you want OR-logic ("read OR write"), do not pass a space-separated string — write a custom <code>claimCheck</code> that tests membership yourself. Misreading this is a classic source of unexpected 403s.</p></div>
+
+    <p>Finally, the error handler. The library throws typed errors; we translate them into clean JSON and the correct status code.</p>
+
+    <pre><code class="language-javascript">// src/middleware/errorHandler.js
+// Express recognizes error middleware by its 4 arguments: (err, req, res, next)
+function errorHandler(err, req, res, next) {
+  // The library sets err.status (401 or 403) and err.headers (WWW-Authenticate)
+  if (err.name === 'UnauthorizedError' || err.status === 401) {
+    return res.status(401).json({
+      error: 'unauthorized',
+      message: 'Authentication required: missing, malformed, or invalid token.',
+    });
+  }
+  if (err.status === 403) {
+    return res.status(403).json({
+      error: 'insufficient_scope',
+      message: 'You are authenticated but lack the required permission.',
+    });
+  }
+  // Fallback for anything unexpected — never leak stack traces in prod.
+  console.error(err);
+  return res.status(500).json({ error: 'internal_error' });
+}
+
+module.exports = { errorHandler };</code></pre>
+  </section>
+
+  <!-- ============ 7. PRACTICAL IMPLEMENTATION ============ -->
+  <section id="practical">
+    <h2>7. Practical Implementation — The Complete <code>server.js</code></h2>
+    <p>Here is the full, runnable server wiring everything together. Public and protected routes coexist so you can see the contrast.</p>
+
+    <pre><code class="language-javascript">// server.js
+require('dotenv').config();
+const express = require('express');
+const helmet = require('helmet');
+const cors = require('cors');
+const morgan = require('morgan');
+
+const { checkJwt } = require('./src/middleware/auth');
+const { requireScope, requirePermission } = require('./src/middleware/authz');
+const { errorHandler } = require('./src/middleware/errorHandler');
+
+const app = express();
+
+// ---- Baseline hardening (order matters) ----
+app.use(helmet());                 // secure HTTP headers
+app.use(cors({ origin: true }));   // tighten origin in production
+app.use(express.json());           // parse JSON bodies
+app.use(morgan('tiny'));           // request logging
+
+// ---- PUBLIC route: no token required ----
+app.get('/api/public', (req, res) =&gt; {
+  res.json({ message: 'Anyone can read this. No token needed.' });
+});
+
+// ---- PROTECTED route: any valid token ----
+// checkJwt enforces signature + exp + iss + aud.
+app.get('/api/orders', checkJwt, (req, res) =&gt; {
+  res.json({
+    message: 'You are authenticated.',
+    subject: req.auth.payload.sub,
+    scopes: req.auth.payload.scope,
+  });
+});
+
+// ---- SCOPE-protected route: valid token AND scope 'write:orders' ----
+app.post('/api/orders', checkJwt, requireScope('write:orders'), (req, res) =&gt; {
+  res.status(201).json({ message: 'Order created.', order: req.body });
+});
+
+// ---- PERMISSION-protected route: valid token AND permission 'delete:orders' ----
+app.delete('/api/orders/:id', checkJwt, requirePermission('delete:orders'), (req, res) =&gt; {
+  res.json({ message: `Order ${req.params.id} deleted.` });
+});
+
+// ---- Error handler MUST be registered LAST ----
+app.use(errorHandler);
+
+const port = process.env.PORT || 3000;
+app.listen(port, () =&gt; console.log(`API listening on http://localhost:${port}`));
+
+module.exports = app; // exported for tests</code></pre>
+
+    <p>And the package manifest:</p>
+    <pre><code class="language-json">{
+  "name": "auth0-express-api",
+  "version": "1.0.0",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js",
+    "test": "node --test"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "express-oauth2-jwt-bearer": "^1.6.0",
+    "helmet": "^7.1.0",
+    "morgan": "^1.10.0"
+  }
+}</code></pre>
+
+    <p>Install and run:</p>
+    <pre><code class="language-bash">npm install
+npm run dev
+# -> API listening on http://localhost:3000</code></pre>
+
+    <div class="callout tip"><span class="tag">Tip</span><p>To create the matching API in Auth0: Dashboard → <strong>Applications → APIs → Create API</strong>. The <em>Identifier</em> you choose (a URI like <code>https://orders.example.com/api</code>, which need not resolve) becomes your <code>AUTH0_AUDIENCE</code>. Then enable <strong>RBAC</strong> and <strong>Add Permissions in the Access Token</strong> under the API's Settings tab so the <code>permissions</code> claim appears.</p></div>
+  </section>
+
+  <!-- ============ 8. PRODUCTION ARCHITECTURE ============ -->
+  <section id="architecture">
+    <h2>8. Production Architecture — Where This Fits in a Real System</h2>
+    <p>A single Express process is fine for learning. In production the API sits inside a larger topology. The token-validation logic stays identical, but several layers wrap it.</p>
+
+    <pre class="diagram">
+                          Internet
+                              |
+                    +---------v---------+
+                    |   CDN / WAF       |  (DDoS, rate-limit, TLS termination)
+                    +---------+---------+
+                              |
+                    +---------v---------+
+                    |  API Gateway /    |  (routing, coarse rate-limit;
+                    |  Load Balancer    |   MAY pre-validate JWT)
+                    +----+--------+-----+
+                         |        |
+              +----------v-+    +-v----------+
+              | Express    |    | Express    |   N stateless replicas.
+              | API pod 1  |    | API pod 2  |   Each validates JWT locally
+              | checkJwt   |    | checkJwt   |   -> horizontal scale is trivial
+              +-----+------+    +-----+------+
+                    |                 |
+                    +--------+--------+
+                             |
+                    +--------v--------+        +------------------+
+                    |  Database /     |        |  Auth0 JWKS      |
+                    |  downstream svc |        |  (cached per pod)|
+                    +-----------------+        +------------------+
+    </pre>
+
+    <p><strong>Why stateless validation is an architectural superpower:</strong> because each replica verifies tokens locally against a cached public key, you can run 2 pods or 200 pods with zero shared session store. There is no "sticky session," no Redis for auth, no single point of failure tied to login. Scaling the API is a pure CPU/replica problem.</p>
+
+    <p><strong>Defense in depth.</strong> An API gateway may also validate the JWT to reject junk early, but the Express service must <em>still</em> validate independently — never trust that something upstream did it. The principle is "validate at the trust boundary you own."</p>
+
+    <p><strong>Machine-to-machine.</strong> When another backend service (not a user) calls this API, it uses the <strong>Client Credentials grant</strong>: it exchanges its client id/secret for an access token whose <code>aud</code> is this API. The middleware is identical — it does not care whether a human or a service obtained the token, only that the token is valid for this audience and carries the required scope.</p>
+
+    <div class="callout note"><span class="tag">Note</span><p>Twelve-factor configuration: domain, audience, port, and log level all come from environment variables / a secrets manager (AWS Secrets Manager, Vault). The same image is promoted dev → staging → prod with only the env changing.</p></div>
+  </section>
+
+  <!-- ============ 9. SECURITY ANALYSIS ============ -->
+  <section id="security">
+    <h2>9. Security Analysis — Threats and Mitigations</h2>
+    <table>
+      <thead><tr><th>Threat</th><th>How it works</th><th>Mitigation in this design</th></tr></thead>
+      <tbody>
+        <tr><td><strong>alg=none</strong></td><td>Attacker strips the signature and sets <code>alg:"none"</code>, hoping the server skips verification.</td><td><code>tokenSigningAlg: 'RS256'</code> pins the algorithm; the library rejects <code>none</code> outright.</td></tr>
+        <tr><td><strong>Algorithm confusion (RS256→HS256)</strong></td><td>Attacker signs with HS256 using the <em>public</em> key as the HMAC secret.</td><td>Algorithm is pinned to RS256; the library never treats RSA public keys as HMAC secrets.</td></tr>
+        <tr><td><strong>Token from another tenant</strong></td><td>A valid JWT from a different Auth0 tenant or IdP.</td><td><code>iss</code> check rejects any issuer that is not your exact tenant URL.</td></tr>
+        <tr><td><strong>Confused deputy / token replay across APIs</strong></td><td>A token issued for API A is replayed against API B.</td><td><code>aud</code> check rejects any token whose audience is not this API's identifier.</td></tr>
+        <tr><td><strong>Expired / stolen old token</strong></td><td>A leaked token reused after its lifetime.</td><td><code>exp</code> check enforces short lifetimes; keep access tokens short (e.g. 1 hour) and rely on refresh tokens.</td></tr>
+        <tr><td><strong>Token leakage in logs/URLs</strong></td><td>Tokens accidentally logged or placed in query strings.</td><td>Only ever read tokens from the <code>Authorization</code> header; <code>morgan('tiny')</code> does not log headers; enforce TLS so tokens never travel in clear.</td></tr>
+        <tr><td><strong>Privilege escalation</strong></td><td>A user with read access calls a write/delete endpoint.</td><td>Per-route <code>requireScope</code>/<code>requirePermission</code> guards; default-deny on every mutating route.</td></tr>
+        <tr><td><strong>Stack-trace info leak</strong></td><td>500 errors reveal internals to an attacker.</td><td>Central <code>errorHandler</code> returns generic messages and logs details server-side only.</td></tr>
+      </tbody>
+    </table>
+
+    <div class="callout danger"><span class="tag">Danger</span><p><strong>Never</strong> use a JWT library's <code>decode()</code> result for authorization without <code>verify()</code>. <code>decode()</code> only Base64-parses the payload — it performs <em>zero</em> signature checks. Any attacker can craft a payload claiming <code>"permissions":["admin"]</code>. The whole point of this chapter is that trust comes from the verified signature, never from the readable contents.</p></div>
+
+    <div class="callout warn"><span class="tag">Warn</span><p>Always serve the API over <strong>HTTPS/TLS</strong> in production. A bearer token is exactly that — bearer — so anyone who captures it over plaintext HTTP can impersonate the user until it expires. TLS is non-negotiable.</p></div>
+  </section>
+
+  <!-- ============ 10. PERFORMANCE ============ -->
+  <section id="performance">
+    <h2>10. Performance Considerations</h2>
+    <p>Stateless JWT validation is fast, but "fast" deserves precision.</p>
+    <ul>
+      <li><strong>JWKS caching.</strong> The public key is fetched once and cached (default ~10 minutes, with an LRU of recent keys and request rate-limiting). So 99.99% of requests do <em>zero</em> network calls. Only a cold start or a key rotation triggers a fetch. Do not disable the cache.</li>
+      <li><strong>Signature verification cost.</strong> RS256 verification is an RSA public-key operation — on the order of tens of microseconds per request on modern hardware. It is CPU-bound but negligible compared to a typical DB query. There is no per-request crypto handshake.</li>
+      <li><strong>No DB lookup for auth.</strong> Because authorization data (scopes/permissions) rides inside the token, the API needs no user-table query to authorize. This is the single biggest latency win over session/DB-backed auth.</li>
+      <li><strong>Token size trade-off.</strong> Stuffing many permissions or large custom claims into the token grows every request header. Keep tokens lean; if a user has hundreds of permissions, prefer coarse scopes plus an in-API authorization model. Headers above ~8 KB can hit proxy limits.</li>
+      <li><strong>Clock skew leeway.</strong> A small leeway (a few seconds) prevents spurious 401s when the API and Auth0 clocks differ slightly. Keep servers NTP-synced so the leeway stays tiny.</li>
+      <li><strong>Connection reuse to JWKS.</strong> On cold start the first request pays the JWKS fetch. To avoid a slow first request, warm the cache at boot by making a throwaway verification, or accept a one-time ~100 ms penalty.</li>
+    </ul>
+    <div class="callout tip"><span class="tag">Tip</span><p>Benchmark with the cache warm. If you load-test from a cold process you will measure the one-time JWKS fetch as if it happened per request — a classic false alarm.</p></div>
+  </section>
+
+  <!-- ============ 11. COMMON MISTAKES ============ -->
+  <section id="mistakes">
+    <h2>11. Common Mistakes</h2>
+    <ol>
+      <li><strong>Trailing-slash mismatch on the issuer.</strong> Auth0's <code>iss</code> is <code>https://tenant.us.auth0.com/</code> <em>with</em> a trailing slash. If your <code>issuerBaseURL</code> omits it, every token is rejected with a confusing error. Match it exactly.</li>
+      <li><strong>Wrong audience.</strong> Requesting a token without the <code>audience</code> parameter yields an <em>opaque</em> token (not a JWT) intended for the <code>/userinfo</code> endpoint — your API cannot validate it. Always request a token <em>for your API's identifier</em>.</li>
+      <li><strong>Confusing <code>scope</code> with <code>permissions</code>.</strong> <code>requiredScopes</code> reads the space-delimited <code>scope</code> string only. If your tenant emits RBAC <code>permissions</code> (an array), <code>requiredScopes</code> will not see them — use <code>claimCheck</code> as shown.</li>
+      <li><strong>Registering the error handler too early.</strong> Express runs middleware in order. The 4-arg error handler must be the <em>last</em> <code>app.use</code>, or your 401/403 errors fall through to a generic 500.</li>
+      <li><strong>Returning 403 when you mean 401 (and vice-versa).</strong> Missing/invalid token = 401. Valid token, missing right = 403. Mixing them up confuses clients and breaks retry logic.</li>
+      <li><strong>Putting <code>checkJwt</code> on the public route.</strong> Apply auth per-route (or per-router), not globally, unless every route truly requires a token.</li>
+      <li><strong>Hard-coding the domain/audience.</strong> Secrets and environment-specific values belong in env vars, never in source.</li>
+      <li><strong>Logging the token.</strong> A debug <code>console.log(req.headers)</code> can leak live credentials into your log aggregator.</li>
+    </ol>
+    <div class="callout warn"><span class="tag">Warn</span><p>The "opaque token" trap (mistake #2) is the number-one beginner failure. Symptom: your token has only one or two dots when decoded, or jwt.io says "invalid." Fix: ensure the <em>client</em> requests the token with <code>audience=&lt;your API identifier&gt;</code>.</p></div>
+  </section>
+
+  <!-- ============ 12. BEST PRACTICES ============ -->
+  <section id="best-practices">
+    <h2>12. Best Practices</h2>
+    <ul>
+      <li><strong>Default deny.</strong> Protect by default; explicitly mark the few public routes. It is safer to forget to open a route than to forget to lock one.</li>
+      <li><strong>Least privilege scopes.</strong> Define narrow, verb:resource scopes (<code>read:orders</code>, <code>write:orders</code>, <code>delete:orders</code>) rather than one mega-scope. Grant the minimum each client needs.</li>
+      <li><strong>Enforce authorization at the API, not just the UI.</strong> The front-end hiding a button is UX, not security. The API guard is the real boundary.</li>
+      <li><strong>Short access-token lifetimes</strong> + refresh tokens. Minimizes the blast radius of a leaked token.</li>
+      <li><strong>Pin the algorithm</strong> to RS256 and never accept symmetric algorithms for externally issued tokens.</li>
+      <li><strong>Centralize error handling</strong> so every protected route returns consistent, non-leaky 401/403 JSON.</li>
+      <li><strong>Use RBAC + permissions</strong> in the access token for fine-grained control; reserve scopes for coarse, client-level consent.</li>
+      <li><strong>Validate independently at each trust boundary</strong> — do not assume the gateway already checked.</li>
+      <li><strong>Version your API</strong> (<code>/v1/...</code>) so you can evolve scopes/permissions without breaking callers.</li>
+      <li><strong>Write integration tests</strong> that assert 401 (no token), 403 (wrong scope), and 200 (correct token) for every protected route.</li>
+    </ul>
+  </section>
+
+  <!-- ============ 13. INTERVIEW QUESTIONS ============ -->
+  <section id="interview">
+    <h2>13. Interview Questions (with Model Answers)</h2>
+
+    <h3>Q1. Why does an API validate a JWT locally instead of calling Auth0 on every request?</h3>
+    <p><strong>Model answer:</strong> Auth0 signs tokens with a private key and publishes the matching public key at the JWKS endpoint. The API caches that public key and verifies the RS256 signature locally, so it needs no network call per request. This makes validation fast, stateless, horizontally scalable, and resilient — the API keeps working even if Auth0 is briefly unreachable, because verification depends only on the cached public key, not on an availability call.</p>
+
+    <h3>Q2. Explain the difference between 401 and 403 with concrete examples.</h3>
+    <p><strong>Model answer:</strong> 401 Unauthorized means authentication failed — no token, malformed token, bad signature, expired, or wrong issuer/audience. The client should (re-)authenticate. 403 Forbidden means authentication succeeded but the caller lacks the required permission/scope — e.g. a user with <code>read:orders</code> hitting <code>DELETE /orders/42</code> which needs <code>delete:orders</code>. Retrying with the same token will not help; the user needs additional grants.</p>
+
+    <h3>Q3. What stops a token issued for another API from being accepted by mine?</h3>
+    <p><strong>Model answer:</strong> The <code>aud</code> (audience) claim. Each token is minted for a specific API identifier, and the middleware rejects any token whose audience does not include this API. This prevents the confused-deputy / cross-API replay attack. The <code>iss</code> claim provides a parallel guarantee against tokens from a different tenant.</p>
+
+    <h3>Q4. Scope vs permission — when do you use each?</h3>
+    <p><strong>Model answer:</strong> Scopes are an OAuth concept representing what a <em>client</em> was granted, delivered as a space-delimited <code>scope</code> string; they express coarse, consent-style capability. Permissions come from Auth0 RBAC, are assigned to <em>users/roles</em>, and (when enabled) appear as a <code>permissions</code> array claim for fine-grained, per-user authorization. Scopes gate "this app may attempt order writes"; permissions gate "this particular user may delete orders."</p>
+
+    <h3>Q5. How would you defend against the alg=none and RS256→HS256 confusion attacks?</h3>
+    <p><strong>Model answer:</strong> Explicitly pin the accepted algorithm to RS256 (<code>tokenSigningAlg: 'RS256'</code>) and never accept <code>none</code> or symmetric algorithms for externally issued tokens. A correct library refuses to verify an RSA token using the public key as an HMAC secret. Always verify the signature; never authorize from a decoded-but-unverified payload.</p>
+
+    <h3>Q6. Where does the error middleware go and why?</h3>
+    <p><strong>Model answer:</strong> Last. Express identifies error-handling middleware by its four parameters and invokes it only after a thrown error or <code>next(err)</code>. Registering it after all routes ensures the library's 401/403 errors are translated into clean JSON instead of falling through to a default 500.</p>
+
+    <h3>Q7. How does a backend service (no user) call this protected API?</h3>
+    <p><strong>Model answer:</strong> Via the Client Credentials grant: the service authenticates with its own client id/secret to Auth0 and receives an access token whose audience is this API. The API's validation is identical — it only cares that the token is valid for this audience and carries the needed scope, not whether a human or machine obtained it.</p>
+
+    <h3>Q8. Your token validates on jwt.io but your API returns 401. Name three likely causes.</h3>
+    <p><strong>Model answer:</strong> (1) Issuer mismatch — missing trailing slash in <code>issuerBaseURL</code>. (2) Audience mismatch — token was requested without (or with a different) <code>audience</code>, so its <code>aud</code> does not include your API. (3) Expiry — the token is past <code>exp</code> by the time the API checks it (or clock skew between servers).</p>
+  </section>
+
+  <!-- ============ 14. CERTIFICATION TIPS ============ -->
+  <section id="cert">
+    <h2>14. Certification Tips</h2>
+    <div class="callout key"><span class="tag">Key</span><p>The Auth0 certification loves the distinction between <strong>access token</strong> (for the API, carries <code>aud</code>/scope/permissions) and <strong>ID token</strong> (for the client, identity claims). Memorize: <em>never send an ID token to an API; never use an access token to read user profile in your front-end.</em></p></div>
+    <ul>
+      <li><strong>Audience is mandatory</strong> to get a JWT access token. No audience ⇒ opaque token ⇒ not API-validatable. Exam questions test this exact trap.</li>
+      <li><strong>RBAC settings:</strong> remember the two toggles — "Enable RBAC" and "Add Permissions in the Access Token." Only the second puts the <code>permissions</code> claim in the token.</li>
+      <li><strong>RS256 vs HS256:</strong> RS256 (asymmetric) is the default and recommended; HS256 (symmetric) shares a secret and does not scale to many resource servers. Know why RS256 is preferred (public-key distribution, no shared secret).</li>
+      <li><strong>JWKS endpoint:</strong> know it lives at <code>/.well-known/jwks.json</code> and that the <code>kid</code> in the JWT header selects the key.</li>
+      <li><strong>Token lifetime &amp; refresh:</strong> access tokens are short-lived; refresh tokens obtain new ones. APIs do not handle refresh — clients do.</li>
+      <li><strong>401 vs 403</strong> mapping appears repeatedly. Lock it in.</li>
+    </ul>
+  </section>
+
+  <!-- ============ 15. HANDS-ON EXERCISES ============ -->
+  <section id="exercises">
+    <h2>15. Hands-On Exercises — curl &amp; Postman</h2>
+
+    <h3>15.1 Get an access token (Client Credentials, for testing)</h3>
+    <p>From your API's <strong>Test</strong> tab in the Auth0 Dashboard, or via curl:</p>
+    <pre><code class="language-bash">curl --request POST \
+  --url https://your-tenant.us.auth0.com/oauth/token \
+  --header 'content-type: application/json' \
+  --data '{
+    "client_id": "YOUR_M2M_CLIENT_ID",
+    "client_secret": "YOUR_M2M_CLIENT_SECRET",
+    "audience": "https://orders.example.com/api",
+    "grant_type": "client_credentials"
+  }'
+# -> { "access_token": "eyJhbGciOi...", "token_type": "Bearer", "expires_in": 86400 }</code></pre>
+
+    <h3>15.2 Test the public route (no token)</h3>
+    <pre><code class="language-bash">curl -i http://localhost:3000/api/public
+# HTTP/1.1 200 OK
+# {"message":"Anyone can read this. No token needed."}</code></pre>
+
+    <h3>15.3 Protected route WITHOUT a token → 401</h3>
+    <pre><code class="language-bash">curl -i http://localhost:3000/api/orders
+# HTTP/1.1 401 Unauthorized
+# {"error":"unauthorized","message":"Authentication required: ..."}</code></pre>
+
+    <h3>15.4 Protected route WITH a valid token → 200</h3>
+    <pre><code class="language-bash">TOKEN="eyJhbGciOi..."   # paste from 15.1
+curl -i http://localhost:3000/api/orders \
+  -H "Authorization: Bearer $TOKEN"
+# HTTP/1.1 200 OK
+# {"message":"You are authenticated.","subject":"...","scopes":"read:orders write:orders"}</code></pre>
+
+    <h3>15.5 Scope-protected route WITHOUT the scope → 403</h3>
+    <pre><code class="language-bash"># Token lacking 'write:orders'
+curl -i -X POST http://localhost:3000/api/orders \
+  -H "Authorization: Bearer $TOKEN_READONLY" \
+  -H "Content-Type: application/json" \
+  -d '{"item":"book","qty":1}'
+# HTTP/1.1 403 Forbidden
+# {"error":"insufficient_scope","message":"You are authenticated but lack the required permission."}</code></pre>
+
+    <h3>15.6 Postman recipe</h3>
+    <ol>
+      <li>Create a request <code>GET http://localhost:3000/api/orders</code>.</li>
+      <li>Go to the <strong>Authorization</strong> tab → Type = <strong>Bearer Token</strong> → paste the token. (Postman adds the <code>Authorization: Bearer ...</code> header for you.)</li>
+      <li>For automatic tokens: Authorization → Type = <strong>OAuth 2.0</strong> → Grant Type <em>Client Credentials</em>, set Access Token URL to your <code>/oauth/token</code>, client id/secret, and the <strong>audience</strong> as a scope/extra param. Click <em>Get New Access Token</em>.</li>
+      <li>Add a <strong>Tests</strong> assertion: <code>pm.test("200", () =&gt; pm.response.to.have.status(200));</code></li>
+    </ol>
+  </section>
+
+  <!-- ============ 16. ASSIGNMENT ============ -->
+  <section id="assignment">
+    <h2>16. Assignment</h2>
+    <p>Extend the API above into a small <strong>"Tasks" service</strong> and prove the security boundary with tests.</p>
+    <ol>
+      <li>Create an Auth0 API with identifier <code>https://tasks.example.com/api</code>. Define scopes/permissions: <code>read:tasks</code>, <code>write:tasks</code>, <code>delete:tasks</code>.</li>
+      <li>Implement routes: <code>GET /api/tasks</code> (requires <code>read:tasks</code>), <code>POST /api/tasks</code> (requires <code>write:tasks</code>), <code>DELETE /api/tasks/:id</code> (requires <code>delete:tasks</code>). Add one <code>GET /api/health</code> that is public.</li>
+      <li>Enable RBAC + "Add Permissions in the Access Token." Create two roles: <em>Viewer</em> (read only) and <em>Editor</em> (read+write). Assign permissions accordingly.</li>
+      <li>Using curl, capture and submit the responses proving: no-token→401, viewer-token on POST→403, editor-token on POST→201, and any-valid-token on GET→200.</li>
+      <li><strong>Stretch:</strong> add a custom <code>claimCheck</code> that allows <em>either</em> <code>delete:tasks</code> OR an <code>admin</code> permission (OR-logic), and explain why <code>requiredScopes</code> alone could not express this.</li>
+    </ol>
+    <div class="callout note"><span class="tag">Note</span><p>Deliverable: the repo plus a short README mapping each route to the exact status codes you observed. The grader is the curl transcript, not the prose.</p></div>
+  </section>
+
+  <!-- ============ 17. MINI PROJECT ============ -->
+  <section id="mini-project">
+    <h2>17. Mini Project — "Orders API" with an Automated Test Suite</h2>
+    <p>Ship the Orders API from Section 7 with a Node built-in test runner suite that does not even need Auth0 online for the negative path (the 401-no-token case requires no network), plus a guarded helper for the positive paths.</p>
+
+    <pre><code class="language-javascript">// test/api.test.js  (run with: node --test)
+const test = require('node:test');
+const assert = require('node:assert');
+const app = require('../server');
+const http = require('node:http');
+
+// minimal request helper
+function req(method, path, headers = {}, body) {
+  return new Promise((resolve) =&gt; {
+    const server = app.listen(0, () =&gt; {
+      const { port } = server.address();
+      const r = http.request({ port, method, path, headers }, (res) =&gt; {
+        let data = '';
+        res.on('data', (c) =&gt; (data += c));
+        res.on('end', () =&gt; { server.close(); resolve({ status: res.statusCode, body: data }); });
+      });
+      if (body) r.write(JSON.stringify(body));
+      r.end();
+    });
+  });
+}
+
+test('public route returns 200 without a token', async () =&gt; {
+  const res = await req('GET', '/api/public');
+  assert.strictEqual(res.status, 200);
+});
+
+test('protected route returns 401 without a token', async () =&gt; {
+  const res = await req('GET', '/api/orders');
+  assert.strictEqual(res.status, 401);
+});
+
+test('protected route returns 401 with a garbage token', async () =&gt; {
+  const res = await req('GET', '/api/orders', { Authorization: 'Bearer not.a.jwt' });
+  assert.strictEqual(res.status, 401);
+});
+
+// Positive-path test: set TEST_TOKEN env to a real token to exercise 200/201.
+test('protected route returns 200 with a valid token', async (t) =&gt; {
+  if (!process.env.TEST_TOKEN) return t.skip('set TEST_TOKEN to run');
+  const res = await req('GET', '/api/orders', { Authorization: `Bearer ${process.env.TEST_TOKEN}` });
+  assert.strictEqual(res.status, 200);
+});</code></pre>
+
+    <p>Run it:</p>
+    <pre><code class="language-bash"># negative paths run with no network:
+node --test
+# include positive paths:
+TEST_TOKEN="eyJ..." node --test</code></pre>
+
+    <p><strong>Acceptance criteria:</strong> all negative tests pass offline; with a real <code>TEST_TOKEN</code>, the positive test passes; a read-only token causes the POST route to return 403. This proves you have authentication, authorization, and correct status mapping — the three deliverables of the chapter.</p>
+  </section>
+
+  <!-- ============ 18. QUIZ ============ -->
+  <section id="quiz">
+    <h2>18. Quiz — 22 Questions</h2>
+    <ol>
+      <li>Which token does a client send to an API: ID token or access token?</li>
+      <li>What are the three dot-separated parts of a JWT?</li>
+      <li>Which signing algorithm does an Auth0 API use by default, and is it symmetric or asymmetric?</li>
+      <li>Where does the API get the key it uses to verify a token's signature?</li>
+      <li>Does the API contact Auth0 on every request to validate a token? Why or why not?</li>
+      <li>Name the four registered claims the middleware checks.</li>
+      <li>What HTTP status means "no/invalid token"?</li>
+      <li>What HTTP status means "valid token but missing permission"?</li>
+      <li>What does the <code>aud</code> claim prevent?</li>
+      <li>What does the <code>iss</code> claim prevent?</li>
+      <li>What is the difference between the <code>scope</code> claim and the <code>permissions</code> claim in shape (string vs array)?</li>
+      <li>Which library helper reads the space-delimited <code>scope</code> claim?</li>
+      <li>Which helper would you use to check a <code>permissions</code> array?</li>
+      <li>What happens if you request a token <em>without</em> an <code>audience</code> parameter?</li>
+      <li>Why must the <code>issuerBaseURL</code> include the trailing slash?</li>
+      <li>Where in the middleware chain must the error handler be registered?</li>
+      <li>What attack does pinning <code>tokenSigningAlg: 'RS256'</code> defend against?</li>
+      <li>Why is <code>decode()</code> without <code>verify()</code> dangerous?</li>
+      <li>How does a machine (no user) obtain a token for this API?</li>
+      <li>Why is stateless validation good for horizontal scaling?</li>
+      <li>Roughly how often is the JWKS document fetched in steady state?</li>
+      <li>Does <code>requiredScopes('a b')</code> mean "a OR b" or "a AND b"?</li>
+    </ol>
+
+    <details>
+      <summary>Show answer key</summary>
+      <ol>
+        <li>The <strong>access token</strong>. The ID token is for the client only.</li>
+        <li><code>header.payload.signature</code> (Base64URL-encoded, dot-separated).</li>
+        <li><strong>RS256</strong> — asymmetric (RSA + SHA-256; private key signs, public key verifies).</li>
+        <li>From the tenant's <strong>JWKS</strong> endpoint (<code>/.well-known/jwks.json</code>), cached locally; the <code>kid</code> selects the key.</li>
+        <li>No. It verifies the signature locally with the cached public key, so validation is fast, stateless, and resilient.</li>
+        <li><code>exp</code> (expiry / <code>nbf</code>), <code>iss</code> (issuer), <code>aud</code> (audience), plus a valid signature.</li>
+        <li><strong>401 Unauthorized.</strong></li>
+        <li><strong>403 Forbidden.</strong></li>
+        <li>Cross-API token replay / confused deputy — a token for API A being used against API B.</li>
+        <li>Acceptance of tokens from a different/illegitimate issuer (another tenant or IdP).</li>
+        <li><code>scope</code> is a single space-delimited <em>string</em>; <code>permissions</code> is a JSON <em>array</em>.</li>
+        <li><code>requiredScopes</code>.</li>
+        <li><code>claimCheck</code> (a custom predicate over the payload).</li>
+        <li>You get an <strong>opaque</strong> token (not a JWT) meant for <code>/userinfo</code>; your API cannot validate it.</li>
+        <li>Because Auth0's <code>iss</code> claim ends with a slash; an exact string match is required or every token is rejected.</li>
+        <li><strong>Last</strong>, after all routes (Express recognizes it by its 4 arguments).</li>
+        <li>The <code>alg=none</code> and RS256→HS256 algorithm-confusion attacks.</li>
+        <li><code>decode()</code> performs no signature check — an attacker can forge any payload; trust requires <code>verify()</code>.</li>
+        <li>Via the <strong>Client Credentials</strong> grant (client id/secret → token with this API's audience).</li>
+        <li>Each replica validates independently against a cached public key — no shared session store, so adding replicas is trivial.</li>
+        <li>About once per cache window (~10 minutes) plus on key rotation/cold start — effectively never per request.</li>
+        <li>"a <strong>AND</strong> b" — both scopes are required. Use a custom <code>claimCheck</code> for OR-logic.</li>
+      </ol>
+    </details>
+  </section>
+
+  <!-- ============ 19. CHEAT SHEET ============ -->
+  <section id="cheatsheet">
+    <h2>19. Cheat Sheet</h2>
+    <pre class="diagram">
+INSTALL      npm i express express-oauth2-jwt-bearer dotenv helmet cors
+
+AUTH         const { auth } = require('express-oauth2-jwt-bearer');
+(any valid    const checkJwt = auth({
+ token)         issuerBaseURL: process.env.AUTH0_ISSUER_BASE_URL, // trailing slash!
+                audience:      process.env.AUTH0_AUDIENCE,        // your API id
+                tokenSigningAlg: 'RS256',                         // pin algorithm
+              });
+
+SCOPE        const { requiredScopes } = require('express-oauth2-jwt-bearer');
+             app.post('/x', checkJwt, requiredScopes('write:orders'), handler);
+
+PERMISSION   const { claimCheck } = require('express-oauth2-jwt-bearer');
+(RBAC array) claimCheck(p =&gt; (p.permissions||[]).includes('delete:orders'));
+
+ERRORS       401 = no/invalid/expired token        (authenticate)
+             403 = valid token, missing scope/perm (insufficient_scope)
+             register errorHandler LAST: app.use((err,req,res,next)=&gt;{...})
+
+CLAIMS       iss = exact tenant URL      aud = your API identifier
+             exp = expiry                scope = "a b c" (string)
+             sub = user/subject id       permissions = ["a","b"] (array, RBAC)
+
+GET TOKEN    POST /oauth/token  grant_type=client_credentials
+             body needs: client_id, client_secret, audience
+
+TEST         curl -H "Authorization: Bearer $TOKEN" http://localhost:3000/api/orders
+
+GOLDEN RULE  Verify the SIGNATURE. Never authorize from a decoded-but-
+             unverified payload. Audience pins the token to THIS api.
+    </pre>
+  </section>
+
+  <!-- ============ 20. KEY TAKEAWAYS ============ -->
+  <section id="takeaways">
+    <h2>20. Key Takeaways</h2>
+    <div class="callout key"><span class="tag">Key</span><p>An API protects itself by <strong>validating a JWT access token locally</strong> on every request — checking signature, expiry, issuer, and audience — using Auth0's cached public key. No per-request call to Auth0 is needed; that is what makes it fast, stateless, and scalable.</p></div>
+    <ul>
+      <li><strong>Three lines of middleware</strong> (<code>auth({ issuerBaseURL, audience, tokenSigningAlg })</code>) deliver signature + <code>exp</code> + <code>iss</code> + <code>aud</code> validation. That is the entire authentication boundary.</li>
+      <li><strong>Authentication ≠ authorization.</strong> <code>checkJwt</code> answers "is this a real, valid token?" (401 if not); <code>requiredScopes</code>/<code>claimCheck</code> answer "may this caller do this?" (403 if not).</li>
+      <li><strong>401 vs 403</strong> is the contract with your clients: 401 = (re)authenticate; 403 = you lack the right, do not bother retrying.</li>
+      <li><strong>Audience pins each token to one API</strong>; issuer pins it to your tenant. Together they stop replay and impersonation across APIs.</li>
+      <li><strong>Scope (string) vs permissions (array).</strong> Know which your token carries — it is the #1 cause of unexpected 403s.</li>
+      <li><strong>Pin RS256, never trust a decoded payload, always use TLS.</strong> Security comes from the verified signature, not the readable contents.</li>
+      <li><strong>Register the error handler last</strong> and keep its messages generic — clean 401/403 JSON, no stack traces.</li>
+    </ul>
+    <p>You can now take any Express service and turn it into a hardened Auth0-protected resource server — the same pattern you will reuse for every backend in the rest of this course and in production.</p>
+  </section>
+
+  <nav class="pager">
+    <a class="prev" href="chapter-20.html">← Previous</a>
+    <a class="next" href="chapter-22.html">Next →</a>
+  </nav>
+</main>
+<footer class="site-footer">Master Auth0 End-to-End · Chapter 21 of 32</footer>
+</body>
+</html>

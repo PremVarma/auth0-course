@@ -1,0 +1,724 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 8 — OIDC Tokens: Validation, Introspection and Revocation | Master Auth0</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">🔐 Master Auth0</a>
+  <nav class="topnav">
+    <a href="chapter-07.html">← Prev</a>
+    <a href="index.html">Contents</a>
+    <a href="chapter-09.html">Next →</a>
+  </nav>
+</header>
+<main class="container">
+  <div class="chapter-head">
+    <span class="phase">Phase 3 · OpenID Connect</span>
+    <h1>Chapter 8 — OIDC Tokens: Validation, Introspection and Revocation</h1>
+    <p class="lead">In Chapter 7 you learned how OpenID Connect mints an ID token and how the login dance produces it. But a token you do not verify is just a string an attacker can forge. This chapter is the rigorous, first-principles guide to what happens <em>after</em> a token lands in your hands: how to validate an ID token claim-by-claim, how to check a cryptographic signature using JWKS and the <code>kid</code>, how a resource server validates an access token, when to call the introspection endpoint (RFC 7662) instead of validating locally, how to revoke tokens (RFC 7009), how to handle expiry and refresh without locking users out, and how to log a user out everywhere. Get this right and you have built the trust boundary your entire system depends on; get it wrong and every other security control is decoration.</p>
+  </div>
+
+  <!-- 1 -->
+  <section id="theory">
+    <h2>1. Theory — First Principles of Token Trust</h2>
+    <p>A token is a <strong>bearer credential</strong>: whoever holds it is treated as the subject it describes. That single fact drives everything in this chapter. If a token can be presented by anyone who possesses it, then the only thing standing between your system and an impostor is your ability to answer one question with certainty: <em>"Is this token genuine, intended for me, and still valid right now?"</em></p>
+
+    <p>To answer that question we decompose it into three independent properties, each of which must hold:</p>
+    <ul>
+      <li><strong>Authenticity / Integrity</strong> — Was this token issued by the authority I trust (Auth0), and has a single byte been changed since? This is answered by verifying the <em>digital signature</em>.</li>
+      <li><strong>Intended audience</strong> — Was this token minted <em>for me</em>, or for some other application? A token valid for App A must be rejected by App B. This is the <code>aud</code> (and for ID tokens, the relationship between <code>aud</code> and your client ID) check.</li>
+      <li><strong>Freshness / Liveness</strong> — Is the token within its valid time window (<code>exp</code>, <code>iat</code>, <code>nbf</code>), and has it not been revoked since issuance?</li>
+    </ul>
+
+    <p>There are two fundamentally different validation strategies, and choosing between them is one of the most important architectural decisions in OIDC:</p>
+
+    <table>
+      <thead><tr><th>Strategy</th><th>How it works</th><th>Network cost</th><th>Revocation awareness</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Local / stateless validation</strong></td><td>Verify the JWT signature with the issuer's public key, then check the claims. No call to the issuer per request.</td><td>Zero (keys cached)</td><td>None until the token expires</td></tr>
+        <tr><td><strong>Introspection (RFC 7662)</strong></td><td>POST the token to the authorization server's <code>/introspect</code> endpoint; it returns <code>active: true/false</code> plus claims.</td><td>One round-trip per request</td><td>Immediate — the server is the source of truth</td></tr>
+      </tbody>
+    </table>
+
+    <div class="callout key"><span class="tag">Key</span><p>JWT access tokens are validated <em>locally</em> (fast, scalable, but blind to revocation until expiry). Opaque tokens <em>must</em> be introspected (a network call, but always authoritative). This trade-off — speed vs. immediacy — is the central tension of token validation, and you will meet it again in performance, security, and architecture.</p></div>
+
+    <p>The reason we can validate locally at all is <strong>asymmetric cryptography</strong>. Auth0 signs tokens with a private key (RS256 by default) that never leaves Auth0. It publishes the matching <em>public</em> key at a well-known URL. Anyone can verify a signature with the public key, but only Auth0 can produce one with the private key. That asymmetry is what lets thousands of API instances verify tokens without ever talking to Auth0 and without sharing any secret.</p>
+  </section>
+
+  <!-- 2 -->
+  <section id="story">
+    <h2>2. Story-Based Explanation — The Forged Wristband</h2>
+    <p>Imagine a three-day music festival. At the gate you show your ticket once and receive a tamper-evident wristband. For the rest of the festival, the wristband <em>is</em> your authorization — staff at the beer tent, the VIP area, and the backstage gate never re-check your ticket; they glance at the wristband.</p>
+
+    <p>Now consider how a wristband fails — and how each failure maps exactly to a token claim:</p>
+    <ul>
+      <li><strong>A counterfeit wristband</strong> — printed by a scalper. Staff defeat this by checking the <em>hologram</em> only the festival's printer can produce. That hologram is the <strong>signature</strong>. No hologram, no entry.</li>
+      <li><strong>Yesterday's wristband</strong> — last year's color, or a Day-1 band on Day-2. That is <strong>expiry</strong> (<code>exp</code>).</li>
+      <li><strong>A general-admission band at the backstage gate</strong> — genuine, in-date, but not minted for <em>that</em> area. That is wrong <strong>audience</strong> (<code>aud</code>) and missing <strong>scope</strong>.</li>
+      <li><strong>A band cut off an ejected troublemaker</strong> — genuine and in-date, but the holder was thrown out an hour ago. The hologram still checks out; only a <em>radio call to security HQ</em> reveals it is void. That radio call is <strong>introspection</strong>, and cutting the band is <strong>revocation</strong>.</li>
+    </ul>
+
+    <p>The festival deliberately uses cheap, local hologram checks at most gates (fast, no radio needed) and reserves the slow radio-to-HQ check for the highest-value backstage gate. That is exactly the JWT-vs-introspection trade-off. And the reason a cut wristband can still pass a hologram check is the same reason a revoked-but-unexpired JWT still passes local validation: the local check has no knowledge of events that happened after the band was issued.</p>
+
+    <div class="callout note"><span class="tag">Note</span><p>Hold this analogy in your head for the whole chapter. Every algorithm below is just "checking the hologram, the color/date, the zone, and — when it matters enough — radioing HQ."</p></div>
+  </section>
+
+  <!-- 3 -->
+  <section id="diagrams">
+    <h2>3. ASCII Diagrams — The Validation Pipelines</h2>
+
+    <h3>3.1 ID Token validation (client-side, after login)</h3>
+<pre class="diagram">
+  ID TOKEN ARRIVES (from /oauth/token, code exchange)
+  +-------------------------------------------------------------+
+  | header.payload.signature  (three base64url parts)           |
+  +-------------------------------------------------------------+
+        |
+        v
+  [1] Decode header  --> read "alg" and "kid"
+        |  alg must be RS256 (reject "none"/HS256 surprise)
+        v
+  [2] Fetch JWKS from issuer ----> https://TENANT/.well-known/jwks.json
+        |  pick the JWK whose "kid" == header.kid
+        v
+  [3] Verify SIGNATURE with that public key  --(fail)--> REJECT
+        |  (pass)
+        v
+  [4] iss  == https://TENANT/         ? --(no)--> REJECT
+  [5] aud  contains MY client_id      ? --(no)--> REJECT
+  [6] exp  >  now (with leeway)       ? --(no)--> REJECT
+  [7] iat  reasonable / nbf &lt;= now    ? --(no)--&gt; REJECT
+  [8] nonce == nonce I sent           ? --(no)--> REJECT  (replay!)
+  [9] azp  == client_id (if multi-aud)? --(no)--> REJECT
+        |  ALL pass
+        v
+  ACCEPT --> establish a USER SESSION (the ID token's job is done)
+</pre>
+
+    <h3>3.2 Access token validation (server-side, every API call)</h3>
+<pre class="diagram">
+  Client                Your API (Resource Server)         Auth0 (JWKS)
+    |  Authorization: Bearer eyJ...   |                        |
+    |-------------------------------->|                        |
+    |                                 | header.kid -> need key  |
+    |                                 |--- GET jwks.json ------&gt;|   (cached!)
+    |                                 |&lt;-- public keys ---------|
+    |                                 | verify signature        |
+    |                                 | check iss / aud(=API id)|
+    |                                 | check exp / scope/perms |
+    |        200  (claims trusted)    |                        |
+    |&lt;--------------------------------|                        |
+    |        401/403 (invalid)        |                        |
+    |&lt;--------------------------------|                        |
+</pre>
+
+    <h3>3.3 Introspection vs. local validation (decision)</h3>
+<pre class="diagram">
+                     Token received
+                          |
+              is it a JWT (3 dots, RS256)?
+                /                      \
+             yes                        no (opaque / ?)
+              |                          |
+       LOCAL VALIDATION           INTROSPECT (RFC 7662)
+       verify sig + claims        POST /oauth/token/introspect
+       (no network per req)       Authorization: Basic client:secret
+              |                    token=...&amp;token_type_hint=access_token
+              |                          |
+        accept/reject              { "active": true, "scope": "...",
+                                     "exp": ..., "sub": ... }  -> trust
+                                   { "active": false } -> REJECT
+</pre>
+
+    <h3>3.4 Refresh + revocation lifecycle</h3>
+<pre class="diagram">
+   login ──► [access_token 15m] + [refresh_token (long-lived, rotating)]
+                 |                          |
+        every request uses AT              |
+                 |                          |
+        AT expires (401) ─────────────────►|
+                 |                  POST /oauth/token
+                 |                  grant_type=refresh_token
+                 |◄──── new AT + new RT (old RT now invalid) ◄──
+                 |
+   logout / breach ──► POST /oauth/revoke  token=&lt;refresh_token&gt;
+                       ──► RT family killed; AT dies at its own exp
+</pre>
+  </section>
+
+  <!-- 4 -->
+  <section id="analogy">
+    <h2>4. Real-World Analogy — Passport vs. Visa vs. Border Phone Call</h2>
+    <p>Think of crossing an international border.</p>
+    <ul>
+      <li>An <strong>ID token</strong> is your <em>passport</em>: it proves <em>who you are</em> and is checked once at immigration to let you into the country (your app establishes a session). You do not show your passport to buy a coffee inside the country — its job ends at the door.</li>
+      <li>An <strong>access token</strong> is a <em>visa stamped for specific activities</em>: it says <em>what you may do</em> (scopes/permissions) and at which <em>destination</em> (the <code>aud</code> = the specific API). The coffee shop (your API) checks the visa, not the passport.</li>
+      <li><strong>Local validation</strong> is the border officer recognizing the security features of the passport — watermarks, the chip, the issuing-country seal — <em>without phoning the issuing government</em>. Fast, and trustworthy because the document is tamper-evident.</li>
+      <li><strong>Introspection</strong> is the officer actually <em>phoning the issuing authority</em> to ask "is passport #X still valid?" — slower, but it catches a passport that was reported stolen <em>after</em> it was printed.</li>
+      <li><strong>Revocation</strong> is the issuing government <em>cancelling</em> a passport in its central database. The physical document still looks perfect; only a phone call (introspection) reveals it is void.</li>
+    </ul>
+    <div class="callout tip"><span class="tag">Tip</span><p>The analogy explains the single most counter-intuitive fact in this chapter: <strong>revoking a JWT access token does not stop it from passing local validation.</strong> The cancelled passport still has valid watermarks. Only introspection — or waiting for expiry — closes that window. This is why you keep JWT access-token lifetimes short.</p></div>
+  </section>
+
+  <!-- 5 -->
+  <section id="internal">
+    <h2>5. Internal Working — Signatures, JWKS, and the <code>kid</code></h2>
+
+    <h3>5.1 How an RS256 signature is produced and verified</h3>
+    <p>A JWT is <code>base64url(header) + "." + base64url(payload) + "." + base64url(signature)</code>. With RS256:</p>
+    <ol>
+      <li>Auth0 computes <code>signing_input = base64url(header) + "." + base64url(payload)</code>.</li>
+      <li>It hashes the signing input with SHA-256, then encrypts that hash with its <em>RSA private key</em>. The result is the signature.</li>
+      <li>Your code re-computes the SHA-256 hash of the signing input, then uses Auth0's <em>RSA public key</em> to verify that the signature decrypts to the same hash.</li>
+    </ol>
+    <p>Because only the holder of the private key can produce a signature that verifies against the public key, a valid signature simultaneously proves <em>authenticity</em> (it came from Auth0) and <em>integrity</em> (the payload was not altered — any change flips the hash).</p>
+
+    <h3>5.2 JWKS — the public key directory</h3>
+    <p>Auth0 publishes its public keys as a <strong>JWKS</strong> (JSON Web Key Set) document at <code>https://YOUR_TENANT/.well-known/jwks.json</code>. Each entry is a JWK:</p>
+<pre><code class="language-json">{
+  "keys": [
+    {
+      "kty": "RSA",          // key type
+      "use": "sig",          // used for signatures
+      "kid": "abc123KEYID",  // KEY ID — matches the JWT header's "kid"
+      "n":   "0vx7agoeb...",  // RSA modulus  (base64url)
+      "e":   "AQAB",          // RSA exponent (base64url)
+      "alg": "RS256",
+      "x5c": ["MIID...certificate..."]
+    }
+  ]
+}</code></pre>
+
+    <h3>5.3 Why <code>kid</code> exists: key rotation</h3>
+    <p>Auth0 periodically rotates signing keys (and you can force a rotation). During rotation, tokens signed with the <em>old</em> key are still in the wild while new tokens use the <em>new</em> key. So the JWKS often contains <strong>multiple</strong> keys at once. The JWT header's <code>kid</code> tells you exactly which public key to use, eliminating guesswork:</p>
+<pre class="diagram">
+   JWT header: { "alg":"RS256", "kid":"NEW_KEY_2" }
+                                        |
+                                        v   match by kid
+   JWKS: [ {kid:"OLD_KEY_1", ...},  {kid:"NEW_KEY_2", ...} ]
+                                          ^^^^^^^^^^^^^ use this one
+</pre>
+    <div class="callout warn"><span class="tag">Warn</span><p>Never hard-code a single public key or pin one <code>kid</code>. When Auth0 rotates keys, hard-coded validation breaks for <em>all</em> users at once. Always resolve the key dynamically from JWKS by <code>kid</code>, and <strong>cache the JWKS</strong> (do not fetch it on every request — see §10).</p></div>
+
+    <h3>5.4 The OIDC discovery document</h3>
+    <p>You should not hard-code the JWKS URL either. Every OIDC provider publishes a <strong>discovery document</strong> at <code>/.well-known/openid-configuration</code> that links to the JWKS, the token, authorization, introspection, revocation, and end-session endpoints. Libraries fetch this automatically. See §20's OIDC metadata reference.</p>
+  </section>
+
+  <!-- 6 -->
+  <section id="walkthrough">
+    <h2>6. Code Walkthrough — Validation by Hand, Then by Library</h2>
+
+    <h3>6.1 Node.js — manual ID-token validation (to see every step)</h3>
+    <p>This is intentionally explicit so you understand what libraries do for you. <strong>In production use a library</strong> (§7), but read this once.</p>
+<pre><code class="language-javascript">import jwt from 'jsonwebtoken';
+import { JwksClient } from 'jwks-rsa';
+
+const ISSUER   = 'https://YOUR_TENANT.us.auth0.com/';
+const AUDIENCE = 'YOUR_CLIENT_ID';            // ID token aud = client_id
+
+const jwks = new JwksClient({
+  jwksUri: `${ISSUER}.well-known/jwks.json`,
+  cache: true, cacheMaxEntries: 5, cacheMaxAge: 600000, // 10 min cache
+  rateLimit: true, jwksRequestsPerMinute: 10
+});
+
+// (1) resolve the signing key by the header's kid
+function getKey(header, callback) {
+  jwks.getSigningKey(header.kid, (err, key) =&gt; {
+    if (err) return callback(err);
+    callback(null, key.getPublicKey());
+  });
+}
+
+export function validateIdToken(idToken, expectedNonce) {
+  return new Promise((resolve, reject) =&gt; {
+    jwt.verify(idToken, getKey, {
+      algorithms: ['RS256'],          // (2) PIN the algorithm — reject "none"
+      issuer:   ISSUER,               // (3) iss must match exactly
+      audience: AUDIENCE,             // (4) aud must contain my client_id
+      clockTolerance: 60              // (5) 60s leeway for clock skew on exp/iat
+    }, (err, claims) =&gt; {
+      if (err) return reject(err);            // signature/iss/aud/exp failures
+      if (claims.nonce !== expectedNonce)     // (6) replay protection
+        return reject(new Error('nonce mismatch'));
+      resolve(claims);                        // (7) trusted user profile
+    });
+  });
+}</code></pre>
+
+    <div class="callout danger"><span class="tag">Danger</span><p>The single most dangerous mistake is omitting <code>algorithms: ['RS256']</code>. Without it, some libraries will honor an attacker-supplied <code>"alg":"none"</code> token (no signature) or an <code>HS256</code> token signed with your <em>public</em> key as if it were a shared secret. Always pin the algorithm to RS256 (or your configured asymmetric alg).</p></div>
+
+    <h3>6.2 curl — see the discovery doc and JWKS</h3>
+<pre><code class="language-bash"># 1. The discovery document — the map of every endpoint
+curl -s https://YOUR_TENANT.us.auth0.com/.well-known/openid-configuration | jq
+
+# 2. The public keys used to verify signatures
+curl -s https://YOUR_TENANT.us.auth0.com/.well-known/jwks.json | jq '.keys[].kid'
+
+# 3. Decode a token locally (NO verification — inspection only!)
+echo "eyJhbGciOi..." | cut -d. -f2 | base64 -d 2&gt;/dev/null | jq</code></pre>
+  </section>
+
+  <!-- 7 -->
+  <section id="implementation">
+    <h2>7. Practical Implementation — Production Validators per Stack</h2>
+
+    <h3>7.1 Java Spring Boot — resource server (access-token validation)</h3>
+    <p>Spring Security validates JWTs, resolves JWKS by <code>kid</code>, and caches keys for you. You configure the issuer and a custom audience validator.</p>
+<pre><code class="language-yaml"># application.yml
+spring:
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: https://YOUR_TENANT.us.auth0.com/
+          # issuer-uri triggers auto-discovery of jwks_uri from
+          # /.well-known/openid-configuration
+
+app:
+  auth0:
+    audience: https://api.cinema.example.com   # your API Identifier</code></pre>
+
+<pre><code class="language-java">@Configuration
+@EnableMethodSecurity
+public class SecurityConfig {
+
+  @Value("${app.auth0.audience}") String audience;
+  @Value("${spring.security.oauth2.resourceserver.jwt.issuer-uri}") String issuer;
+
+  @Bean
+  SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+    http.authorizeHttpRequests(a -&gt; a
+          .requestMatchers("/public/**").permitAll()
+          .requestMatchers("/admin/**").hasAuthority("SCOPE_read:admin")
+          .anyRequest().authenticated())
+        .oauth2ResourceServer(o -&gt; o.jwt(j -&gt; j.decoder(jwtDecoder())));
+    return http.build();
+  }
+
+  @Bean
+  JwtDecoder jwtDecoder() {
+    // NimbusJwtDecoder fetches JWKS, selects key by kid, verifies RS256,
+    // and caches keys (default 5 min) automatically.
+    NimbusJwtDecoder decoder = JwtDecoders.fromIssuerLocation(issuer);
+
+    OAuth2TokenValidator&lt;Jwt&gt; withAudience =
+        new DelegatingOAuth2TokenValidator&lt;&gt;(
+            JwtValidators.createDefaultWithIssuer(issuer), // iss + exp
+            audienceValidator());                          // aud
+    decoder.setJwtValidator(withAudience);
+    return decoder;
+  }
+
+  private OAuth2TokenValidator&lt;Jwt&gt; audienceValidator() {
+    return jwt -&gt; jwt.getAudience().contains(audience)
+        ? OAuth2TokenValidatorResult.success()
+        : OAuth2TokenValidatorResult.failure(
+            new OAuth2Error("invalid_token", "Missing required audience", null));
+  }
+}</code></pre>
+
+    <h3>7.2 FastAPI — dependency that validates the access token</h3>
+<pre><code class="language-python">import jwt                       # pip install "pyjwt[crypto]"
+from jwt import PyJWKClient
+from fastapi import Depends, HTTPException, Security
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+
+ISSUER   = "https://YOUR_TENANT.us.auth0.com/"
+AUDIENCE = "https://api.cinema.example.com"
+JWKS_URL = f"{ISSUER}.well-known/jwks.json"
+
+jwks_client = PyJWKClient(JWKS_URL, cache_keys=True, lifespan=600)  # cache 10m
+bearer = HTTPBearer()
+
+def verify_token(cred: HTTPAuthorizationCredentials = Security(bearer)) -&gt; dict:
+    token = cred.credentials
+    try:
+        signing_key = jwks_client.get_signing_key_from_jwt(token)  # by kid
+        claims = jwt.decode(
+            token, signing_key.key,
+            algorithms=["RS256"],          # pin algorithm
+            audience=AUDIENCE,             # aud check
+            issuer=ISSUER,                 # iss check
+            leeway=60,                     # clock skew tolerance
+        )                                  # exp/iat enforced automatically
+        return claims
+    except jwt.PyJWTError as e:
+        raise HTTPException(status_code=401, detail=f"Invalid token: {e}")
+
+def require_scope(scope: str):
+    def checker(claims: dict = Depends(verify_token)):
+        if scope not in claims.get("scope", "").split():
+            raise HTTPException(status_code=403, detail="Insufficient scope")
+        return claims
+    return checker
+
+# usage:
+# @app.get("/bookings")
+# def list_bookings(claims = Depends(require_scope("read:bookings"))): ...</code></pre>
+
+    <h3>7.3 React (SPA) — let the SDK manage tokens, you consume them</h3>
+    <p>In an SPA you do <em>not</em> validate the access token (your API does). You let <code>@auth0/auth0-react</code> store and refresh tokens, and you attach the access token to API calls.</p>
+<pre><code class="language-jsx">import { useAuth0 } from '@auth0/auth0-react';
+
+function useApi() {
+  const { getAccessTokenSilently } = useAuth0();
+  return async function call(path) {
+    // getAccessTokenSilently transparently uses the refresh token /
+    // silent-auth iframe to obtain a fresh access token when needed.
+    const token = await getAccessTokenSilently({
+      authorizationParams: { audience: 'https://api.cinema.example.com',
+                             scope: 'read:bookings' }
+    });
+    const res = await fetch(`https://api.cinema.example.com${path}`, {
+      headers: { Authorization: `Bearer ${token}` }
+    });
+    if (res.status === 401) throw new Error('token rejected');
+    return res.json();
+  };
+}</code></pre>
+
+    <h3>7.4 Next.js (App Router) — server-side session + logout</h3>
+<pre><code class="language-javascript">// app/api/auth/[auth0]/route.js  — Auth0 Next.js SDK v3
+import { handleAuth, handleLogout } from '@auth0/nextjs-auth0';
+
+export const GET = handleAuth({
+  // RP-initiated logout: clears the local session cookie AND redirects to
+  // Auth0's /v2/logout (end-session) so the IdP session is cleared too.
+  logout: handleLogout({ returnTo: 'https://app.cinema.example.com' })
+});</code></pre>
+
+    <h3>7.5 Postman — calling a protected API</h3>
+<pre><code class="language-text">1. Authorization tab -&gt; Type: OAuth 2.0
+2. Configure:
+     Grant Type:      Authorization Code (With PKCE)
+     Auth URL:        https://YOUR_TENANT/authorize
+     Token URL:       https://YOUR_TENANT/oauth/token
+     Client ID:       &lt;spa or web app client id&gt;
+     Scope:           openid profile read:bookings
+     Audience (extra param): https://api.cinema.example.com
+3. "Get New Access Token" -&gt; Postman runs the flow, stores the token.
+4. "Use Token" -&gt; Postman adds  Authorization: Bearer &lt;token&gt;  automatically.
+5. Inspect the token at jwt.io or via the Visualizer to read claims.</code></pre>
+  </section>
+
+  <!-- 8 -->
+  <section id="architecture">
+    <h2>8. Production Architecture — Where Validation Lives</h2>
+
+    <p>In a real system, token validation is not a single line in one service. It is a layered defense distributed across the edge, the gateway, and each service. Here is a reference layout for a microservices platform behind Auth0:</p>
+
+<pre class="diagram">
+                     Internet
+                        |
+        +---------------v----------------+
+        |        CDN / WAF (edge)         |  rate limit, block obvious junk
+        +---------------+----------------+
+                        |
+        +---------------v----------------+
+        |     API GATEWAY  (Kong/Envoy)   |  FIRST validation:
+        |  - verify RS256 sig via JWKS    |  signature + iss + exp
+        |  - JWKS cached (shared)         |  reject 80% of bad tokens here
+        |  - strips/normalizes headers    |
+        +---------------+----------------+
+                        | (validated, with claims forwarded)
+        +-----------+---+----+-----------+
+        |           |        |           |
+   +----v---+  +----v---+  +-v------+  +-v------+
+   | orders |  |payments|  |catalog |  | users  |   each service:
+   | svc    |  | svc    |  | svc    |  | svc    |   - re-checks aud(=its API)
+   +--------+  +--------+  +--------+  +--------+   - checks scope/permissions
+        |                                          (defense in depth)
+   payments svc, being high-value, ALSO introspects
+   the token (RFC 7662) for immediate revocation awareness.
+</pre>
+
+    <div class="callout key"><span class="tag">Key</span><p><strong>Validate at the gateway, re-authorize at the service.</strong> The gateway proves the token is genuine and unexpired (cheap, centralized). Each service still checks that the token's audience matches <em>that</em> service's API identifier and that the required scope/permission is present — because a token valid for the catalog API must not be accepted by the payments API.</p></div>
+
+    <h3>8.1 Hybrid validation pattern</h3>
+    <p>The pragmatic production pattern combines both strategies:</p>
+    <ul>
+      <li><strong>Default: local JWT validation everywhere</strong> with short access-token TTL (e.g. 10–15 min). This gives you scale.</li>
+      <li><strong>High-value or sensitive operations introspect</strong> (payments, account deletion, admin). This gives those paths immediate revocation awareness.</li>
+      <li><strong>Optional revocation cache</strong>: maintain a short-TTL deny-list (e.g. in Redis) of <code>jti</code> values revoked since issuance, populated by an Auth0 Log Stream / webhook. Services consult it during local validation to get near-immediate revocation without per-request introspection.</li>
+    </ul>
+  </section>
+
+  <!-- 9 -->
+  <section id="security">
+    <h2>9. Security Analysis — Attacks and Defenses</h2>
+
+    <table>
+      <thead><tr><th>Attack</th><th>What the attacker does</th><th>Defense</th></tr></thead>
+      <tbody>
+        <tr><td><code>alg: none</code></td><td>Strips the signature, sets alg to <code>none</code>, hoping you skip verification.</td><td>Pin <code>algorithms: ['RS256']</code>. Never accept <code>none</code>.</td></tr>
+        <tr><td>Algorithm confusion (RS256→HS256)</td><td>Signs an HS256 token using your <em>public</em> key as the HMAC secret; a naive verifier that trusts the header's alg accepts it.</td><td>Pin the expected algorithm; never let the token's header choose the verification algorithm.</td></tr>
+        <tr><td>Audience confusion</td><td>Replays a token issued for API-A against API-B.</td><td>Validate <code>aud</code> equals <em>this</em> API's identifier on every service.</td></tr>
+        <tr><td>Token replay (ID token)</td><td>Reuses a captured ID token from a previous login.</td><td><code>nonce</code> binding: the ID token's nonce must equal the one you generated for that login attempt.</td></tr>
+        <tr><td>Expired-token acceptance</td><td>Uses a token after <code>exp</code>.</td><td>Enforce <code>exp</code> with small leeway; keep TTL short.</td></tr>
+        <tr><td>JWKS spoofing / SSRF</td><td>Tricks the verifier into fetching keys from an attacker URL (e.g. via a header-controlled <code>jku</code>).</td><td>Hard-pin the issuer; derive jwks_uri only from the trusted discovery doc; use TLS; never trust a key URL from the token header.</td></tr>
+        <tr><td>Refresh-token theft</td><td>Steals a long-lived refresh token from storage.</td><td><strong>Refresh token rotation</strong> + automatic reuse detection: reusing a rotated RT revokes the whole family.</td></tr>
+        <tr><td>Revocation blindness</td><td>Keeps using a JWT after the user was disabled/logged out.</td><td>Short TTL + introspection (or a revocation deny-list) on sensitive paths.</td></tr>
+      </tbody>
+    </table>
+
+    <div class="callout danger"><span class="tag">Danger</span><p><strong>Never store tokens in <code>localStorage</code> for sensitive apps.</strong> It is readable by any XSS payload. Prefer httpOnly, Secure, SameSite cookies managed by a backend (the BFF pattern) so JavaScript can never read the token. An access token in <code>localStorage</code> is one XSS away from full account takeover, and it cannot be revoked fast enough to matter.</p></div>
+
+    <h3>9.1 Refresh token rotation &amp; reuse detection</h3>
+    <p>With rotation, every refresh returns a <em>new</em> refresh token and invalidates the old one. If an attacker who stole an RT uses it after the legitimate client has already rotated, Auth0 sees a <em>used</em> token being replayed and revokes the entire token family — logging the victim out and locking out the thief. This converts silent theft into a detectable event.</p>
+  </section>
+
+  <!-- 10 -->
+  <section id="performance">
+    <h2>10. Performance Considerations</h2>
+    <ul>
+      <li><strong>Cache the JWKS.</strong> Fetching <code>jwks.json</code> on every request adds a network round-trip to Auth0 and can trip rate limits. Cache it (5–10 min is typical) and refresh only on a <code>kid</code> miss. Libraries (Nimbus, jwks-rsa, PyJWKClient) do this for you — make sure caching is enabled.</li>
+      <li><strong>Local validation is essentially free.</strong> An RS256 verify is a few hundred microseconds of CPU. This is why JWTs scale: 10,000 API instances can each verify independently with no shared state and no per-request call to Auth0.</li>
+      <li><strong>Introspection costs a round-trip per request.</strong> Reserve it for high-value paths, or cache introspection results for a few seconds keyed by token hash to amortize cost (accepting a small revocation-latency window).</li>
+      <li><strong>Handle the <code>kid</code>-miss path gracefully.</strong> On a key you do not have (post-rotation), refresh the JWKS <em>once</em> and retry — but rate-limit those refreshes so a flood of bad <code>kid</code>s cannot become a self-inflicted DoS against Auth0.</li>
+      <li><strong>Right-size token lifetimes.</strong> Shorter access tokens = better revocation latency but more refreshes (more load on Auth0). Longer = fewer refreshes but a bigger revocation window. 10–15 min access / rotating refresh is a common balance.</li>
+    </ul>
+    <div class="callout tip"><span class="tag">Tip</span><p>Measure validation latency. If token validation shows up in your p99, the cause is almost always an un-cached JWKS fetch or per-request introspection — not the crypto.</p></div>
+  </section>
+
+  <!-- 11 -->
+  <section id="mistakes">
+    <h2>11. Common Mistakes</h2>
+    <ul>
+      <li><strong>Not validating the signature at all</strong> — decoding the JWT and trusting the claims. Decoding ≠ verifying. Anyone can craft a payload.</li>
+      <li><strong>Forgetting to pin the algorithm</strong> — opening the door to <code>alg:none</code> and RS256→HS256 confusion.</li>
+      <li><strong>Skipping the <code>aud</code> check</strong> — accepting any valid-from-Auth0 token, letting a token for one API work on another.</li>
+      <li><strong>Validating an access token like an ID token (or vice versa)</strong> — ID token <code>aud</code> = client_id; access token <code>aud</code> = API identifier. They are different.</li>
+      <li><strong>Reading user data from the access token</strong> — access tokens are for authorization, may be opaque, and their format is not contractually stable. Get profile data from the ID token or <code>/userinfo</code>.</li>
+      <li><strong>Hard-coding a public key or <code>kid</code></strong> — breaks on rotation.</li>
+      <li><strong>Fetching JWKS on every request</strong> — latency and rate-limit problems.</li>
+      <li><strong>No clock-skew leeway</strong> — tokens randomly rejected when server clocks drift a few seconds.</li>
+      <li><strong>Treating logout as "delete the cookie"</strong> — the Auth0 (IdP) session survives, so the next login is silent and the user is "still logged in." You must call the end-session endpoint.</li>
+      <li><strong>Revoking the access token and assuming it stops working</strong> — RFC 7009 revocation primarily targets refresh tokens; a JWT access token keeps validating locally until <code>exp</code>.</li>
+    </ul>
+  </section>
+
+  <!-- 12 -->
+  <section id="best-practices">
+    <h2>12. Best Practices</h2>
+    <ul>
+      <li>Always verify the signature against JWKS, resolving the key by <code>kid</code>; cache JWKS.</li>
+      <li>Always pin <code>algorithms</code> to your asymmetric alg (RS256). Reject <code>none</code> and symmetric algs.</li>
+      <li>Always check <code>iss</code>, <code>aud</code>, and <code>exp</code> (and <code>nonce</code> for ID tokens, <code>azp</code> for multi-audience).</li>
+      <li>Use a battle-tested library; do not hand-roll JWT verification in production.</li>
+      <li>Keep access tokens short-lived; use refresh-token rotation with reuse detection.</li>
+      <li>Store tokens securely: httpOnly/Secure cookies or a backend session (BFF), never <code>localStorage</code> for sensitive apps.</li>
+      <li>Introspect (or use a revocation deny-list) on high-value operations to close the revocation gap.</li>
+      <li>Implement full OIDC logout: clear the local session <em>and</em> call the end-session endpoint, then revoke the refresh token.</li>
+      <li>Allow small clock leeway (30–60s). Use NTP-synced servers.</li>
+      <li>Get user profile data from the ID token / <code>/userinfo</code>, not the access token.</li>
+    </ul>
+  </section>
+
+  <!-- 13 -->
+  <section id="interview">
+    <h2>13. Interview Questions (with model answers)</h2>
+
+    <h3>Q1. Walk me through validating an ID token end-to-end.</h3>
+    <p><strong>Model answer:</strong> Split the JWT into header/payload/signature. Read <code>alg</code> and <code>kid</code> from the header. Fetch the issuer's JWKS (cached), select the JWK whose <code>kid</code> matches, and verify the RS256 signature over <code>header.payload</code> using that public key — pinning the algorithm to RS256 to prevent <code>alg:none</code>/confusion attacks. Then check claims: <code>iss</code> equals the exact issuer, <code>aud</code> contains my client_id, <code>exp</code> is in the future (with leeway), <code>iat</code>/<code>nbf</code> are sane, and <code>nonce</code> matches the value I generated for this login. If all pass, establish a session.</p>
+
+    <h3>Q2. Why use JWTs if you can't revoke them instantly?</h3>
+    <p><strong>Model answer:</strong> JWTs trade instant revocation for stateless scalability — any service can verify them with cached public keys and no call to the IdP, which is essential at scale. You mitigate the revocation gap with short lifetimes, refresh-token rotation, and introspection or a revocation deny-list on sensitive paths. It's a deliberate trade-off, not a flaw.</p>
+
+    <h3>Q3. When would you choose introspection over local validation?</h3>
+    <p><strong>Model answer:</strong> When tokens are opaque (no JWT to verify), when you need immediate revocation awareness (payments, admin actions, account deletion), or when the authorization server must be the single source of truth. The cost is a network round-trip per request, so I reserve it for high-value paths and rely on local validation elsewhere.</p>
+
+    <h3>Q4. What's the difference between an ID token and an access token, and how does validation differ?</h3>
+    <p><strong>Model answer:</strong> The ID token is for the <em>client</em> — it proves authentication and carries the user's identity; its <code>aud</code> is the client_id and it should never be sent to APIs. The access token is for the <em>resource server</em> — it authorizes API calls; its <code>aud</code> is the API identifier and it carries scopes/permissions. Validation differs mainly in the audience: ID token <code>aud</code> = client_id and includes a <code>nonce</code> check; access token <code>aud</code> = API identifier with scope checks.</p>
+
+    <h3>Q5. How does <code>kid</code> support key rotation?</h3>
+    <p><strong>Model answer:</strong> During rotation the JWKS holds both old and new keys. The token header's <code>kid</code> identifies which public key signed it, so the verifier picks the right one without guessing. This lets the provider rotate keys without invalidating tokens already issued under the previous key.</p>
+
+    <h3>Q6. A user reports they're "still logged in" after logout. Diagnose.</h3>
+    <p><strong>Model answer:</strong> Logout only cleared the local app session/cookie but didn't call Auth0's end-session (<code>/v2/logout</code>) endpoint, so the IdP session cookie persists and the next <code>/authorize</code> silently re-authenticates. Fix: implement RP-initiated logout that redirects to the end-session endpoint, and revoke the refresh token so it can't mint new access tokens.</p>
+
+    <h3>Q7. How would you implement near-instant revocation for JWTs?</h3>
+    <p><strong>Model answer:</strong> Combine short TTLs with a revocation deny-list keyed by <code>jti</code>/<code>sub</code> in a fast store like Redis, populated by Auth0 Log Streams/webhooks on logout/disable events; local validators consult it. For the strongest guarantee, introspect on sensitive endpoints so the authorization server is authoritative.</p>
+  </section>
+
+  <!-- 14 -->
+  <section id="certification">
+    <h2>14. Certification Tips</h2>
+    <ul>
+      <li><strong>Know the exact validation checklist</strong> for ID tokens: signature, <code>iss</code>, <code>aud</code>, <code>exp</code>, <code>iat</code>, <code>nonce</code> (and <code>azp</code> when multiple audiences). Exam questions love asking "which check prevents replay?" → <code>nonce</code>.</li>
+      <li><strong>RFC numbers:</strong> Introspection = <strong>RFC 7662</strong>; Revocation = <strong>RFC 7009</strong>; PKCE = RFC 7636; Bearer usage = RFC 6750. Memorize these.</li>
+      <li><strong>Endpoints:</strong> discovery <code>/.well-known/openid-configuration</code>, keys <code>/.well-known/jwks.json</code>, introspect <code>/oauth/token/introspect</code> (Auth0), revoke <code>/oauth/revoke</code>, logout <code>/v2/logout</code> (or <code>/oidc/logout</code> for OIDC-spec end_session).</li>
+      <li><strong>Audience rule:</strong> ID token <code>aud</code> = client_id; access token <code>aud</code> = API identifier. This is a classic distractor.</li>
+      <li><strong>Revocation reality:</strong> revoking primarily affects refresh tokens; JWT access tokens validate locally until expiry. Expect a "what actually happens" question.</li>
+      <li><strong>Default signing alg in Auth0 is RS256</strong> (asymmetric). HS256 is symmetric and unsuitable when many parties validate.</li>
+      <li><strong>Refresh token rotation + reuse detection</strong> is the recommended pattern for SPAs/native apps — know why (mitigates theft of long-lived tokens).</li>
+    </ul>
+  </section>
+
+  <!-- 15 -->
+  <section id="exercises">
+    <h2>15. Hands-On Exercises</h2>
+    <ol>
+      <li><strong>Inspect a real token.</strong> Log in to any Auth0 app, copy the access token, decode it at jwt.io. Identify <code>iss</code>, <code>aud</code>, <code>exp</code>, <code>scope</code>, <code>kid</code>. Convert <code>exp</code> to a human time.</li>
+      <li><strong>Fetch and match keys.</strong> Run the curl commands in §6.2. Confirm the token's header <code>kid</code> appears in the JWKS.</li>
+      <li><strong>Break it on purpose.</strong> Change one character in the token payload and send it to your API. Confirm a 401 (signature fails). Then tamper with only the signature — confirm 401 again.</li>
+      <li><strong>Wrong audience.</strong> Request a token for a <em>different</em> API identifier and call your API with it. Confirm a 401/403 from the audience check.</li>
+      <li><strong>Expire it.</strong> Set your API's token lifetime to 60s in the Auth0 dashboard, get a token, wait 70s, call the API. Confirm an expiry rejection.</li>
+      <li><strong>Introspect.</strong> Using a machine-to-machine app's credentials, POST a token to the introspection endpoint and read the <code>active</code> field.</li>
+      <li><strong>Revoke.</strong> Obtain a refresh token, POST it to <code>/oauth/revoke</code>, then try to use it to get a new access token. Confirm it fails.</li>
+    </ol>
+  </section>
+
+  <!-- 16 -->
+  <section id="assignment">
+    <h2>16. Assignment</h2>
+    <p>Build a small <strong>resource server</strong> in your preferred stack (Spring Boot, FastAPI, or Node/Express) that protects two endpoints:</p>
+    <ul>
+      <li><code>GET /me</code> — requires a valid access token (any authenticated caller).</li>
+      <li><code>DELETE /account</code> — requires scope <code>delete:account</code> <em>and</em> performs a live <strong>introspection</strong> call before proceeding (so a revoked token is rejected even before its local expiry).</li>
+    </ul>
+    <p>Requirements: validate <code>iss</code>, <code>aud</code>, <code>exp</code>; pin RS256; resolve keys via cached JWKS; return <code>401</code> for invalid/expired tokens and <code>403</code> for insufficient scope. Write three integration tests: valid token → 200, tampered token → 401, wrong-audience token → 401. Document why <code>/account</code> uses introspection while <code>/me</code> does not.</p>
+  </section>
+
+  <!-- 17 -->
+  <section id="mini-project">
+    <h2>17. Mini Project — "Revoke-and-Verify" Console</h2>
+    <p>Create a CLI/web tool that demonstrates the full token lifecycle against your Auth0 tenant:</p>
+    <ol>
+      <li><strong>Login</strong> via Authorization Code + PKCE; capture the ID token, access token, and refresh token.</li>
+      <li><strong>Validate</strong> the ID token locally (full checklist) and print each check's pass/fail.</li>
+      <li><strong>Introspect</strong> the access token and display the JSON response.</li>
+      <li><strong>Refresh</strong> using the refresh token; show that a <em>new</em> refresh token is issued (rotation) and the old one no longer works.</li>
+      <li><strong>Revoke</strong> the refresh token via <code>/oauth/revoke</code>; then attempt a refresh and show it fails.</li>
+      <li><strong>Logout</strong> by redirecting to the end-session endpoint and confirm the next <code>/authorize</code> prompts for credentials again.</li>
+    </ol>
+    <p>Deliverable: a README that explains, for each step, <em>which</em> property (authenticity, audience, freshness, revocation) you exercised and what a failure would mean in production.</p>
+  </section>
+
+  <!-- 18 -->
+  <section id="quiz">
+    <h2>18. Quiz — 22 Questions</h2>
+    <ol>
+      <li>What three properties must token validation establish?</li>
+      <li>Which claim prevents ID-token replay attacks?</li>
+      <li>What does the <code>kid</code> in a JWT header point to?</li>
+      <li>Where is the JWKS published for an Auth0 tenant?</li>
+      <li>Why must you pin <code>algorithms</code> to RS256?</li>
+      <li>What is the <code>aud</code> of a correctly issued ID token?</li>
+      <li>What is the <code>aud</code> of an access token meant for your API?</li>
+      <li>Which RFC defines token introspection?</li>
+      <li>Which RFC defines token revocation?</li>
+      <li>What field in an introspection response tells you the token is usable?</li>
+      <li>Does revoking a JWT access token immediately stop local validation? Why/why not?</li>
+      <li>What does refresh-token rotation protect against?</li>
+      <li>What happens when a rotated (already-used) refresh token is replayed?</li>
+      <li>Why should you cache the JWKS instead of fetching it per request?</li>
+      <li>What is the RS256→HS256 algorithm-confusion attack?</li>
+      <li>Why is reading user profile data from the access token a bad idea?</li>
+      <li>What does the OIDC discovery document at <code>/.well-known/openid-configuration</code> provide?</li>
+      <li>Why does deleting the app's session cookie not fully log a user out of Auth0?</li>
+      <li>Name two situations where introspection is preferable to local validation.</li>
+      <li>Why is a small clock-skew leeway recommended on <code>exp</code>/<code>iat</code>?</li>
+      <li>In a microservices setup, why does each service re-check <code>aud</code> even though the gateway already validated the token?</li>
+      <li>What is the security risk of storing access tokens in <code>localStorage</code>?</li>
+    </ol>
+
+    <details>
+      <summary>Show answer key</summary>
+      <ol>
+        <li>Authenticity/integrity (signature), intended audience (<code>aud</code>), and freshness/liveness (<code>exp</code>/not revoked).</li>
+        <li>The <code>nonce</code> claim, matched against the value the client generated for that login.</li>
+        <li>It identifies which public key in the JWKS was used to sign the token.</li>
+        <li>At <code>https://YOUR_TENANT/.well-known/jwks.json</code>.</li>
+        <li>To prevent <code>alg:none</code> (no signature) and RS256→HS256 confusion attacks; never let the token header choose the verification algorithm.</li>
+        <li>The application's <code>client_id</code>.</li>
+        <li>The API's identifier/audience (e.g. <code>https://api.cinema.example.com</code>).</li>
+        <li>RFC 7662.</li>
+        <li>RFC 7009.</li>
+        <li>The <code>active</code> boolean (<code>true</code> = usable).</li>
+        <li>No. A JWT validates locally against the signature and claims; revocation isn't checked locally, so it keeps passing until <code>exp</code> (or until introspection/deny-list catches it).</li>
+        <li>Theft of long-lived refresh tokens — each use issues a new RT and invalidates the old.</li>
+        <li>Reuse detection triggers and the entire refresh-token family is revoked, logging out victim and attacker.</li>
+        <li>Per-request fetches add latency and can hit Auth0 rate limits; keys change rarely, so caching (with refresh on <code>kid</code> miss) is far more efficient.</li>
+        <li>An attacker signs an HS256 token using the RSA <em>public</em> key as the HMAC secret; a verifier that trusts the header's alg accepts it as valid.</li>
+        <li>Access tokens are for authorization, may be opaque, and have no stable contract for profile fields; use the ID token or <code>/userinfo</code>.</li>
+        <li>A machine of all OIDC endpoints and capabilities: issuer, authorization, token, jwks_uri, userinfo, introspection, revocation, end_session, supported algorithms/scopes.</li>
+        <li>Because Auth0 maintains its own IdP session cookie; without calling the end-session endpoint, the next <code>/authorize</code> silently re-authenticates.</li>
+        <li>Opaque tokens (nothing to verify locally) and high-value/sensitive operations needing immediate revocation awareness.</li>
+        <li>Server clocks drift; a few seconds of leeway prevents valid tokens from being wrongly rejected at the boundary.</li>
+        <li>Defense in depth: a token valid for API-A must not be accepted by API-B, so each service confirms the <code>aud</code> matches its own identifier.</li>
+        <li><code>localStorage</code> is readable by any XSS payload, so a single script-injection leaks the token and enables account takeover.</li>
+      </ol>
+    </details>
+  </section>
+
+  <!-- 19 -->
+  <section id="cheatsheet">
+    <h2>19. Cheat Sheet</h2>
+<pre class="diagram">
+ID TOKEN CHECKS            ACCESS TOKEN CHECKS
+  [x] signature (RS256)      [x] signature (RS256)
+  [x] iss == issuer          [x] iss == issuer
+  [x] aud == client_id       [x] aud == API identifier
+  [x] exp &gt; now (+leeway)     [x] exp &gt; now (+leeway)
+  [x] iat / nbf sane         [x] scope / permissions present
+  [x] nonce == sent nonce    [x] (high value) introspect
+  [x] azp == client_id*
+
+ENDPOINTS (Auth0)
+  discovery : /.well-known/openid-configuration
+  keys      : /.well-known/jwks.json
+  token     : /oauth/token
+  introspect: /oauth/token/introspect      (RFC 7662)
+  revoke    : /oauth/revoke                 (RFC 7009)
+  userinfo  : /userinfo
+  logout    : /v2/logout  |  /oidc/logout (end_session)
+
+RFCs:  7662 introspect | 7009 revoke | 6750 bearer | 7636 PKCE
+
+LOCAL vs INTROSPECT
+  local  -> fast, stateless, blind to revocation until exp
+  introspect -> 1 round-trip, authoritative, immediate
+
+REVOKE: targets refresh tokens; JWT access tokens live until exp
+FIX REVOCATION GAP: short TTL + rotation + deny-list/introspect
+</pre>
+<pre><code class="language-bash"># Introspect (RFC 7662) — Auth0 (M2M client credentials)
+curl -X POST https://YOUR_TENANT/oauth/token/introspect \
+  -u "CLIENT_ID:CLIENT_SECRET" \
+  -d "token=ACCESS_OR_REFRESH_TOKEN" \
+  -d "token_type_hint=access_token"
+# -> { "active": true, "scope": "...", "exp": ..., "sub": "..." }
+
+# Revoke (RFC 7009) — refresh token
+curl -X POST https://YOUR_TENANT/oauth/revoke \
+  -H "Content-Type: application/json" \
+  -d '{ "client_id":"CLIENT_ID",
+        "client_secret":"CLIENT_SECRET",
+        "token":"REFRESH_TOKEN" }'
+# -> 200 OK (empty body) whether or not the token existed</code></pre>
+  </section>
+
+  <!-- 20 -->
+  <section id="takeaways">
+    <h2>20. Key Takeaways</h2>
+    <div class="callout key"><span class="tag">Key</span><p>A token is a bearer credential; <strong>validation is the entire trust boundary.</strong> Validation answers three questions: is it authentic (signature), is it for me (<code>aud</code>), and is it fresh (<code>exp</code>/not revoked).</p></div>
+    <div class="callout key"><span class="tag">Key</span><p>Verify signatures with the issuer's <strong>public key from JWKS</strong>, selected by <code>kid</code>, and <strong>cache the JWKS</strong>. Always <strong>pin the algorithm</strong> to RS256 to defeat <code>alg:none</code> and RS256→HS256 confusion.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p><strong>ID token <code>aud</code> = client_id; access token <code>aud</code> = API identifier.</strong> ID tokens establish sessions and need a <code>nonce</code> check; access tokens authorize API calls and need scope checks.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p><strong>Local validation</strong> is fast and stateless but blind to revocation until expiry; <strong>introspection (RFC 7662)</strong> is authoritative but costs a round-trip. Use local everywhere, introspect on high-value paths.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p><strong>Revocation (RFC 7009)</strong> primarily kills refresh tokens; JWT access tokens keep validating until <code>exp</code>. Close the gap with short TTLs, refresh-token rotation with reuse detection, and a deny-list or introspection.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p><strong>Real logout = clear local session + call the end-session endpoint + revoke the refresh token.</strong> Deleting a cookie alone leaves the Auth0 session alive and re-logs the user in silently.</p></div>
+  </section>
+
+  <nav class="pager">
+    <a class="prev" href="chapter-07.html">← Previous</a>
+    <a class="next" href="chapter-09.html">Next →</a>
+  </nav>
+</main>
+<footer class="site-footer">Master Auth0 End-to-End · Chapter 8 of 32</footer>
+</body>
+</html>

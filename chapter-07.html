@@ -1,0 +1,752 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 7 — OpenID Connect Core | Master Auth0</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">🔐 Master Auth0</a>
+  <nav class="topnav">
+    <a href="chapter-06.html">← Prev</a>
+    <a href="index.html">Contents</a>
+    <a href="chapter-08.html">Next →</a>
+  </nav>
+</header>
+<main class="container">
+  <div class="chapter-head">
+    <span class="phase">Phase 3 · OpenID Connect</span>
+    <h1>Chapter 7 — OpenID Connect Core</h1>
+    <p class="lead">OAuth 2.0 answered the question <em>"may this app access that resource?"</em> — it is an <strong>authorization</strong> framework and, by design, says nothing about <em>who</em> the user is. OpenID Connect (OIDC) is the thin, standardized <strong>identity layer</strong> bolted on top of OAuth 2.0 that finally answers <em>"who just logged in, and how do I trust that answer?"</em> In this chapter you will learn OIDC from first principles: the ID token, the discovery document, JWKS key rotation, the <code>nonce</code> replay defense, the userinfo endpoint, the standard scopes and claims, and the full Authorization Code flow end-to-end — with runnable code in Node, Spring Boot, FastAPI, React/Next.js, plus curl and Postman. By the end you will be able to implement, secure, debug, and explain OIDC at a senior level.</p>
+  </div>
+
+  <!-- 1 -->
+  <section id="theory">
+    <h2>1. Theory — First Principles</h2>
+    <p>Start with the gap. OAuth 2.0 (Chapter 5–6) is a <strong>delegated authorization</strong> protocol. A client obtains an <strong>access token</strong> — an opaque or JWT credential that grants access to an API (a "resource server"). Crucially, the access token is <em>for the API, not for the client</em>. It is not designed to tell the client application anything reliable about the end user. The access token's audience is the resource server; reading user identity out of it is, at best, an implementation accident and, at worst, a security hole.</p>
+    <p>People nonetheless tried to do authentication with raw OAuth 2.0 ("log in with X"). They invented ad-hoc tricks: hit a proprietary <code>/me</code> endpoint with the access token, trust whatever comes back. This produced incompatible, insecure pseudo-standards (the infamous "OAuth login" confusion). Two failure modes dominated:</p>
+    <ul>
+      <li><strong>Access token as proof of identity</strong> — an access token leaked from one app could be replayed at another app's "login with this token" endpoint (the <em>confused deputy</em> / <em>token substitution</em> attack).</li>
+      <li><strong>No standard identity contract</strong> — every provider returned user data in a different shape, with no signed, verifiable assertion the client could validate offline.</li>
+    </ul>
+    <p><strong>OpenID Connect 1.0</strong> (finalized 2014, still current in 2026) fixes this by defining:</p>
+    <ol>
+      <li>A new artifact, the <strong>ID token</strong> — a signed JWT whose <em>audience is the client</em> and whose purpose is to assert "this user authenticated, here is who they are, here is when and how."</li>
+      <li>A reserved scope, <code>openid</code>, that <em>turns an OAuth request into an OIDC request</em>. No <code>openid</code> scope → no ID token → it is plain OAuth.</li>
+      <li>Standard <strong>claims</strong> (name, email, sub, etc.) and a <strong>userinfo</strong> endpoint to fetch them.</li>
+      <li>Self-describing metadata: the <strong>discovery document</strong> and the <strong>JWKS</strong> key endpoint, so a client can configure itself and verify signatures automatically.</li>
+      <li>Replay defenses: <code>nonce</code> (binds the ID token to a specific browser request) on top of OAuth's <code>state</code> (CSRF defense).</li>
+    </ol>
+    <div class="callout key"><span class="tag">Key</span><p>One-sentence mental model: <strong>OAuth 2.0 gets you an access token to call an API; OpenID Connect additionally gets you an ID token that proves who logged in.</strong> OIDC = OAuth 2.0 + identity contract. It reuses every OAuth endpoint and adds the ID token, the <code>openid</code> scope, userinfo, and discovery.</p></div>
+    <p>Why a <em>JWT</em> for the ID token? Because the client must verify it <strong>without calling the server</strong>. A signed JWT carries its own proof: the issuer signs it with a private key; the client validates it with the matching public key (from JWKS). That makes login stateless and tamper-evident. We will dissect every validation step in §5 and §9.</p>
+  </section>
+
+  <!-- 2 -->
+  <section id="story">
+    <h2>2. Story-Based Explanation</h2>
+    <p>Imagine <strong>Maya</strong>, a developer building "PhotoVault," a web app that lets users back up photos. She wants two things: (1) let users sign in with their existing identity, and (2) later call a "Cloud Drive" API on their behalf.</p>
+    <p><strong>Act I — the OAuth-only mistake.</strong> Maya first wires plain OAuth 2.0. PhotoVault redirects the user to the identity provider, gets an access token back, and calls Cloud Drive's <code>/me</code>. It works in the demo. But a security researcher, <strong>Theo</strong>, shows her an exploit: he builds a malicious app, tricks a victim into authorizing it, captures the <em>victim's</em> access token, and pastes it into PhotoVault's "log in with token" endpoint. PhotoVault calls <code>/me</code>, sees the victim's profile, and logs Theo in <em>as the victim</em>. The access token had no notion of "which client am I for" that PhotoVault checked. Identity by access token is broken.</p>
+    <p><strong>Act II — the OIDC fix.</strong> Maya adds <code>scope=openid profile email</code> and a random <code>nonce</code>. Now the provider returns an <strong>ID token</strong> alongside the access token. The ID token is a signed JWT that says: <code>iss</code> = the provider, <code>aud</code> = PhotoVault's exact client_id, <code>sub</code> = the user's stable ID, <code>nonce</code> = the value Maya generated, plus <code>iat</code>/<code>exp</code>. PhotoVault verifies the signature against the provider's published public key, checks <code>aud</code> equals its own client_id, and checks <code>nonce</code> matches what it sent. Theo's stolen token is useless: even if he steals an ID token, its <code>aud</code> is some other app, and he cannot forge a new signature.</p>
+    <p><strong>Act III — separation of concerns.</strong> Maya now uses the <em>ID token</em> to establish the login session (who the user is) and the <em>access token</em> to call Cloud Drive (what the app may do). Two tokens, two jobs. When she needs the access token to outlive its short life, she adds <code>offline_access</code> to get a <em>refresh token</em>. Three tokens, three jobs — and she never confuses them again.</p>
+    <div class="callout note"><span class="tag">Note</span><p>The moral of Maya's story is the single most-tested OIDC fact: <strong>never use an access token to identify a user, and never send an ID token to an API to authorize access.</strong> ID token = identity, for the client. Access token = authorization, for the API.</p></div>
+  </section>
+
+  <!-- 3 -->
+  <section id="diagrams">
+    <h2>3. ASCII Diagrams</h2>
+    <h3>3.1 The layering: OIDC sits on OAuth 2.0</h3>
+<pre class="diagram">
+        +-------------------------------------------------------+
+        |                 OpenID Connect 1.0                    |
+        |   ID token  ·  userinfo  ·  nonce  ·  discovery       |
+        |   standard claims  ·  openid scope  ·  JWKS use       |
+        +-------------------------------------------------------+
+        |                   OAuth 2.0 core                      |
+        |  /authorize  ·  /token  ·  access & refresh tokens    |
+        |  grants: auth code (+PKCE), client creds, ...         |
+        +-------------------------------------------------------+
+        |          HTTPS / TLS  ·  JSON  ·  JWS/JWT             |
+        +-------------------------------------------------------+
+  OIDC adds an identity LAYER; it does not replace OAuth, it extends it.
+</pre>
+    <h3>3.2 The three tokens at a glance</h3>
+<pre class="diagram">
+   ID TOKEN                ACCESS TOKEN              REFRESH TOKEN
+   --------                ------------              -------------
+   audience = CLIENT       audience = API           audience = AUTH SERVER
+   "who logged in"         "what app may do"        "get me new tokens"
+   ALWAYS a JWT            JWT or opaque            opaque (usually)
+   client verifies         API verifies             only /token consumes
+   short-lived             short-lived (mins)       long-lived (days+)
+        |                       |                         |
+        v                       v                         v
+   establish session       call protected API       silent renewal
+</pre>
+    <h3>3.3 OIDC Authorization Code flow (end-to-end)</h3>
+<pre class="diagram">
+ User-Agent        Client (PhotoVault)        Auth Server (Auth0)      API
+ (browser)                                     /authorize /token        (Cloud Drive)
+    |                     |                          |                     |
+    |  1. click "Login"   |                          |                     |
+    |-------------------->|                          |                     |
+    |                     | 2. build redirect:       |                     |
+    |                     |    response_type=code     |                     |
+    |                     |    scope=openid profile   |                     |
+    |                     |    state=S  nonce=N        |                     |
+    |                     |    code_challenge=C (PKCE) |                     |
+    |  3. 302 to /authorize ------------------------->|                     |
+    |<--------------------|                          |                     |
+    |  4. GET /authorize?...                          |                     |
+    |----------------------------------------------->|                     |
+    |  5. user authenticates + consents              |                     |
+    |<================ login UI =====================|                     |
+    |  6. 302 back: redirect_uri?code=AUTH&state=S    |                     |
+    |<-----------------------------------------------|                     |
+    |  7. browser hits client redirect_uri           |                     |
+    |-------------------->|                          |                     |
+    |                     | 8. verify state == S      |                     |
+    |                     | 9. POST /token            |                     |
+    |                     |    code=AUTH              |                     |
+    |                     |    code_verifier=V (PKCE) |                     |
+    |                     |    client_secret (conf.)  |                     |
+    |                     |------------------------->|                     |
+    |                     | 10. { id_token,           |                     |
+    |                     |       access_token,        |                     |
+    |                     |       refresh_token }      |                     |
+    |                     |<-------------------------|                     |
+    |                     | 11. verify id_token:      |                     |
+    |                     |     sig(JWKS), iss, aud,   |                     |
+    |                     |     exp, nonce == N        |                     |
+    |                     | 12. create app session     |                     |
+    |  13. set session cookie, redirect to app        |                     |
+    |<--------------------|                          |                     |
+    |                     | 14. call API with access_token ---------------->|
+    |                     |                          |   verify token, serve|
+    |                     |<-----------------------------------------------|
+</pre>
+    <h3>3.4 Discovery + JWKS bootstrap</h3>
+<pre class="diagram">
+  Client startup
+       |
+       | GET https://YOUR.auth0.com/.well-known/openid-configuration
+       v
+  +----------------------------+        contains URLs for:
+  | discovery document (JSON)  |--->  issuer, authorization_endpoint,
+  +----------------------------+      token_endpoint, userinfo_endpoint,
+       |                              jwks_uri, response_types_supported...
+       | GET jwks_uri
+       v
+  +----------------------------+      array of public keys, each with a
+  | JWKS  { "keys": [ ... ] }  |--->  "kid" (key id). Client caches them.
+  +----------------------------+
+       |
+       | later: ID token header says { "alg":"RS256", "kid":"abc" }
+       v
+  pick key with kid="abc"  -->  verify ID token signature OFFLINE
+</pre>
+  </section>
+
+  <!-- 4 -->
+  <section id="analogy">
+    <h2>4. Real-World Analogy</h2>
+    <p>Think of an international airport.</p>
+    <ul>
+      <li><strong>Passport = ID token.</strong> Issued by a trusted government (the issuer), it asserts <em>who you are</em>. It has your photo (claims), an issue date and expiry (<code>iat</code>/<code>exp</code>), and a holographic seal that border control can verify without phoning the issuing country (the signature, verified via public keys). The passport is <em>about you</em> and is presented to <em>identify</em> you. It is not a ticket.</li>
+      <li><strong>Boarding pass = access token.</strong> It does not prove who you are in general; it grants a <em>specific permission</em>: board flight BA117, seat 14C. The gate agent (resource server / API) checks the boarding pass, not your life story. It is scoped (this flight, this seat = OAuth scopes) and short-lived.</li>
+      <li><strong>Frequent-flyer membership = refresh token.</strong> Long-lived; you present it to get <em>new</em> boarding passes without re-proving your identity each time.</li>
+      <li><strong>The passport's seal registry = JWKS.</strong> Border control trusts the seal because the issuing authority publishes its sealing standards/keys. When a country rotates its security feature (key rotation), the registry is updated and old + new are honored during transition.</li>
+      <li><strong>Tamper-evident hologram bound to <em>this</em> entry = <code>nonce</code>.</strong> Imagine the passport stamp encoded a one-time code you whispered at the desk; a photocopy presented later wouldn't match, foiling replay.</li>
+    </ul>
+    <div class="callout tip"><span class="tag">Tip</span><p>If you ever catch yourself "showing the passport to the gate agent to board" (sending an ID token to an API) or "using the boarding pass to prove citizenship" (using an access token to identify the user), stop — you have swapped the artifacts. That swap is the root cause of a huge fraction of real OIDC bugs.</p></div>
+  </section>
+
+  <!-- 5 -->
+  <section id="internals">
+    <h2>5. Internal Working</h2>
+    <h3>5.1 Anatomy of an ID token</h3>
+    <p>An ID token is a JWT: three Base64URL parts separated by dots — <code>header.payload.signature</code>. Header and payload are JSON; the signature is a JWS over <code>header + "." + payload</code>.</p>
+<pre><code class="language-json">// HEADER (decoded)
+{
+  "alg": "RS256",          // signing algorithm (asymmetric -> client verifies with public key)
+  "typ": "JWT",
+  "kid": "NkJDQ0Q0..."     // which JWKS key was used; client looks this up
+}
+
+// PAYLOAD (decoded) — the CLAIMS
+{
+  "iss": "https://your-tenant.us.auth0.com/",  // issuer (must match exactly)
+  "sub": "auth0|6512ab...",                     // STABLE unique user id (your primary key)
+  "aud": "aBcD1234ClientId",                    // audience = THIS client's client_id
+  "iat": 1718800000,                            // issued-at (epoch seconds)
+  "exp": 1718803600,                            // expiry  (epoch seconds)
+  "nonce": "n-0S6_WzA2Mj",                      // must equal the nonce the client sent
+  "auth_time": 1718800000,                      // when the user actually authenticated
+  "name": "Maya Singh",
+  "email": "maya@example.com",
+  "email_verified": true
+}</code></pre>
+    <div class="callout warn"><span class="tag">Warn</span><p>The <strong>only</strong> stable user identifier is <code>sub</code> (subject). Email can change and can be reassigned; never key your user table on email. Identity is <code>iss</code> + <code>sub</code> together (the same <code>sub</code> can recur across different issuers).</p></div>
+    <h3>5.2 The seven mandatory ID token validation steps</h3>
+    <p>This is the heart of OIDC security. A relying party (your client) MUST, per the spec:</p>
+    <ol>
+      <li><strong>Signature.</strong> Fetch the key whose <code>kid</code> matches the token header from <code>jwks_uri</code>; verify the JWS. Reject <code>alg: none</code>. Pin asymmetric algs (RS256/ES256); never let the token's header dictate that a symmetric secret is used (the <em>alg-confusion</em> attack).</li>
+      <li><strong>Issuer.</strong> <code>iss</code> must <em>exactly</em> equal your configured issuer (including trailing slash). String compare, not "contains."</li>
+      <li><strong>Audience.</strong> <code>aud</code> must contain your <code>client_id</code>. If <code>aud</code> is an array and an <code>azp</code> (authorized party) is present, <code>azp</code> must equal your client_id.</li>
+      <li><strong>Expiry.</strong> <code>exp</code> must be in the future; reject if past (allow small clock skew, e.g. 60s).</li>
+      <li><strong>Issued-at.</strong> <code>iat</code> should be sane (not far in the future). Optionally enforce a max token age.</li>
+      <li><strong>Nonce.</strong> <code>nonce</code> must equal the value you generated and stored for this request (replay defense — §9.1).</li>
+      <li><strong>auth_time / acr (conditional).</strong> If you requested <code>max_age</code> or specific authentication context (e.g. MFA), verify <code>auth_time</code> and <code>acr</code>/<code>amr</code> satisfy your policy.</li>
+    </ol>
+    <h3>5.3 How signature verification actually works (RS256)</h3>
+<pre class="diagram">
+  Issuer (Auth0)                              Client (Relying Party)
+  --------------                              ----------------------
+  has PRIVATE key  -- sign -->  id_token  -- send -->  has PUBLIC key (from JWKS)
+                                                       |
+   signature = RSA_sign(SHA256(h"."p), privKey)        |
+                                                       v
+                          RSA_verify(SHA256(h"."p), sig, pubKey) == true ?
+                          yes -> token is authentic & untampered
+                          no  -> REJECT
+  Asymmetric => the client never holds a secret capable of MINTING tokens.
+</pre>
+    <p>Contrast with HS256 (symmetric): the same secret signs and verifies, so every verifier could forge tokens. For ID tokens validated by public clients (SPAs, mobile), <strong>RS256 is the correct default</strong>; Auth0 uses RS256 by default.</p>
+  </section>
+
+  <!-- 6 -->
+  <section id="walkthrough">
+    <h2>6. Code Walkthrough — verifying an ID token by hand</h2>
+    <p>Before reaching for a library, see what a library does for you. Here is manual RS256 verification in Node using the standard <code>jose</code> library's primitives, so every step is visible.</p>
+<pre><code class="language-javascript">// verify-id-token.js  (Node 20+, "type":"module")
+import { createRemoteJWKSet, jwtVerify, decodeProtectedHeader } from 'jose';
+
+const ISSUER   = 'https://your-tenant.us.auth0.com/';   // note trailing slash
+const AUDIENCE = 'aBcD1234ClientId';                    // your client_id
+const JWKS     = createRemoteJWKSet(new URL(ISSUER + '.well-known/jwks.json'));
+
+export async function verifyIdToken(idToken, expectedNonce) {
+  // 1. Reject 'none' / unexpected algs BEFORE verifying.
+  const { alg } = decodeProtectedHeader(idToken);
+  if (alg !== 'RS256') throw new Error(`unexpected alg: ${alg}`);
+
+  // 2-5. jwtVerify resolves the kid against JWKS, checks signature, iss, aud, exp, nbf.
+  const { payload } = await jwtVerify(idToken, JWKS, {
+    issuer:   ISSUER,
+    audience: AUDIENCE,
+    algorithms: ['RS256'],
+    clockTolerance: '60s',
+  });
+
+  // 6. Nonce — the library does NOT know your stored nonce; you must check it.
+  if (payload.nonce !== expectedNonce) throw new Error('nonce mismatch (replay?)');
+
+  // 7. (optional) max_age enforcement
+  // if (Date.now()/1000 - payload.auth_time > 3600) throw new Error('reauth required');
+
+  return payload; // trusted claims: payload.sub, payload.email, ...
+}</code></pre>
+    <div class="callout note"><span class="tag">Note</span><p>What <code>jwtVerify</code> did for you: parsed the header, picked the key by <code>kid</code> from the cached JWKS (refetching if unknown), verified the RSA signature, and checked <code>iss</code>, <code>aud</code>, <code>exp</code>, <code>nbf</code> with clock tolerance. It deliberately leaves <code>nonce</code> to you because only your app knows the value it generated. This is exactly the seven-step checklist from §5.2.</p></div>
+    <h3>6.1 Decode (NOT verify) — to inspect during debugging</h3>
+<pre><code class="language-javascript">// Decoding != verifying. NEVER trust decoded claims you haven't verified.
+function unsafeDecode(jwt) {
+  const [, payload] = jwt.split('.');
+  return JSON.parse(Buffer.from(payload, 'base64url').toString('utf8'));
+}
+console.log(unsafeDecode(idToken)); // debugging only</code></pre>
+    <div class="callout danger"><span class="tag">Danger</span><p>Decoding a JWT is trivial and unauthenticated — anyone can read the payload (it is only Base64, not encryption). Treat decoded values as attacker-controlled until the signature and claims are verified. Never put secrets in an ID token.</p></div>
+  </section>
+
+  <!-- 7 -->
+  <section id="practical">
+    <h2>7. Practical Implementation</h2>
+    <h3>7.1 curl — drive the flow manually</h3>
+<pre><code class="language-bash"># Step A: discovery — let the server tell you every endpoint
+curl -s https://your-tenant.us.auth0.com/.well-known/openid-configuration | jq
+
+# Step B: build the /authorize URL (open in a browser).
+#   PKCE: code_verifier is random; code_challenge = BASE64URL(SHA256(verifier))
+VERIFIER=$(openssl rand -base64 60 | tr -d '\n=+/' | cut -c1-64)
+CHALLENGE=$(printf '%s' "$VERIFIER" | openssl dgst -binary -sha256 | openssl base64 | tr '+/' '-_' | tr -d '=')
+echo "https://your-tenant.us.auth0.com/authorize?\
+response_type=code&client_id=aBcD1234ClientId&\
+redirect_uri=http://localhost:3000/callback&\
+scope=openid%20profile%20email%20offline_access&\
+audience=https://api.photovault.example&\
+state=xyzCSRF&nonce=n-0S6_WzA2Mj&\
+code_challenge=$CHALLENGE&code_challenge_method=S256"
+
+# Step C: after browser redirect gives you ?code=AUTH_CODE, exchange it:
+curl -s -X POST https://your-tenant.us.auth0.com/oauth/token \
+  -H 'Content-Type: application/x-www-form-urlencoded' \
+  -d grant_type=authorization_code \
+  -d client_id=aBcD1234ClientId \
+  -d client_secret=YOUR_CLIENT_SECRET \
+  -d code=AUTH_CODE \
+  -d code_verifier="$VERIFIER" \
+  -d redirect_uri=http://localhost:3000/callback | jq
+# -> { "access_token": "...", "id_token": "ey...", "refresh_token": "...",
+#      "expires_in": 86400, "token_type": "Bearer", "scope": "openid profile ..." }
+
+# Step D: call userinfo with the ACCESS token (not the id_token!)
+curl -s https://your-tenant.us.auth0.com/userinfo \
+  -H "Authorization: Bearer ACCESS_TOKEN" | jq</code></pre>
+    <h3>7.2 Postman</h3>
+    <ul>
+      <li>New request → <strong>Authorization</strong> tab → Type <code>OAuth 2.0</code> → <em>Configure New Token</em>.</li>
+      <li>Grant Type: <code>Authorization Code (With PKCE)</code>. Auth URL: <code>.../authorize</code>; Access Token URL: <code>.../oauth/token</code>.</li>
+      <li>Scope: <code>openid profile email offline_access</code>. Add a custom param <code>audience=https://api.photovault.example</code> so you also get a usable API access token.</li>
+      <li>Click <em>Get New Access Token</em>; Postman handles <code>state</code>, the redirect, and PKCE. The returned token set includes <code>id_token</code> — paste it into <a href="https://jwt.io">jwt.io</a> to inspect claims.</li>
+    </ul>
+    <h3>7.3 Node / Express — the right way (use a certified library)</h3>
+<pre><code class="language-javascript">// app.js — express-openid-connect does discovery, PKCE, state, nonce & validation for you
+import express from 'express';
+import { auth } from 'express-openid-connect';
+
+const app = express();
+app.use(auth({
+  authRequired: false,
+  auth0Logout: true,
+  baseURL: 'http://localhost:3000',
+  clientID: process.env.CLIENT_ID,
+  clientSecret: process.env.CLIENT_SECRET,
+  secret: process.env.SESSION_SECRET,        // encrypts the session cookie
+  issuerBaseURL: 'https://your-tenant.us.auth0.com',
+  authorizationParams: {
+    response_type: 'code',                    // Authorization Code flow
+    scope: 'openid profile email offline_access',
+    audience: 'https://api.photovault.example',
+  },
+}));
+
+app.get('/', (req, res) =>
+  res.send(req.oidc.isAuthenticated()
+    ? `Hi ${req.oidc.user.name} (sub=${req.oidc.user.sub})`
+    : '&lt;a href="/login"&gt;Log in&lt;/a&gt;'));
+
+app.listen(3000);</code></pre>
+    <h3>7.4 Spring Boot — OIDC login in ~15 lines of config</h3>
+<pre><code class="language-yaml"># application.yml
+spring:
+  security:
+    oauth2:
+      client:
+        registration:
+          auth0:
+            client-id: ${CLIENT_ID}
+            client-secret: ${CLIENT_SECRET}
+            scope: openid, profile, email, offline_access
+            authorization-grant-type: authorization_code
+            redirect-uri: "{baseUrl}/login/oauth2/code/{registrationId}"
+        provider:
+          auth0:
+            issuer-uri: https://your-tenant.us.auth0.com/   # enables discovery</code></pre>
+<pre><code class="language-java">// SecurityConfig.java — Spring Security validates the ID token automatically
+@Configuration
+@EnableWebSecurity
+public class SecurityConfig {
+  @Bean
+  SecurityFilterChain chain(HttpSecurity http) throws Exception {
+    http.authorizeHttpRequests(a -> a.anyRequest().authenticated())
+        .oauth2Login(Customizer.withDefaults()); // discovery + JWKS + ID token validation
+    return http.build();
+  }
+
+  @GetMapping("/me")  // inject the verified OIDC user
+  public Map&lt;String,Object&gt; me(@AuthenticationPrincipal OidcUser user) {
+    return Map.of("sub", user.getSubject(), "email", user.getEmail());
+  }
+}</code></pre>
+    <h3>7.5 FastAPI — verifying the ID token with cached JWKS</h3>
+<pre><code class="language-python"># auth.py
+import time, httpx
+from jose import jwt                       # python-jose
+from fastapi import Depends, HTTPException, Request
+
+ISSUER   = "https://your-tenant.us.auth0.com/"
+AUDIENCE = "aBcD1234ClientId"
+_jwks, _jwks_at = None, 0
+
+async def jwks():
+    global _jwks, _jwks_at
+    if not _jwks or time.time() - _jwks_at &gt; 3600:   # cache 1h, respect rotation
+        async with httpx.AsyncClient() as c:
+            _jwks = (await c.get(ISSUER + ".well-known/jwks.json")).json()
+            _jwks_at = time.time()
+    return _jwks
+
+async def current_user(request: Request):
+    token = request.cookies.get("id_token") or ""
+    keys = await jwks()
+    try:
+        claims = jwt.decode(token, keys, algorithms=["RS256"],
+                            audience=AUDIENCE, issuer=ISSUER)
+    except Exception as e:
+        raise HTTPException(401, f"invalid id token: {e}")
+    # nonce check happens at callback time against the stored value
+    return claims</code></pre>
+    <h3>7.6 React (SPA) + Next.js</h3>
+<pre><code class="language-jsx">// React SPA: the SDK runs Authorization Code + PKCE in the browser (no client secret)
+import { Auth0Provider, useAuth0 } from '@auth0/auth0-react';
+
+function Root() {
+  return (
+    &lt;Auth0Provider
+      domain="your-tenant.us.auth0.com"
+      clientId="aBcD1234ClientId"
+      authorizationParams={{
+        redirect_uri: window.location.origin,
+        scope: 'openid profile email',
+        audience: 'https://api.photovault.example',
+      }}&gt;
+      &lt;App /&gt;
+    &lt;/Auth0Provider&gt;
+  );
+}
+
+function App() {
+  const { isAuthenticated, user, loginWithRedirect, getAccessTokenSilently } = useAuth0();
+  if (!isAuthenticated) return &lt;button onClick={() =&gt; loginWithRedirect()}&gt;Log in&lt;/button&gt;;
+  // user.sub / user.email come from the VERIFIED id_token; call APIs with the access token:
+  // const token = await getAccessTokenSilently();
+  return &lt;p&gt;Hello {user.name} ({user.sub})&lt;/p&gt;;
+}</code></pre>
+<pre><code class="language-javascript">// Next.js (App Router) with @auth0/nextjs-auth0 v4 — server-side session, no token in JS
+// middleware.ts
+import { auth0 } from "./lib/auth0";
+export const middleware = auth0.middleware;       // mounts /auth/login, /auth/callback, /auth/logout
+
+// app/page.tsx (server component)
+import { auth0 } from "@/lib/auth0";
+export default async function Home() {
+  const session = await auth0.getSession();        // session.user is the verified ID-token profile
+  return session
+    ? &lt;p&gt;Hi {session.user.name} ({session.user.sub})&lt;/p&gt;
+    : &lt;a href="/auth/login"&gt;Log in&lt;/a&gt;;
+}</code></pre>
+  </section>
+
+  <!-- 8 -->
+  <section id="prod-arch">
+    <h2>8. Production Architecture</h2>
+    <p>Where does OIDC live in a real system? The dominant secure pattern in 2026 is the <strong>Backend-for-Frontend (BFF)</strong>: the OIDC flow and tokens stay server-side; the browser holds only an encrypted, httpOnly session cookie. This avoids exposing tokens to JavaScript (XSS theft) entirely.</p>
+<pre class="diagram">
+  Browser (no tokens in JS)            BFF / Web Server                Auth0
+  ------------------------             ----------------                -----
+  httpOnly SameSite cookie  &lt;--session--&gt;  runs Auth Code+PKCE  &lt;--OIDC--&gt; /authorize
+       |                                   stores tokens server-side       /token
+       |  /api/* (cookie)                  validates id_token              /jwks.json
+       v                                   |                               (cached)
+  +-----------+    proxy + attach          v
+  |   BFF     | --- access_token ----&gt; Resource API (verifies access_token via JWKS)
+  +-----------+    refresh when expiring
+</pre>
+    <p>Decision guide for token placement:</p>
+    <table>
+      <thead><tr><th>App type</th><th>Flow</th><th>Token storage</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td>Server-rendered web (Spring, Next.js, Express)</td><td>Auth Code + PKCE</td><td>Encrypted httpOnly cookie / server session</td><td>No tokens in browser JS; XSS can't exfiltrate</td></tr>
+        <tr><td>SPA with its own API</td><td>BFF (Auth Code + PKCE server-side)</td><td>Cookie to BFF; tokens on BFF</td><td>Best security; avoids browser token storage</td></tr>
+        <tr><td>Pure SPA (no backend)</td><td>Auth Code + PKCE (in browser)</td><td>In-memory; refresh via rotating refresh tokens</td><td>PKCE replaces the secret; never use Implicit</td></tr>
+        <tr><td>Native / mobile</td><td>Auth Code + PKCE (system browser)</td><td>OS secure storage / keychain</td><td>PKCE mandatory; public client</td></tr>
+      </tbody>
+    </table>
+    <div class="callout key"><span class="tag">Key</span><p>JWKS caching is an architecture concern: cache keys (respect <code>Cache-Control</code> / TTL ~10–60 min), and on encountering an unknown <code>kid</code>, refetch <em>once</em> (to pick up a rotated key) before rejecting. This makes key rotation seamless and prevents a thundering herd against <code>jwks_uri</code>.</p></div>
+  </section>
+
+  <!-- 9 -->
+  <section id="security">
+    <h2>9. Security Analysis</h2>
+    <table>
+      <thead><tr><th>Threat</th><th>Mechanism</th><th>Defense in OIDC</th></tr></thead>
+      <tbody>
+        <tr><td>CSRF on the callback</td><td>Attacker forges a redirect with their own code</td><td><code>state</code>: random, bound to the user's session, checked on return</td></tr>
+        <tr><td>ID token replay / injection</td><td>Reuse a stolen id_token in another browser session</td><td><code>nonce</code>: random per request, embedded in id_token, matched on return</td></tr>
+        <tr><td>Token interception (no secret)</td><td>Stolen auth code redeemed by attacker</td><td>PKCE: <code>code_verifier</code> binds the code to the original client</td></tr>
+        <tr><td>Token forgery</td><td>Attacker mints a token</td><td>RS256 signature; client holds only the public key</td></tr>
+        <tr><td>alg confusion / "none"</td><td>Trick verifier into HS256-with-pubkey or no signature</td><td>Pin <code>algorithms: ['RS256']</code>; reject <code>none</code></td></tr>
+        <tr><td>Audience confusion</td><td>Use a token issued for app B at app A</td><td>Strict <code>aud == client_id</code> check (+ <code>azp</code>)</td></tr>
+        <tr><td>Token theft via XSS</td><td>JS reads tokens from localStorage</td><td>BFF + httpOnly cookies; keep tokens out of JS</td></tr>
+        <tr><td>Stale-key acceptance</td><td>Accept token signed by revoked key</td><td>Honor JWKS rotation; short cache TTL</td></tr>
+      </tbody>
+    </table>
+    <h3>9.1 Why <code>state</code> AND <code>nonce</code> (they are different)</h3>
+<pre class="diagram">
+  state  -> protects the CALLBACK (CSRF):   "did *I* start this login?"
+            random value sent to /authorize, returned as ?state=, compared.
+
+  nonce  -> protects the ID TOKEN (replay):  "is this id_token for *this* request?"
+            random value sent to /authorize, embedded in id_token.nonce, compared.
+
+  state lives in the URL round-trip; nonce lives INSIDE the signed token.
+  You need both: state can't protect a token's contents; nonce can't stop CSRF.
+</pre>
+    <div class="callout danger"><span class="tag">Danger</span><p>The Implicit flow (<code>response_type=token id_token</code>) is <strong>deprecated</strong> — it returned tokens in the URL fragment, exposing them to history, logs, and referrers. As of OAuth 2.1 / 2026 best practice, always use <strong>Authorization Code + PKCE</strong>, even for SPAs. Do not use Implicit in new systems.</p></div>
+  </section>
+
+  <!-- 10 -->
+  <section id="performance">
+    <h2>10. Performance Considerations</h2>
+    <ul>
+      <li><strong>Verify ID tokens locally.</strong> Signature verification with a cached JWKS key is microseconds of CPU and zero network — far cheaper than introspection. Don't call the network on every request to validate identity.</li>
+      <li><strong>Cache the discovery document and JWKS.</strong> Fetch discovery once at startup (or with a long TTL); cache JWKS for minutes and refetch only on unknown <code>kid</code> or TTL expiry. Uncached, you add a round-trip per login and risk rate limits.</li>
+      <li><strong>Prefer the ID token over userinfo for basic profile.</strong> If <code>profile</code>/<code>email</code> claims are in the ID token, you already have them — calling <code>/userinfo</code> is an extra network hop. Use userinfo when you need fresh or omitted claims.</li>
+      <li><strong>Keep ID tokens lean.</strong> Large custom claims bloat every request that carries the token/session. Put bulk data behind userinfo or your own API, not in the token.</li>
+      <li><strong>RS256 verify vs HS256:</strong> RS256 verification is asymmetric and slightly heavier than HMAC, but still sub-millisecond and the right trade for public clients. Don't "optimize" to HS256 and break the security model.</li>
+      <li><strong>Connection reuse:</strong> use a keep-alive HTTP client for JWKS/discovery fetches; share a singleton <code>createRemoteJWKSet</code> rather than constructing one per request.</li>
+    </ul>
+  </section>
+
+  <!-- 11 -->
+  <section id="mistakes">
+    <h2>11. Common Mistakes</h2>
+    <div class="callout danger"><span class="tag">Danger</span><p><strong>Using the access token to identify the user.</strong> Access tokens are for APIs; their format may be opaque and their claims are not an identity contract. Use the ID token.</p></div>
+    <div class="callout danger"><span class="tag">Danger</span><p><strong>Sending the ID token to your API as the bearer credential.</strong> APIs must validate <em>access</em> tokens (correct <code>aud</code> = the API). An ID token's <code>aud</code> is the client; accepting it at the API is an audience-confusion bug.</p></div>
+    <ul>
+      <li><strong>Forgetting the <code>openid</code> scope.</strong> No <code>openid</code> → no ID token → it's plain OAuth and login breaks silently.</li>
+      <li><strong>Not validating the signature (only decoding).</strong> Decoding is not verifying; unverified claims are attacker-controlled.</li>
+      <li><strong>Loose issuer/audience checks</strong> (substring match, ignoring trailing slash, skipping <code>aud</code>).</li>
+      <li><strong>Allowing <code>alg: none</code> or symmetric algs</strong> by trusting the token header — always pin RS256.</li>
+      <li><strong>Skipping <code>nonce</code></strong> (or generating it but never comparing it on return).</li>
+      <li><strong>Keying users on <code>email</code></strong> instead of <code>iss</code>+<code>sub</code>.</li>
+      <li><strong>Treating <code>email_verified=false</code> as verified</strong> — and account-linking on unverified email (account-takeover risk).</li>
+      <li><strong>Hardcoding endpoints</strong> instead of reading the discovery document → breaks on tenant/region change or rotation.</li>
+      <li><strong>Storing tokens in <code>localStorage</code></strong> → XSS exfiltration. Use httpOnly cookies / BFF.</li>
+      <li><strong>Requesting <code>offline_access</code> you don't need</strong> → unnecessary long-lived refresh tokens to protect.</li>
+    </ul>
+  </section>
+
+  <!-- 12 -->
+  <section id="best-practices">
+    <h2>12. Best Practices</h2>
+    <ul>
+      <li>Always <strong>Authorization Code + PKCE</strong>; never Implicit. PKCE even for confidential clients.</li>
+      <li>Use a <strong>certified OIDC library/SDK</strong> (express-openid-connect, Spring Security, @auth0/nextjs-auth0, @auth0/auth0-react, authlib). Don't hand-roll the flow.</li>
+      <li>Drive config from the <strong>discovery document</strong>; never hardcode endpoints.</li>
+      <li>Validate <strong>all seven</strong>: signature (RS256, pinned), <code>iss</code> (exact), <code>aud</code>, <code>exp</code> (with small skew), <code>iat</code>, <code>nonce</code>, and conditionally <code>auth_time</code>/<code>acr</code>.</li>
+      <li>Generate <code>state</code> and <code>nonce</code> with a CSPRNG, store them bound to the browser session, and compare on return.</li>
+      <li>Request the <strong>least scopes</strong> needed; add <code>offline_access</code> only when you truly need refresh tokens; pass <code>audience</code> only to get an API access token.</li>
+      <li>Keep tokens <strong>out of the browser</strong> where possible (BFF + httpOnly, SameSite=Lax/Strict cookies).</li>
+      <li>Use the <strong>ID token to start a session</strong>, then rely on your own session — don't re-present the ID token on every request.</li>
+      <li>Trust <code>email</code> only when <code>email_verified === true</code>; key users on <code>sub</code>.</li>
+      <li>Cache JWKS/discovery with sane TTLs and a refetch-on-unknown-kid strategy.</li>
+    </ul>
+  </section>
+
+  <!-- 13 -->
+  <section id="interview">
+    <h2>13. Interview Questions (with model answers)</h2>
+    <h3>Q1. What does OpenID Connect add to OAuth 2.0?</h3>
+    <p><strong>A.</strong> OIDC is an identity layer on top of OAuth 2.0. OAuth only delegates authorization (access tokens for APIs). OIDC adds: the <strong>ID token</strong> (a signed JWT asserting who authenticated, audience = the client), the reserved <code>openid</code> scope that triggers it, standard claims and the <code>userinfo</code> endpoint, the discovery document and JWKS for self-configuration and signature verification, and the <code>nonce</code> replay defense. It reuses OAuth's endpoints and grants.</p>
+    <h3>Q2. Difference between an ID token and an access token?</h3>
+    <p><strong>A.</strong> ID token: identity assertion, audience = client, always a JWT, validated by the client to establish login. Access token: authorization credential, audience = the API/resource server, JWT or opaque, validated by the API. They have different audiences and different consumers; swapping them is an audience-confusion vulnerability.</p>
+    <h3>Q3. Why <code>nonce</code> if we already have <code>state</code>?</h3>
+    <p><strong>A.</strong> <code>state</code> defends the callback against CSRF (it's a URL round-trip value proving the client initiated the flow). <code>nonce</code> defends the ID token against replay/injection: it is embedded <em>inside</em> the signed token, so a stolen/replayed token from another request won't match the nonce this client generated. State protects the transaction; nonce protects the token's binding to that transaction.</p>
+    <h3>Q4. Walk me through ID token validation.</h3>
+    <p><strong>A.</strong> (1) Verify the JWS signature using the JWKS key matching the header <code>kid</code>, pinning RS256 and rejecting <code>none</code>. (2) <code>iss</code> exactly matches configured issuer. (3) <code>aud</code> contains our client_id (check <code>azp</code> if multiple). (4) <code>exp</code> not past (small skew allowed). (5) <code>iat</code> sane. (6) <code>nonce</code> matches the stored value. (7) If <code>max_age</code>/MFA requested, check <code>auth_time</code>/<code>acr</code>/<code>amr</code>.</p>
+    <h3>Q5. What is the discovery document and why use it?</h3>
+    <p><strong>A.</strong> A JSON metadata document at <code>/.well-known/openid-configuration</code> listing the issuer, authorization/token/userinfo endpoints, <code>jwks_uri</code>, supported scopes/claims/response types and algorithms. Clients read it to self-configure and to locate signing keys, so endpoints aren't hardcoded and rotation/region changes don't break them.</p>
+    <h3>Q6. How does JWKS enable key rotation?</h3>
+    <p><strong>A.</strong> JWKS publishes the issuer's current public keys, each tagged with a <code>kid</code>. The ID token header names the <code>kid</code> used. To rotate, the issuer publishes the new key (both old and new appear during overlap) and starts signing with it. Clients select keys by <code>kid</code> and refetch JWKS on an unknown <code>kid</code>, so rotation is transparent and never requires client redeploys.</p>
+    <h3>Q7. What is the Hybrid flow and when is it used?</h3>
+    <p><strong>A.</strong> Hybrid uses combined <code>response_type</code> values like <code>code id_token</code>: the front channel returns an ID token immediately <em>and</em> a code to exchange at the token endpoint. It lets the client validate identity early (e.g., to bind/sanity-check the request) before the back-channel exchange. Modern guidance favors plain Authorization Code + PKCE; Hybrid is mostly seen in legacy/financial-grade setups and is largely superseded.</p>
+    <h3>Q8. Why prefer RS256 over HS256 for ID tokens?</h3>
+    <p><strong>A.</strong> RS256 is asymmetric: the issuer signs with a private key, clients verify with a public key from JWKS. No verifier can forge tokens, and rotation is easy. HS256 shares one secret between issuer and verifier — every verifier could mint tokens, and distributing the secret to public clients (SPAs) is impossible to keep secret. RS256 is correct for OIDC.</p>
+    <h3>Q9. Should an SPA store the ID/access token in localStorage?</h3>
+    <p><strong>A.</strong> No. localStorage is readable by any JS, so XSS exfiltrates it. Prefer a BFF that keeps tokens server-side and issues an httpOnly, SameSite cookie; if a pure SPA is required, keep tokens in memory and use Authorization Code + PKCE with rotating refresh tokens.</p>
+    <h3>Q10. When do you call userinfo vs read claims from the ID token?</h3>
+    <p><strong>A.</strong> If the needed claims are already in the verified ID token, use them — no network call. Call <code>/userinfo</code> (with the <em>access</em> token) when you need claims not included in the ID token or want the freshest profile. userinfo is the authoritative source for the user's current standard claims.</p>
+  </section>
+
+  <!-- 14 -->
+  <section id="cert-tips">
+    <h2>14. Certification Tips</h2>
+    <div class="callout tip"><span class="tag">Tip</span><p>For the Auth0 / OIDC certification, memorize the artifact→consumer→audience triangle: <strong>ID token → client → aud=client_id</strong>; <strong>access token → API → aud=API identifier</strong>; <strong>refresh token → /token endpoint</strong>.</p></div>
+    <ul>
+      <li>Exams love the trap "use the access token to log the user in." The answer is always the <strong>ID token</strong>.</li>
+      <li>Know that <code>openid</code> is the scope that makes a request OIDC and triggers the ID token.</li>
+      <li>Map scopes to claims: <code>profile</code> → name/picture/locale/etc., <code>email</code> → email + email_verified, <code>offline_access</code> → refresh token.</li>
+      <li>Know the discovery path exactly: <code>/.well-known/openid-configuration</code>, and that it contains <code>jwks_uri</code>.</li>
+      <li>Remember Auth0 defaults to <strong>RS256</strong> and that Implicit is deprecated in favor of <strong>Auth Code + PKCE</strong>.</li>
+      <li>Distinguish <code>state</code> (CSRF, URL) vs <code>nonce</code> (replay, inside ID token).</li>
+      <li>Know <code>sub</code> is the stable user identifier and identity = <code>iss</code> + <code>sub</code>.</li>
+      <li>Recognize response_type values: <code>code</code> (Auth Code), <code>code id_token</code>/<code>code token</code> (Hybrid), <code>id_token token</code> (Implicit, avoid).</li>
+    </ul>
+  </section>
+
+  <!-- 15 -->
+  <section id="exercises">
+    <h2>15. Hands-On Exercises</h2>
+    <ol>
+      <li><strong>Read your tenant's discovery doc.</strong> <code>curl</code> the <code>/.well-known/openid-configuration</code> for your Auth0 tenant and list <code>issuer</code>, <code>jwks_uri</code>, and <code>response_types_supported</code>.</li>
+      <li><strong>Inspect an ID token.</strong> Run the curl flow in §7.1, paste the <code>id_token</code> into jwt.io, and identify <code>iss</code>, <code>aud</code>, <code>sub</code>, <code>nonce</code>, <code>iat</code>, <code>exp</code>.</li>
+      <li><strong>Break audience validation.</strong> In the §6 verifier, set <code>AUDIENCE</code> to a wrong value and confirm verification fails. Restore it.</li>
+      <li><strong>Force a nonce mismatch.</strong> Pass the wrong <code>expectedNonce</code> and confirm the "replay?" error fires.</li>
+      <li><strong>Compare ID-token claims vs userinfo.</strong> Diff the ID token claims against the <code>/userinfo</code> response and note what's only in one.</li>
+      <li><strong>Observe key rotation handling.</strong> Log which <code>kid</code> your verifier used; restart and confirm JWKS is fetched and cached.</li>
+    </ol>
+  </section>
+
+  <!-- 16 -->
+  <section id="assignment">
+    <h2>16. Assignment</h2>
+    <p>Build a minimal "Login with Auth0" web app (any stack from §7) that:</p>
+    <ol>
+      <li>Initiates Authorization Code + PKCE with <code>scope=openid profile email</code>, a CSPRNG <code>state</code> and <code>nonce</code> stored in the session.</li>
+      <li>On callback, verifies <code>state</code>, exchanges the code, and performs all seven ID token validation steps (signature via JWKS, iss, aud, exp, iat, nonce, optional auth_time).</li>
+      <li>Establishes a server session keyed on <code>iss</code>+<code>sub</code>, displays <code>name</code>/<code>email</code>, and shows <code>email_verified</code>.</li>
+      <li>Implements logout that clears the local session and calls the IdP logout endpoint.</li>
+    </ol>
+    <p><strong>Deliverable:</strong> source + a short README explaining where each of the seven validations happens and why <code>state</code> and <code>nonce</code> are both present. <strong>Stretch:</strong> add <code>offline_access</code> and use the refresh token to renew an API access token.</p>
+  </section>
+
+  <!-- 17 -->
+  <section id="mini-project">
+    <h2>17. Mini Project — "AuthLens" ID-token verifier service</h2>
+    <p>Create a small service that accepts an issuer URL and an ID token and returns a structured verification report. It must:</p>
+    <ul>
+      <li>Fetch and cache the discovery document and JWKS for the given issuer.</li>
+      <li>Run each of the seven validation steps independently and report pass/fail with the offending claim value.</li>
+      <li>Detect and flag dangerous conditions: <code>alg: none</code>, non-RS256 alg, missing <code>nonce</code>, expired token, audience mismatch, unknown <code>kid</code>.</li>
+    </ul>
+<pre><code class="language-javascript">// authlens.js (sketch) — POST {issuer, idToken, expectedAud, expectedNonce}
+import express from 'express';
+import { createRemoteJWKSet, jwtVerify, decodeProtectedHeader } from 'jose';
+
+const app = express(); app.use(express.json());
+const jwksCache = new Map();
+const jwksFor = (iss) => jwksCache.get(iss)
+  ?? jwksCache.set(iss, createRemoteJWKSet(new URL(iss + '.well-known/jwks.json'))).get(iss);
+
+app.post('/verify', async (req, res) => {
+  const { issuer, idToken, expectedAud, expectedNonce } = req.body;
+  const report = { steps: [] };
+  const add = (name, ok, detail) => report.steps.push({ name, ok, detail });
+  try {
+    const hdr = decodeProtectedHeader(idToken);
+    add('alg', hdr.alg === 'RS256', `alg=${hdr.alg}`);
+    const { payload } = await jwtVerify(idToken, jwksFor(issuer), {
+      issuer, audience: expectedAud, algorithms: ['RS256'], clockTolerance: '60s',
+    });
+    add('signature+iss+aud+exp', true, `sub=${payload.sub}`);
+    add('nonce', payload.nonce === expectedNonce, `nonce=${payload.nonce}`);
+    report.valid = report.steps.every(s =&gt; s.ok);
+  } catch (e) { add('verify', false, e.message); report.valid = false; }
+  res.json(report);
+});
+app.listen(4000);</code></pre>
+    <p><strong>Extend it:</strong> add a UI that color-codes each step, and a "diff against userinfo" panel.</p>
+  </section>
+
+  <!-- 18 -->
+  <section id="quiz">
+    <h2>18. Quiz (24 questions)</h2>
+    <ol>
+      <li>What category of protocol is OAuth 2.0, and what does OIDC add?</li>
+      <li>Which scope turns an OAuth request into an OIDC request?</li>
+      <li>What is the audience (<code>aud</code>) of an ID token?</li>
+      <li>What is the audience of an access token?</li>
+      <li>Name the only stable, reliable user identifier claim.</li>
+      <li>True/False: an access token should be used to identify the logged-in user.</li>
+      <li>True/False: an ID token should be sent to your API as the bearer credential.</li>
+      <li>What does the <code>nonce</code> parameter protect against?</li>
+      <li>What does the <code>state</code> parameter protect against?</li>
+      <li>Why do you need both <code>state</code> and <code>nonce</code>?</li>
+      <li>At what URL is the OIDC discovery document published?</li>
+      <li>Which field in discovery tells you where the signing keys are?</li>
+      <li>What is a <code>kid</code> and how is it used?</li>
+      <li>How does JWKS make key rotation transparent to clients?</li>
+      <li>Why is RS256 preferred over HS256 for ID tokens?</li>
+      <li>What attack does pinning <code>algorithms: ['RS256']</code> prevent?</li>
+      <li>List the seven ID token validation steps.</li>
+      <li>Which scope yields a refresh token?</li>
+      <li>Which claims does the <code>email</code> scope grant?</li>
+      <li>When should you call <code>/userinfo</code> instead of reading the ID token?</li>
+      <li>Which token do you send to <code>/userinfo</code>?</li>
+      <li>What is the Hybrid flow and an example <code>response_type</code>?</li>
+      <li>Why is the Implicit flow deprecated?</li>
+      <li>Why is keying users on <code>email</code> dangerous, and what should you use instead?</li>
+    </ol>
+    <details>
+      <summary>Show answer key</summary>
+      <ol>
+        <li>OAuth 2.0 is a <em>delegated authorization</em> framework; OIDC adds an <em>authentication/identity</em> layer (ID token, openid scope, userinfo, discovery, nonce).</li>
+        <li><code>openid</code>.</li>
+        <li>The client (<code>aud</code> = the client's <code>client_id</code>).</li>
+        <li>The API / resource server (its API identifier/audience).</li>
+        <li><code>sub</code> (subject) — identity is <code>iss</code> + <code>sub</code>.</li>
+        <li>False — use the ID token for identity.</li>
+        <li>False — APIs validate access tokens; an ID token's aud is the client.</li>
+        <li>Replay/injection of an ID token — it binds the token to this specific authorization request.</li>
+        <li>CSRF on the authorization callback.</li>
+        <li><code>state</code> protects the URL round-trip/transaction (CSRF); <code>nonce</code> protects the token's contents (replay). Neither covers the other.</li>
+        <li><code>/.well-known/openid-configuration</code>.</li>
+        <li><code>jwks_uri</code>.</li>
+        <li>Key ID: a label on each JWKS public key; the JWT header's <code>kid</code> tells the verifier which key to use.</li>
+        <li>Keys are selected by <code>kid</code>; the issuer publishes new keys (overlapping with old) and clients refetch JWKS on an unknown <code>kid</code>, so no redeploy is needed.</li>
+        <li>RS256 is asymmetric — issuer signs with a private key, clients verify with a public key, so verifiers can't forge tokens and rotation is easy; HS256 shares one secret.</li>
+        <li>alg-confusion (e.g., tricking the verifier into HS256-with-the-public-key) and <code>alg: none</code> forgery.</li>
+        <li>(1) signature via JWKS (RS256, reject none), (2) <code>iss</code> exact, (3) <code>aud</code> = client_id (+azp), (4) <code>exp</code> not past, (5) <code>iat</code> sane, (6) <code>nonce</code> matches, (7) conditional <code>auth_time</code>/<code>acr</code>.</li>
+        <li><code>offline_access</code>.</li>
+        <li><code>email</code> and <code>email_verified</code>.</li>
+        <li>When the needed claims aren't in the ID token or you need the freshest profile.</li>
+        <li>The <strong>access</strong> token.</li>
+        <li>A flow returning tokens via both front and back channels; e.g. <code>response_type=code id_token</code>.</li>
+        <li>It returned tokens in the URL fragment (exposed to history/logs/referrer); Auth Code + PKCE is the secure replacement.</li>
+        <li>Email can change and be reassigned, and may be unverified; key on <code>iss</code>+<code>sub</code> instead.</li>
+      </ol>
+    </details>
+  </section>
+
+  <!-- 19 -->
+  <section id="cheatsheet">
+    <h2>19. Cheat Sheet</h2>
+<pre class="diagram">
+ OIDC = OAuth 2.0 + identity layer (ID token, openid scope, userinfo, discovery, nonce)
+
+ TOKENS        aud           consumer       format      job
+ ----------    -----------   -----------    --------    --------------------
+ id_token      client_id     the CLIENT     JWT         "who logged in" (session)
+ access_token  API id        the API        JWT/opaque  "what app may do"
+ refresh_token auth server   /token         opaque      get new tokens
+
+ SCOPES   openid (REQUIRED) | profile | email | offline_access(=refresh)
+
+ ENDPOINTS  /.well-known/openid-configuration  -> discovery
+            jwks_uri                           -> public keys (by kid)
+            /authorize  /oauth/token  /userinfo
+
+ VALIDATE id_token (7):
+   1 signature (JWKS, RS256, reject none)   5 iat sane
+   2 iss exact match                        6 nonce == stored
+   3 aud contains client_id (+azp)          7 auth_time/acr (if max_age/MFA)
+   4 exp not past (±skew)
+
+ SECURITY  state=CSRF(URL)   nonce=replay(in token)   PKCE=code binding
+           RS256 always      never Implicit           tokens out of JS (BFF)
+
+ KEY CLAIMS  sub(stable id)  iss  aud  exp  iat  nonce  email+email_verified
+
+ GOLDEN RULE  id_token => identify (client).  access_token => authorize (API).
+</pre>
+  </section>
+
+  <!-- 20 -->
+  <section id="takeaways">
+    <h2>20. Key Takeaways</h2>
+    <div class="callout key"><span class="tag">Key</span><p><strong>OIDC is the identity layer on OAuth 2.0.</strong> It reuses every OAuth endpoint and adds the ID token, the <code>openid</code> scope, userinfo, discovery, and <code>nonce</code>. OAuth authorizes; OIDC authenticates.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p><strong>Three tokens, three jobs.</strong> ID token (identity, aud=client), access token (authorization, aud=API), refresh token (renewal, for /token). Never confuse or swap them — swapping is an audience-confusion vulnerability.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p><strong>Validate ID tokens in seven steps</strong>: signature (RS256 via JWKS, reject none), iss, aud, exp, iat, nonce, and conditionally auth_time/acr. Decoding is not verifying.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p><strong>Discovery + JWKS make clients self-configuring and rotation-safe.</strong> Read <code>/.well-known/openid-configuration</code>; cache JWKS; select keys by <code>kid</code>; refetch on unknown kid.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p><strong>Use Authorization Code + PKCE everywhere</strong> (never Implicit), keep tokens out of browser JS (BFF + httpOnly cookies), pin RS256, and use both <code>state</code> (CSRF) and <code>nonce</code> (replay). Key users on <code>iss</code>+<code>sub</code>.</p></div>
+  </section>
+
+  <nav class="pager">
+    <a class="prev" href="chapter-06.html">← Previous</a>
+    <a class="next" href="chapter-08.html">Next →</a>
+  </nav>
+</main>
+<footer class="site-footer">Master Auth0 End-to-End · Chapter 7 of 32</footer>
+</body>
+</html>

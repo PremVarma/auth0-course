@@ -1,0 +1,665 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 30 — Interview Preparation | Master Auth0</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">🔐 Master Auth0</a>
+  <nav class="topnav">
+    <a href="chapter-29.html">← Prev</a>
+    <a href="index.html">Contents</a>
+    <a href="chapter-31.html">Next →</a>
+  </nav>
+</header>
+<main class="container">
+  <div class="chapter-head">
+    <span class="phase">Phase 12 · Interview Prep</span>
+    <h1>Chapter 30 — Interview Preparation</h1>
+    <p class="lead">You have spent twenty-nine chapters building a real mental model of identity: how OAuth 2.0 delegates access, how OpenID Connect layers identity on top of it, how a JWT is signed and verified, how Auth0 stitches it all together with Actions, Organizations, and the Management API. An interview is a different skill. It is not "do you know the answer" — it is "can you reason out loud, from first principles, under mild pressure, and convince a senior engineer that you would not blow up their production auth on a Friday night." This chapter turns your knowledge into <em>interview performance</em>. We will drill conceptual Q&amp;A, scenario questions, system-design whiteboards (design SSO; design auth for microservices), security deep-dives, and live debugging — each answered the way a strong candidate answers: define the term, state the trade-off, name the failure mode, then give the concrete Auth0 mechanism. We close with a full mock-interview script you can rehearse against a friend or a mirror.</p>
+  </div>
+
+  <!-- ============================================================= 1 -->
+  <section id="theory">
+    <h2>1. Theory — What an Interview Actually Measures</h2>
+    <p>Before drilling questions, understand the thing being scored. An identity/auth interview is rarely a memory test. The interviewer is sampling four dimensions, and every question is a probe into one of them:</p>
+    <table>
+      <thead><tr><th>Signal</th><th>What it means</th><th>How they probe it</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Conceptual depth</strong></td><td>Do you understand <em>why</em> a mechanism exists, not just its name?</td><td>"Why does OAuth even have an authorization code step?"</td></tr>
+        <tr><td><strong>Trade-off reasoning</strong></td><td>Can you pick between two valid options and justify it?</td><td>"Local JWT validation vs. token introspection — which and why?"</td></tr>
+        <tr><td><strong>Security instinct</strong></td><td>Do you reach for the safe default and spot the foot-gun?</td><td>"Where do you store the access token in a browser?"</td></tr>
+        <tr><td><strong>Operational maturity</strong></td><td>Have you actually run this in production?</td><td>"A token validates locally but the API still 401s — debug it."</td></tr>
+      </tbody>
+    </table>
+
+    <p>The single biggest differentiator between a junior and a senior answer is the <strong>trade-off sentence</strong>. A junior says "use PKCE." A senior says "use Authorization Code with PKCE for any public client — SPA, mobile, native — <em>because</em> a public client cannot keep a secret, so PKCE substitutes a per-request, dynamically generated proof (the code verifier) for the static client secret, which closes the authorization-code-interception attack." Same recommendation, vastly more signal.</p>
+
+    <h3>The first-principles chain you must own cold</h3>
+    <p>Almost every conceptual question reduces to one chain. Memorize the chain, not the answers:</p>
+    <ol>
+      <li><strong>Authentication (AuthN)</strong> = proving <em>who you are</em>. Output: an identity (the <code>id_token</code> in OIDC).</li>
+      <li><strong>Authorization (AuthZ)</strong> = deciding <em>what you may do</em>. Output: a grant (the <code>access_token</code> in OAuth).</li>
+      <li><strong>OAuth 2.0</strong> = a <em>delegation</em> framework. It lets a user grant an app limited access to an API <em>without</em> sharing their password. It says nothing about identity.</li>
+      <li><strong>OpenID Connect (OIDC)</strong> = a thin identity layer <em>on top of</em> OAuth 2.0. It standardizes the <code>id_token</code> (a JWT) and the <code>/userinfo</code> endpoint, so "log in with X" becomes interoperable.</li>
+      <li><strong>JWT</strong> = the <em>container format</em> for those tokens: a signed, base64url-encoded, self-describing claim set. It is not encryption; it is a tamper-evident envelope.</li>
+      <li><strong>Session</strong> = the <em>persistence</em> of an authenticated state over time — a cookie at the IdP (SSO session) and/or at your app (app session).</li>
+    </ol>
+    <div class="callout key"><span class="tag">Key</span><p>If you can fluently explain why OAuth alone is <em>not</em> authentication ("OAuth gives you a valet key to an API; it never promises the holder is the user"), you have already passed the bar most candidates fail. OIDC exists precisely because people misused OAuth for login and got it subtly wrong.</p></div>
+  </section>
+
+  <!-- ============================================================= 2 -->
+  <section id="story">
+    <h2>2. Story-Based Explanation — Two Candidates, One Question</h2>
+    <p>The interviewer asks the same question to two candidates: <em>"How does login with Auth0 work?"</em></p>
+    <p><strong>Priya (junior signal)</strong> says: "You add the Auth0 SDK, call <code>loginWithRedirect()</code>, the user types their password, and then you get a token you put in the header." Accurate-ish, but it's a list of API calls. It shows she has used a quickstart. It does not show she understands the protocol, so the interviewer cannot trust her with a novel problem.</p>
+    <p><strong>Sam (senior signal)</strong> says: "It's an OIDC Authorization Code flow with PKCE. My SPA redirects the browser to Auth0's <code>/authorize</code> endpoint with a generated code challenge. Auth0 authenticates the user — that establishes an SSO session as a cookie on the Auth0 domain — and redirects back to my callback with a short-lived, single-use authorization <em>code</em>. My app then POSTs that code plus the original code <em>verifier</em> to <code>/oauth/token</code>. Auth0 checks the verifier matches the challenge, and returns an <code>id_token</code> (who the user is) and an <code>access_token</code> (what they can call). I validate the ID token's signature against Auth0's JWKS, then send the access token as a Bearer header to my API, which validates it independently. The reason the code is exchanged server-side-style rather than returned directly is to keep the actual tokens out of the browser URL and history."</p>
+    <p>Same product, same SDK. But Sam named the flow, the endpoints, the security reason for each step, and the validation responsibilities. <strong>That</strong> is the gap this chapter closes. The trick is not knowing more — it's narrating the <em>why</em> at every hop.</p>
+    <div class="callout tip"><span class="tag">Tip</span><p>When you don't know an exact detail, narrate your reasoning anyway: "I'd expect Auth0 to rotate the refresh token here, because reuse detection requires a one-time-use token — let me reason about what happens if it didn't." Interviewers reward visible thinking over confident silence.</p></div>
+  </section>
+
+  <!-- ============================================================= 3 -->
+  <section id="diagrams">
+    <h2>3. ASCII Diagrams — The Whiteboards You Will Draw</h2>
+
+    <h3>3.1 Authorization Code + PKCE (the flow you'll be asked to draw most)</h3>
+    <pre class="diagram">
+  Browser/SPA            Auth0 (/authorize, /oauth/token)         Your API
+  ───────────            ────────────────────────────────         ────────
+      │  1. generate code_verifier + code_challenge (S256)            │
+      │─────── GET /authorize?code_challenge=...&amp;state=... ──▶     │
+      │                          │ user logs in (SSO cookie set)      │
+      │◀──── 302 redirect to /callback?code=AUTH_CODE&amp;state=... ──│
+      │                          │                                    │
+      │── POST /oauth/token  code=AUTH_CODE + code_verifier ─▶        │
+      │                          │ verify SHA256(verifier)==challenge │
+      │◀──── { id_token, access_token, refresh_token } ──────────────│
+      │                                                               │
+      │──── GET /resource   Authorization: Bearer access_token ──────▶│
+      │                                          validate JWT (JWKS)  │
+      │◀──────────────────────  200 OK  ─────────────────────────────│
+    </pre>
+
+    <h3>3.2 SSO across multiple apps (one IdP session, many app sessions)</h3>
+    <pre class="diagram">
+                       ┌──────────────────────────┐
+                       │   Auth0 (Identity Prov.)  │
+                       │   SSO session cookie       │
+                       │   on tenant.auth0.com      │
+                       └────────▲───────▲───────────┘
+        first login →           │       │           ← later: NO password
+        redirect+authenticate   │       │             (cookie already valid,
+                                 │       │              silent /authorize)
+              ┌──────────────────┘       └──────────────────┐
+              │                                              │
+        ┌─────┴──────┐                                ┌──────┴─────┐
+        │  App A      │                                │  App B      │
+        │ (mail)      │                                │ (calendar)  │
+        │ own session │                                │ own session │
+        └─────────────┘                                └─────────────┘
+      Single Sign-On = ONE IdP session reused to mint MANY app sessions.
+      Single Logout  = killing the IdP session must also notify the apps.
+    </pre>
+
+    <h3>3.3 Auth for microservices (token at the edge, trust inside)</h3>
+    <pre class="diagram">
+   Client ──Bearer JWT──▶ ┌───────────────┐
+                          │  API Gateway   │  validate JWT once (sig+aud+exp)
+                          │  / BFF         │  enrich: user_id, scopes, org
+                          └──────┬─────────┘
+                                 │ propagate identity (signed internal JWT
+                                 │ or trusted header) — NOT the user password
+            ┌────────────────────┼────────────────────┐
+            ▼                     ▼                     ▼
+      ┌───────────┐        ┌───────────┐        ┌───────────┐
+      │ orders-svc │        │ billing-svc│        │ users-svc  │
+      │ checks      │        │ checks      │        │ checks      │
+      │ scope:write │        │ scope:read  │        │ scope:read  │
+      └───────────┘        └───────────┘        └───────────┘
+      Edge authenticates. Each service authorizes its own resources.
+    </pre>
+
+    <h3>3.4 Where a token can leak (the security whiteboard)</h3>
+    <pre class="diagram">
+   [ URL / browser history ] ◀ implicit flow returned tokens here (BAD)
+   [ localStorage ]          ◀ readable by ANY XSS → token theft
+   [ JS-accessible memory ]  ◀ XSS can read while page is open
+   [ httpOnly Secure cookie ]◀ not readable by JS; needs CSRF defense
+   [ server-side session ]   ◀ token never reaches browser (BFF pattern)
+
+   Threat ranking (browser):  BFF/httpOnly  >  in-memory  >>  localStorage
+    </pre>
+    <div class="callout note"><span class="tag">Note</span><p>Practice drawing 3.1 and 3.3 on paper in under 90 seconds each. In a real whiteboard round you draw <em>while</em> talking; fluency with the boxes frees your mouth to explain the why.</p></div>
+  </section>
+
+  <!-- ============================================================= 4 -->
+  <section id="analogy">
+    <h2>4. Real-World Analogy — The Hotel</h2>
+    <p>Map every confusing token concept onto a hotel, and the vocabulary stops being abstract:</p>
+    <table>
+      <thead><tr><th>Concept</th><th>Hotel equivalent</th><th>Why the analogy holds</th></tr></thead>
+      <tbody>
+        <tr><td>Authentication</td><td>Showing your passport at the front desk</td><td>Proves <em>who you are</em>, once, at a trusted authority.</td></tr>
+        <tr><td>ID token (OIDC)</td><td>The registration record with your name</td><td>Describes <em>who</em> checked in. For the front desk, not the doors.</td></tr>
+        <tr><td>Access token (OAuth)</td><td>The room key card</td><td>Grants <em>access to specific resources</em>. The door doesn't know your name; it checks the key.</td></tr>
+        <tr><td>Scopes</td><td>Key encodes: room 412 + gym, not the vault</td><td>Least-privilege: the card opens only what it should.</td></tr>
+        <tr><td>Token expiry</td><td>Card stops working at checkout</td><td>Short-lived credentials limit blast radius if stolen.</td></tr>
+        <tr><td>Refresh token</td><td>Your reservation lets you re-cut a new card</td><td>Long-lived, kept safe, used only to mint fresh short-lived keys.</td></tr>
+        <tr><td>JWT signature</td><td>Hologram/magstripe the door reader trusts</td><td>The door verifies authenticity <em>offline</em>, without calling the desk.</td></tr>
+        <tr><td>Token introspection</td><td>Door phones the front desk to check the card</td><td>Always current (handles revocation) but slower and coupled.</td></tr>
+        <tr><td>SSO</td><td>One check-in opens room, gym, and spa</td><td>Authenticate once, access many independent doors.</td></tr>
+      </tbody>
+    </table>
+    <p>The killer follow-up: "Why does the door not phone the desk every time?" Answer: <em>performance and decoupling</em>. The hologram (signature) lets the door decide locally in microseconds; phoning the desk (introspection) is only worth it when instant revocation matters more than latency. That single analogy lets you reason about JWT vs. opaque tokens, local validation vs. introspection, and access-token lifetime all at once.</p>
+  </section>
+
+  <!-- ============================================================= 5 -->
+  <section id="internals">
+    <h2>5. Internal Working — What Happens Beneath the SDK</h2>
+    <p>Interviewers love to peel back the SDK. Be ready to explain each layer.</p>
+
+    <h3>5.1 Anatomy of a JWT</h3>
+    <p>A JWT is three base64url segments joined by dots: <code>header.payload.signature</code>. It is <em>signed, not encrypted</em> — anyone can read the payload, but no one can alter it without breaking the signature.</p>
+    <pre><code class="language-text">eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6ImFiYzEyMyJ9   ← header
+.eyJzdWIiOiJhdXRoMHwxMjMiLCJhdWQiOiJodHRwczovL2FwaSIsImV4cCI6MTcwMH0   ← payload
+.SflKxwRJ...signature...                                     ← signature
+
+HEADER  { "alg":"RS256", "typ":"JWT", "kid":"abc123" }   // which key signed it
+PAYLOAD { "iss":"https://tenant.auth0.com/",             // issuer
+          "sub":"auth0|123",                              // subject (user id)
+          "aud":"https://api.example.com",                // audience (your API)
+          "exp":1700000000, "iat":1699996400,             // expiry / issued-at
+          "scope":"read:orders write:orders",
+          "azp":"client_id..." }
+SIGNATURE = RS256( base64url(header) + "." + base64url(payload), privateKey )</code></pre>
+
+    <h3>5.2 How an API verifies a token (the exact checklist)</h3>
+    <p>This is the most testable internal in the whole chapter. A correct verifier does <strong>all</strong> of these — skipping any one is a security bug:</p>
+    <ol>
+      <li><strong>Parse</strong> the header, read <code>kid</code> (key ID).</li>
+      <li><strong>Fetch the public key</strong> from the issuer's JWKS endpoint <code>https://tenant.auth0.com/.well-known/jwks.json</code> matching that <code>kid</code> (cache it!).</li>
+      <li><strong>Verify the signature</strong> with that key using the algorithm in <code>alg</code> — but pin the expected algorithm (RS256) to defeat <code>alg:none</code> and HS/RS confusion attacks.</li>
+      <li><strong>Check <code>exp</code></strong> (not expired) and optionally <code>nbf</code>/<code>iat</code> with small clock skew.</li>
+      <li><strong>Check <code>iss</code></strong> equals your exact issuer URL.</li>
+      <li><strong>Check <code>aud</code></strong> contains your API's identifier — this stops a token minted for App B being replayed at API A.</li>
+      <li><strong>Check <code>scope</code>/permissions</strong> for the specific operation.</li>
+    </ol>
+
+    <h3>5.3 Why RS256 over HS256</h3>
+    <p>HS256 is symmetric: the same secret signs and verifies, so every service that verifies could also <em>forge</em> tokens. RS256 is asymmetric: Auth0 holds the private key (signs), and every API holds only the public key (verifies). A leaked verifier key cannot mint tokens. For any multi-service architecture, RS256 is the default. <strong>HS/RS confusion</strong> is the classic exploit: an attacker re-signs a token with HS256 using your <em>public</em> key as the HMAC secret; a naive library that trusts the header's <code>alg</code> accepts it. Defense: explicitly require RS256.</p>
+    <div class="callout danger"><span class="tag">Danger</span><p>Never let the token's own <code>alg</code> header choose the verification algorithm. Always pass the expected algorithm to your JWT library. "Trusting the header" is the root of both <code>alg:none</code> and HS/RS confusion attacks — a guaranteed follow-up in any security round.</p></div>
+  </section>
+
+  <!-- ============================================================= 6 -->
+  <section id="walkthrough">
+    <h2>6. Code Walkthrough — The Snippets You'll Be Asked to Write</h2>
+    <p>You may be asked to "write a middleware that validates an Auth0 token" on a shared editor. Have these memorized in at least one stack. Comments are the <em>narration</em> the interviewer wants to hear.</p>
+
+    <h4>Node.js / Express — resource server validating an access token</h4>
+    <pre><code class="language-javascript">const { auth, requiredScopes } = require('express-oauth2-jwt-bearer');
+
+// Validates: RS256 signature via JWKS, exp, iss, aud — in one middleware.
+const checkJwt = auth({
+  audience: 'https://api.example.com',          // MUST match token aud
+  issuerBaseURL: 'https://tenant.auth0.com/',   // MUST match token iss
+  tokenSigningAlg: 'RS256',                      // pin algorithm — no alg:none
+});
+
+app.get('/orders',
+  checkJwt,                                      // 1) authenticate the token
+  requiredScopes('read:orders'),                // 2) authorize the operation
+  (req, res) =&gt; {
+    const userId = req.auth.payload.sub;         // trustworthy: signature-verified
+    res.json({ orders: getOrdersFor(userId) });
+  });</code></pre>
+
+    <h4>Java Spring Boot — resource server (Spring Security)</h4>
+    <pre><code class="language-java">// application.yml
+// spring.security.oauth2.resourceserver.jwt:
+//   issuer-uri: https://tenant.auth0.com/
+//   audiences: https://api.example.com
+
+@Configuration
+@EnableMethodSecurity
+public class SecurityConfig {
+  @Bean
+  SecurityFilterChain filter(HttpSecurity http) throws Exception {
+    http.authorizeHttpRequests(a -&gt; a
+          .requestMatchers("/public").permitAll()
+          .anyRequest().authenticated())
+        .oauth2ResourceServer(o -&gt; o.jwt());  // validates sig+iss+aud+exp via JWKS
+    return http.build();
+  }
+}
+
+@RestController
+class OrderController {
+  @GetMapping("/orders")
+  @PreAuthorize("hasAuthority('SCOPE_read:orders')")  // scope-based authz
+  List&lt;Order&gt; list(@AuthenticationPrincipal Jwt jwt) {
+    return service.forUser(jwt.getSubject());          // sub = Auth0 user id
+  }
+}</code></pre>
+
+    <h4>React SPA — Authorization Code + PKCE via the SDK</h4>
+    <pre><code class="language-jsx">import { Auth0Provider, useAuth0 } from '@auth0/auth0-react';
+
+// PKCE is handled automatically; tokens kept in memory by default (not localStorage).
+&lt;Auth0Provider
+  domain="tenant.auth0.com"
+  clientId="SPA_CLIENT_ID"
+  authorizationParams={{
+    redirect_uri: window.location.origin,
+    audience: 'https://api.example.com',   // ask for an access token for THIS api
+    scope: 'openid profile read:orders',
+  }}&gt;
+  &lt;App /&gt;
+&lt;/Auth0Provider&gt;
+
+function Orders() {
+  const { getAccessTokenSilently } = useAuth0();
+  async function load() {
+    const token = await getAccessTokenSilently();        // silent refresh
+    const r = await fetch('/api/orders', {
+      headers: { Authorization: `Bearer ${token}` },     // Bearer scheme
+    });
+    return r.json();
+  }
+}</code></pre>
+
+    <h4>FastAPI — verifying the JWT manually (shows you know the internals)</h4>
+    <pre><code class="language-python">import jwt                       # PyJWT
+from jwt import PyJWKClient
+from fastapi import Depends, HTTPException, Header
+
+ISSUER  = "https://tenant.auth0.com/"
+AUDIENCE = "https://api.example.com"
+jwks = PyJWKClient(f"{ISSUER}.well-known/jwks.json")   # caches keys
+
+def verify(authorization: str = Header(...)):
+    token = authorization.removeprefix("Bearer ").strip()
+    key = jwks.get_signing_key_from_jwt(token).key      # match by kid
+    try:
+        return jwt.decode(token, key,
+                          algorithms=["RS256"],          # pin algorithm
+                          audience=AUDIENCE, issuer=ISSUER)  # check aud + iss
+    except jwt.PyJWTError:
+        raise HTTPException(401, "invalid token")
+
+@app.get("/orders")
+def orders(claims: dict = Depends(verify)):
+    return {"user": claims["sub"]}</code></pre>
+
+    <h4>curl — exchanging a code / calling the API (Postman-equivalent)</h4>
+    <pre><code class="language-bash"># Machine-to-machine: client credentials grant (no user)
+curl --request POST 'https://tenant.auth0.com/oauth/token' \
+  --header 'content-type: application/json' \
+  --data '{
+    "grant_type":"client_credentials",
+    "client_id":"M2M_CLIENT_ID",
+    "client_secret":"M2M_SECRET",
+    "audience":"https://api.example.com"
+  }'
+# -> { "access_token":"eyJ...", "token_type":"Bearer", "expires_in":86400 }
+
+# Call the protected API with the Bearer token
+curl 'https://api.example.com/orders' \
+  --header 'Authorization: Bearer eyJ...'</code></pre>
+    <div class="callout tip"><span class="tag">Tip</span><p>In Postman, set the Authorization tab to <em>OAuth 2.0</em>, grant type <em>Authorization Code (With PKCE)</em>, fill the Auth0 <code>/authorize</code> and <code>/oauth/token</code> URLs, and let Postman do the dance. Mentioning this in an interview signals real hands-on tooling experience.</p></div>
+  </section>
+
+  <!-- ============================================================= 7 -->
+  <section id="practical">
+    <h2>7. Practical Implementation — A 5-Minute Preparation Drill</h2>
+    <p>Knowing answers is not the same as <em>retrieving</em> them under pressure. Build the recall with this repeatable drill, run daily for two weeks before an interview:</p>
+    <ol>
+      <li><strong>The 60-second flow.</strong> Out loud, with no notes, narrate Authorization Code + PKCE end to end. Time yourself. Repeat until smooth.</li>
+      <li><strong>The whiteboard sprint.</strong> Draw diagram 3.3 (microservices auth) from memory in under 2 minutes, narrating each box.</li>
+      <li><strong>The trade-off table.</strong> For five pairs — <em>JWT vs opaque, localStorage vs httpOnly cookie, RS256 vs HS256, access vs refresh token, RBAC vs ABAC</em> — say the one-sentence "use X when Y because Z."</li>
+      <li><strong>The debug script.</strong> Pick one failure (401 with a valid-looking token) and recite the diagnostic ladder (audience &rarr; issuer &rarr; algorithm &rarr; clock skew &rarr; scopes &rarr; JWKS cache).</li>
+      <li><strong>The STAR story.</strong> Have one real (or course-project) story: "I integrated Auth0 into X, hit problem Y, fixed it by Z, learned W."</li>
+    </ol>
+    <p>The goal is <em>automaticity</em>: the structures should fall out of your mouth so your conscious attention is free for the novel twist the interviewer adds.</p>
+  </section>
+
+  <!-- ============================================================= 8 -->
+  <section id="architecture">
+    <h2>8. Production Architecture — The Two Design Questions You Must Nail</h2>
+
+    <h3>8.1 "Design Single Sign-On for our suite of products"</h3>
+    <p>Structure your answer in this order: <em>requirements &rarr; protocol choice &rarr; session model &rarr; logout &rarr; edge cases</em>.</p>
+    <ul>
+      <li><strong>Clarify first.</strong> "How many apps? Same company or third parties? Web only or mobile too? Do you need enterprise federation (SAML/OIDC to customer IdPs)?" Asking this is itself a strong signal.</li>
+      <li><strong>Protocol.</strong> Use OIDC with Auth0 as the central IdP. Each app is a separate OIDC client. The shared <strong>SSO session</strong> lives as a cookie on the Auth0 tenant domain.</li>
+      <li><strong>Session model.</strong> First login authenticates and sets the IdP cookie. Subsequent apps do a <em>silent</em> <code>/authorize</code> (<code>prompt=none</code>); because the IdP cookie is valid, the user is bounced back with a code, no password prompt. Each app then mints its <em>own</em> app session.</li>
+      <li><strong>Logout.</strong> Distinguish app logout (kill local session) from <strong>Single Logout</strong> (kill the IdP session via Auth0's <code>/v2/logout</code> and propagate via OIDC back-channel logout / session-management to sibling apps).</li>
+      <li><strong>Enterprise twist.</strong> For B2B, add Organizations + Connections so each customer brings their own IdP; Auth0 federates upstream and still issues your standard tokens downstream.</li>
+    </ul>
+
+    <h3>8.2 "Design authentication &amp; authorization for a microservices platform"</h3>
+    <ul>
+      <li><strong>Authenticate at the edge.</strong> An API gateway / BFF validates the Bearer JWT once (signature, <code>aud</code>, <code>iss</code>, <code>exp</code>). Internal services trust the edge but still <em>authorize</em> their own resources by scope/permission.</li>
+      <li><strong>Identity propagation.</strong> Don't forward the raw user token blindly to every hop; mint a short-lived internal token or pass a signed, scoped identity header. This limits the audience and blast radius.</li>
+      <li><strong>Service-to-service.</strong> Use the <strong>client credentials</strong> grant (M2M) — no user present. Each service is its own Auth0 client with its own scopes.</li>
+      <li><strong>Token strategy.</strong> JWT for stateless, low-latency validation; add introspection or a short TTL + revocation list only where instant revocation matters.</li>
+      <li><strong>Authorization model.</strong> RBAC for coarse roles; push fine-grained, relationship-based checks (Auth0 FGA / ReBAC) to a dedicated authorization service when ownership graphs get complex.</li>
+    </ul>
+    <div class="callout key"><span class="tag">Key</span><p>In any design round, the phrase interviewers wait for is <strong>"it depends, and here's the axis it depends on."</strong> Name the trade-off axis (latency vs. revocation freshness, simplicity vs. flexibility) and you've shown senior judgment even before picking a side.</p></div>
+  </section>
+
+  <!-- ============================================================= 9 -->
+  <section id="security">
+    <h2>9. Security Analysis — The Questions That Separate Seniors</h2>
+    <table>
+      <thead><tr><th>Question</th><th>The answer that wins</th></tr></thead>
+      <tbody>
+        <tr><td>Where do you store tokens in a browser?</td><td>Best: never expose them — use the <strong>BFF</strong> pattern (token stays server-side, browser gets an httpOnly Secure SameSite cookie). If the SPA must hold one, keep it <strong>in memory</strong>, never <code>localStorage</code> (any XSS reads it). Refresh via silent auth or rotating refresh tokens.</td></tr>
+        <tr><td>Why is the Implicit flow deprecated?</td><td>It returned tokens in the URL fragment — leaking to history, logs, referrers — and had no client authentication. Authorization Code + PKCE replaced it: the token never appears in the redirect, and PKCE binds the code to the requester.</td></tr>
+        <tr><td>What is refresh-token rotation / reuse detection?</td><td>Each refresh issues a new refresh token and invalidates the old one. If an old (already-used) token is presented, Auth0 detects theft and revokes the whole family — turning a stolen token into a self-defeating one.</td></tr>
+        <tr><td>How do you prevent CSRF in OAuth?</td><td>The <code>state</code> parameter: a random value sent to <code>/authorize</code> and verified on callback, binding the response to <em>this</em> browser's request. For OIDC also use <code>nonce</code> to bind the ID token to the request.</td></tr>
+        <tr><td>What's a confused-deputy / audience attack?</td><td>A token minted for API A replayed against API B. Defense: every API strictly validates <code>aud</code> equals its own identifier.</td></tr>
+        <tr><td>How do you revoke a stateless JWT?</td><td>You can't truly revoke a signed JWT before <code>exp</code>. Mitigations: short access-token TTL (5–15 min), refresh-token revocation, a denylist of <code>jti</code>, or switch to introspection for high-risk operations.</td></tr>
+      </tbody>
+    </table>
+    <div class="callout danger"><span class="tag">Danger</span><p>If you ever say "store the JWT in localStorage so it survives refresh," expect an immediate follow-up on XSS. The correct senior reflex is: <em>localStorage is XSS-readable; prefer in-memory + silent refresh, or the BFF pattern with httpOnly cookies.</em></p></div>
+  </section>
+
+  <!-- ============================================================= 10 -->
+  <section id="performance">
+    <h2>10. Performance Considerations — Latency the Interviewer Cares About</h2>
+    <ul>
+      <li><strong>Cache the JWKS.</strong> Fetching the public key on every request adds a network round-trip and can rate-limit you. Cache keys by <code>kid</code> and refresh on rotation/miss. This is the single most common performance question.</li>
+      <li><strong>Local JWT validation is microseconds; introspection is a network call.</strong> Default to local validation; reserve introspection for revocation-critical paths.</li>
+      <li><strong>Right-size token lifetime.</strong> Short access tokens (good for security) mean more refreshes (more traffic). Balance: short access TTL + longer rotating refresh tokens.</li>
+      <li><strong>Keep tokens lean.</strong> A bloated token (huge custom claims, full permission lists) inflates every request header and can blow past header-size limits. Put large/volatile data behind a lookup keyed by <code>sub</code>, not in the token.</li>
+      <li><strong>Silent auth uses an iframe / refresh token, not a full redirect.</strong> Know that <code>getAccessTokenSilently</code> avoids a page reload but still hits Auth0 when the cached token expires.</li>
+    </ul>
+    <pre class="diagram">
+   per-request cost:
+   local JWT verify  ▏▎ ~50µs (cached JWKS)
+   introspection     ▏▔▔▔▔▔▔▔▔▔▔▔▔ ~20–100ms (network)
+   choose local unless you need instant revocation
+    </pre>
+  </section>
+
+  <!-- ============================================================= 11 -->
+  <section id="mistakes">
+    <h2>11. Common Mistakes — In the Interview and In the Code</h2>
+    <h4>Interview-behavior mistakes</h4>
+    <ul>
+      <li><strong>Jumping to the SDK call</strong> instead of naming the protocol. Lead with the flow and the why.</li>
+      <li><strong>Conflating authentication and authorization.</strong> The fastest way to lose senior credibility.</li>
+      <li><strong>Saying "OAuth is for login."</strong> OAuth is delegation; OIDC is login. Get this exactly right.</li>
+      <li><strong>Not asking clarifying questions</strong> in design rounds. Diving straight into a solution signals juniority.</li>
+      <li><strong>Confident silence when stuck.</strong> Narrate your reasoning; partial credit is real.</li>
+    </ul>
+    <h4>Technical mistakes interviewers fish for</h4>
+    <ul>
+      <li>Validating signature but <strong>forgetting <code>aud</code> and <code>iss</code></strong> checks.</li>
+      <li>Letting the token's <code>alg</code> header pick the algorithm (<code>alg:none</code> / HS-RS confusion).</li>
+      <li>Storing tokens in <code>localStorage</code>.</li>
+      <li>Using the <strong>ID token to call an API</strong> — it's for the client; APIs validate the <em>access</em> token.</li>
+      <li>Treating an <strong>expired token as a server bug</strong> rather than triggering a refresh.</li>
+      <li>Using HS256 across many services (any verifier can forge).</li>
+    </ul>
+    <div class="callout warn"><span class="tag">Warn</span><p>The ID-token-vs-access-token mix-up is the most common real-world Auth0 bug <em>and</em> a favorite interview trap. ID token = "who is this user" (for your front end). Access token = "what may this caller do" (for your API). Send the access token to APIs.</p></div>
+  </section>
+
+  <!-- ============================================================= 12 -->
+  <section id="best-practices">
+    <h2>12. Best Practices — Your Default Recommendations</h2>
+    <ul>
+      <li><strong>Always</strong> use Authorization Code + PKCE for public clients; client credentials for M2M.</li>
+      <li><strong>Always</strong> validate signature + <code>iss</code> + <code>aud</code> + <code>exp</code>, and <strong>pin the algorithm</strong> to RS256.</li>
+      <li>Prefer the <strong>BFF pattern</strong> for browser apps; otherwise in-memory tokens + silent refresh, never localStorage.</li>
+      <li>Short access-token TTL + <strong>rotating refresh tokens with reuse detection</strong>.</li>
+      <li><strong>Cache JWKS</strong> by <code>kid</code>; refresh on rotation.</li>
+      <li>Use <code>state</code> (CSRF) and <code>nonce</code> (ID-token binding) on every authorize request.</li>
+      <li>Keep tokens lean; enrich claims via Auth0 <strong>Actions</strong>, not by stuffing the token.</li>
+      <li>Centralize identity (one IdP), distribute authorization (each service owns its checks).</li>
+      <li>In answers, always pair a recommendation with its <strong>trade-off and failure mode</strong>.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================= 13 -->
+  <section id="interview-questions">
+    <h2>13. Interview Questions — With Model Answers</h2>
+
+    <h3>Conceptual</h3>
+    <p><strong>Q1. What's the difference between authentication and authorization, and which Auth0 token represents each?</strong><br>
+    <em>Model:</em> Authentication proves <em>who you are</em> (output: OIDC <code>id_token</code>). Authorization decides <em>what you may do</em> (output: OAuth <code>access_token</code>). The ID token is for the client to know the user; the access token is sent to the API as a Bearer credential. Confusing them — e.g., sending the ID token to an API — is a classic bug.</p>
+
+    <p><strong>Q2. Why does OAuth need OIDC on top of it for login?</strong><br>
+    <em>Model:</em> OAuth 2.0 only delegates <em>access</em> to resources; possession of an access token does not prove the holder is the user, nor in a standard way tell you who they are. People hacked login on top of OAuth and got it subtly wrong (e.g., trusting <code>/userinfo</code>-style endpoints insecurely). OIDC standardizes identity: a signed <code>id_token</code> with defined claims (<code>sub</code>, <code>iss</code>, <code>aud</code>, <code>nonce</code>) and a discovery document, making "log in with X" interoperable and verifiable.</p>
+
+    <p><strong>Q3. Walk me through verifying a JWT.</strong><br>
+    <em>Model:</em> Read <code>kid</code> from the header, fetch the matching public key from the issuer's JWKS (cached), verify the signature with a <em>pinned</em> RS256 algorithm, then check <code>exp</code>/<code>nbf</code> with small skew, <code>iss</code> equals my issuer, <code>aud</code> contains my API id, and the required <code>scope</code>. Skipping <code>aud</code> allows cross-API replay; trusting the header's <code>alg</code> allows <code>alg:none</code>.</p>
+
+    <h3>Scenario</h3>
+    <p><strong>Q4. Your SPA needs to call your API. What flow, where do tokens live, how do you refresh?</strong><br>
+    <em>Model:</em> Authorization Code + PKCE (SPA is a public client). Tokens in memory (or the BFF pattern with httpOnly cookies). Refresh via silent auth / rotating refresh tokens with reuse detection. Never localStorage.</p>
+
+    <p><strong>Q5. A backend cron job must call your API with no user present. How?</strong><br>
+    <em>Model:</em> Client credentials grant. Register an M2M application in Auth0, grant it the needed API scopes, and have the job exchange client_id/secret for an access token at <code>/oauth/token</code>.</p>
+
+    <h3>System design</h3>
+    <p><strong>Q6. Design SSO for five internal apps.</strong> (See §8.1.) <em>Model skeleton:</em> clarify scope &rarr; OIDC with Auth0 as central IdP &rarr; shared IdP session cookie + silent <code>prompt=none</code> per app &rarr; per-app sessions &rarr; single logout via back-channel &rarr; Organizations for B2B federation.</p>
+
+    <p><strong>Q7. Design auth for microservices.</strong> (See §8.2.) <em>Model skeleton:</em> authenticate JWT at the gateway, propagate scoped identity inward, each service authorizes its own resources, client credentials for service-to-service, JWT + short TTL with introspection only where revocation is critical.</p>
+
+    <h3>Security</h3>
+    <p><strong>Q8. How would you handle logout so a stolen token can't keep working?</strong><br>
+    <em>Model:</em> Short access-token TTL limits the window; revoke the refresh token (and its rotation family) on logout; for high-risk paths use introspection or a <code>jti</code> denylist; kill the IdP session via <code>/v2/logout</code> and propagate single logout. Acknowledge honestly that a stateless JWT can't be revoked before expiry — that limitation drives the short-TTL design.</p>
+
+    <p><strong>Q9. Explain a real attack against JWTs and its defense.</strong><br>
+    <em>Model:</em> <code>alg:none</code> (strip the signature) and HS/RS confusion (re-sign with HS256 using the public key as the HMAC secret). Both exploit libraries that trust the token's own <code>alg</code>. Defense: always pin the expected algorithm; never derive it from the header.</p>
+
+    <h3>Debugging</h3>
+    <p><strong>Q10. The token validates in jwt.io but my API returns 401. Walk me through debugging.</strong> (See §15 ladder.) <em>Model:</em> Almost always <code>aud</code> mismatch (no audience requested, so you got an opaque/ID token, or the wrong API id), then <code>iss</code> trailing-slash mismatch, then algorithm pinning, then clock skew, then missing scope, then a stale JWKS cache after key rotation.</p>
+    <div class="callout tip"><span class="tag">Tip</span><p>End every model answer with one sentence of trade-off or failure mode. It converts a "correct" answer into a "senior" answer.</p></div>
+  </section>
+
+  <!-- ============================================================= 14 -->
+  <section id="cert-tips">
+    <h2>14. Certification Tips — Mapping Interview Prep to the Auth0 Exam</h2>
+    <p>The Auth0 Certified Developer / Lab exams reward the same fundamentals, but phrased as product features. Bridge your interview knowledge to exam vocabulary:</p>
+    <ul>
+      <li><strong>Flows:</strong> Know which grant maps to which app type — Regular Web App (Auth Code), SPA (Auth Code + PKCE), Native (Auth Code + PKCE), M2M (Client Credentials). The exam loves "which flow for which client."</li>
+      <li><strong>Tokens:</strong> ID token (OIDC, for the client) vs. access token (OAuth, for the API) vs. refresh token (rotation). Audience and issuer validation are exam staples.</li>
+      <li><strong>Customization:</strong> <strong>Actions</strong> (post-login, machine-to-machine) for adding claims, MFA, and gating; the older Rules/Hooks are deprecated — say Actions.</li>
+      <li><strong>Connections:</strong> Database, Social, Enterprise (SAML/OIDC), Passwordless. Know Universal Login is the recommended, hosted, customizable login.</li>
+      <li><strong>B2B:</strong> Organizations, member roles, organization-specific connections, invitations.</li>
+      <li><strong>Operations:</strong> Management API vs. Authentication API; tenants and environments (dev/staging/prod) and how to promote config.</li>
+      <li><strong>Exam strategy:</strong> Eliminate answers that violate a security default (localStorage, implicit flow, HS256 across services) — they're almost always wrong.</li>
+    </ul>
+    <div class="callout note"><span class="tag">Note</span><p>If a multiple-choice option recommends storing tokens in <code>localStorage</code>, using the implicit flow, or trusting the token's <code>alg</code> header, it is a distractor. The exam, like a good interviewer, scores secure defaults.</p></div>
+  </section>
+
+  <!-- ============================================================= 15 -->
+  <section id="hands-on">
+    <h2>15. Hands-On Exercises — The Debugging Ladder</h2>
+    <p>Debugging questions are pure operational signal. Internalize this <strong>diagnostic ladder</strong> and practice reciting it for each symptom.</p>
+
+    <h4>Symptom A: valid-looking token, API returns 401</h4>
+    <pre class="diagram">
+   1. aud      → did you request audience? token aud == API identifier?
+   2. iss      → exact match incl. trailing slash (https://t.auth0.com/)?
+   3. alg      → API pinned to RS256? token actually RS256?
+   4. exp/skew → expired? server clock drift &gt; allowed skew?
+   5. scope    → token missing the required permission?
+   6. JWKS     → key rotated? cache stale → refetch by kid
+   7. token    → are you sending the ACCESS token, not the ID token?
+    </pre>
+
+    <h4>Symptom B: CORS error on the token or API call</h4>
+    <p>CORS is a <em>browser</em> enforcement, not an auth failure. Diagnose: is the request origin in Auth0's <strong>Allowed Web Origins / Allowed Origins (CORS)</strong>? Does <em>your API</em> return the right <code>Access-Control-Allow-Origin</code> and handle the preflight <code>OPTIONS</code>? A 401 disguised as CORS often means the failed response simply lacks CORS headers — fix the auth, the "CORS error" disappears.</p>
+
+    <h4>Symptom C: redirect/callback error (<code>callback URL mismatch</code>)</h4>
+    <p>The exact <code>redirect_uri</code> sent to <code>/authorize</code> must be listed in the application's <strong>Allowed Callback URLs</strong> — character-for-character, including scheme, port, and trailing slash. Also confirm <code>state</code> round-trips (CSRF) and, for OIDC, that <code>nonce</code> matches.</p>
+
+    <h4>Exercise tasks</h4>
+    <ol>
+      <li>Deliberately request a token <em>without</em> an audience, call your API, observe the 401, and explain why (you got an opaque token / wrong aud).</li>
+      <li>Decode a real token on jwt.io and read off <code>iss</code>, <code>aud</code>, <code>exp</code>, <code>scope</code> aloud.</li>
+      <li>Rotate your signing key in Auth0 (or simulate) and confirm your JWKS cache refetches.</li>
+      <li>Trigger a callback-URL-mismatch on purpose and fix it.</li>
+    </ol>
+  </section>
+
+  <!-- ============================================================= 16 -->
+  <section id="assignment">
+    <h2>16. Assignment — Build Your Interview Portfolio</h2>
+    <p>Produce these artifacts; they double as interview talking points:</p>
+    <ol>
+      <li><strong>A one-page protocol cheat sheet</strong> (your own words) covering OAuth grants, OIDC tokens, and the JWT validation checklist.</li>
+      <li><strong>Two annotated diagrams</strong> you can redraw from memory: Auth Code + PKCE, and microservices auth.</li>
+      <li><strong>A working mini-API</strong> (any stack from §6) that validates Auth0 tokens, with a deliberately broken branch (missing <code>aud</code> check) you can explain.</li>
+      <li><strong>A 90-second spoken answer</strong>, recorded, to "How does Auth0 login work?" — review it for filler words and missing trade-offs.</li>
+      <li><strong>Five STAR stories</strong> from your course projects: one each on integration, debugging, a security decision, a design trade-off, and a production incident (real or simulated).</li>
+    </ol>
+  </section>
+
+  <!-- ============================================================= 17 -->
+  <section id="mini-project">
+    <h2>17. Mini Project — The Mock Interview Script</h2>
+    <p>Rehearse this end-to-end with a partner. Italics are coaching notes, not spoken.</p>
+
+    <blockquote>
+      <p><strong>Interviewer:</strong> Tell me how a user logs into a single-page app with Auth0.</p>
+      <p><strong>You:</strong> It's an OIDC Authorization Code flow with PKCE because the SPA is a public client that can't keep a secret. The app generates a code verifier and its SHA-256 challenge, redirects the browser to Auth0's <code>/authorize</code> with the challenge and a <code>state</code> value. Auth0 authenticates the user, which sets the SSO session cookie on the Auth0 domain, and redirects back to my callback with a one-time authorization code. My app POSTs that code plus the original verifier to <code>/oauth/token</code>; Auth0 confirms the verifier hashes to the challenge and returns an ID token and an access token. I validate the ID token against the JWKS and send the access token as a Bearer header to my API. <em>(Named flow, endpoints, why PKCE, what each token is for.)</em></p>
+
+      <p><strong>Interviewer:</strong> Why PKCE and not just a client secret?</p>
+      <p><strong>You:</strong> A browser app ships its source to the user, so any embedded secret is public. PKCE replaces the static secret with a per-request dynamic proof: only the client that generated the verifier can redeem the code, which closes the authorization-code-interception attack. <em>(Trade-off + named attack.)</em></p>
+
+      <p><strong>Interviewer:</strong> Where do you store the tokens?</p>
+      <p><strong>You:</strong> Ideally I don't expose them to the browser at all — the BFF pattern keeps tokens server-side and gives the browser an httpOnly, Secure, SameSite cookie, so XSS can't read a token and CSRF is mitigated by SameSite plus a token. If the SPA must hold one, in memory only — never localStorage, which any XSS can read — and I refresh via silent auth with rotating refresh tokens. <em>(Safe default first, fallback second, named threats.)</em></p>
+
+      <p><strong>Interviewer:</strong> Now the API gets a token but returns 401 even though jwt.io shows it's valid. Debug it.</p>
+      <p><strong>You:</strong> I'd walk the ladder. Most likely the <code>aud</code>: did the SPA request the API's audience? If not, you get a token whose audience isn't my API and validation fails. Next the <code>iss</code> — a missing trailing slash breaks the exact match. Then algorithm pinning, clock skew on <code>exp</code>, a missing scope, and finally a stale JWKS cache after key rotation. And I'd confirm I'm sending the access token, not the ID token. <em>(Systematic, ranked by likelihood.)</em></p>
+
+      <p><strong>Interviewer:</strong> How would you do service-to-service calls behind that API?</p>
+      <p><strong>You:</strong> Client credentials grant — no user present. Each service is its own M2M client with least-privilege scopes, exchanging its credentials for a short-lived access token. I authenticate the JWT at the edge once and propagate a scoped internal identity inward rather than forwarding the user's token everywhere, to limit audience and blast radius. <em>(Correct grant + propagation reasoning.)</em></p>
+
+      <p><strong>Interviewer:</strong> Last one — how do you revoke access immediately if an account is compromised?</p>
+      <p><strong>You:</strong> Honestly, a stateless JWT can't be un-signed before it expires, so step one is short access-token TTLs — minutes, not days — to bound the window. Then I revoke the refresh token and its whole rotation family so no new tokens can be minted, kill the IdP session, and for the most sensitive endpoints add token introspection or a <code>jti</code> denylist so revocation is enforced in real time at the cost of a lookup. <em>(Names the limitation, then layers mitigations with trade-offs.)</em></p>
+    </blockquote>
+    <div class="callout tip"><span class="tag">Tip</span><p>Notice the pattern in every answer: <strong>name it &rarr; explain why &rarr; state the trade-off or threat</strong>. Drill that three-beat rhythm until it's automatic and you'll sound senior on questions you've never seen.</p></div>
+  </section>
+
+  <!-- ============================================================= 18 -->
+  <section id="quiz">
+    <h2>18. Quiz — 22 Questions</h2>
+    <ol>
+      <li>Which token proves <em>who the user is</em>: ID token or access token?</li>
+      <li>Which token do you send to your API as a Bearer credential?</li>
+      <li>OAuth 2.0 solves _____; OIDC adds _____.</li>
+      <li>Which flow do you use for a SPA, and why can't it use a client secret?</li>
+      <li>What does the PKCE code verifier defend against?</li>
+      <li>Name the four core JWT validation checks beyond the signature.</li>
+      <li>Why must an API validate the <code>aud</code> claim?</li>
+      <li>What attack does pinning the algorithm to RS256 prevent?</li>
+      <li>Why is RS256 preferred over HS256 across multiple services?</li>
+      <li>Where should a SPA <em>not</em> store tokens, and why?</li>
+      <li>What is the BFF pattern and what threat does it neutralize?</li>
+      <li>What is the purpose of the <code>state</code> parameter?</li>
+      <li>What is the purpose of the <code>nonce</code> parameter?</li>
+      <li>Why is the implicit flow deprecated?</li>
+      <li>What grant type is used for machine-to-machine calls with no user?</li>
+      <li>What does refresh-token rotation with reuse detection accomplish?</li>
+      <li>Can you revoke a stateless JWT before it expires? What do you do instead?</li>
+      <li>Why cache the JWKS, and what triggers a refetch?</li>
+      <li>In SSO, what is the difference between the IdP session and the app session?</li>
+      <li>A token validates on jwt.io but the API returns 401 — name the two most likely causes.</li>
+      <li>Local JWT validation vs. token introspection: name the trade-off axis.</li>
+      <li>A callback URL mismatch error — what must match exactly?</li>
+    </ol>
+
+    <details>
+      <summary>Show answer key</summary>
+      <ol>
+        <li><strong>ID token</strong> (OIDC) carries identity claims about the user.</li>
+        <li>The <strong>access token</strong> — it represents authorization to call the API.</li>
+        <li>OAuth solves <strong>delegated authorization (access)</strong>; OIDC adds <strong>standardized authentication/identity</strong> (the ID token).</li>
+        <li><strong>Authorization Code + PKCE.</strong> A SPA ships its code publicly, so any embedded secret is exposed; it's a public client.</li>
+        <li>The <strong>authorization-code-interception attack</strong> — only the client that created the verifier can redeem the code.</li>
+        <li><strong>iss, aud, exp</strong> (and the algorithm pin) — issuer match, audience match, not expired, correct/expected algorithm.</li>
+        <li>To prevent a token minted for another API being replayed against this one (<strong>confused-deputy / audience attack</strong>).</li>
+        <li><strong>alg:none</strong> and <strong>HS/RS confusion</strong> attacks (trusting the token's own <code>alg</code> header).</li>
+        <li>HS256 is symmetric, so every verifier could also <strong>forge</strong> tokens; RS256 keeps the private signing key only at the IdP, verifiers hold only the public key.</li>
+        <li>Not in <strong>localStorage</strong> — it's readable by any XSS. Prefer in-memory or the BFF pattern.</li>
+        <li><strong>Backend-for-Frontend:</strong> tokens stay server-side; the browser gets an httpOnly cookie. Neutralizes <strong>token theft via XSS</strong>.</li>
+        <li>CSRF protection: a random value bound to the request and verified on callback.</li>
+        <li>Binds the <strong>ID token to the original request</strong>, preventing ID-token replay/injection (OIDC).</li>
+        <li>It returned tokens in the URL fragment (leaking to history/logs) and lacked client auth; replaced by Auth Code + PKCE.</li>
+        <li><strong>Client credentials</strong> grant.</li>
+        <li>Each refresh invalidates the prior token; presenting an already-used token signals theft and revokes the whole family.</li>
+        <li><strong>No</strong> — a signed JWT is valid until <code>exp</code>. Use short TTLs, refresh revocation, a <code>jti</code> denylist, or introspection.</li>
+        <li>Avoids a network round-trip per request and rate limits; refetch on a <code>kid</code> miss or key rotation.</li>
+        <li>The <strong>IdP/SSO session</strong> (cookie on the Auth0 domain, shared) authenticates once; each app maintains its <strong>own app session</strong>.</li>
+        <li><strong>aud mismatch</strong> (often no audience requested) and <strong>iss mismatch</strong> (trailing-slash); also sending the ID token instead of the access token.</li>
+        <li><strong>Latency vs. revocation freshness</strong> (local is fast but can't see instant revocation; introspection is current but a network call).</li>
+        <li>The exact <strong>redirect_uri</strong> must be in Allowed Callback URLs — scheme, host, port, path, trailing slash, character-for-character.</li>
+      </ol>
+    </details>
+  </section>
+
+  <!-- ============================================================= 19 -->
+  <section id="cheat-sheet">
+    <h2>19. Cheat Sheet — One-Glance Recall</h2>
+    <pre class="diagram">
+  TOKENS        id_token = WHO (OIDC, for client)
+                access_token = WHAT (OAuth, for API, Bearer header)
+                refresh_token = mint new access tokens (rotate + reuse-detect)
+
+  FLOWS         SPA / mobile / native ........ Auth Code + PKCE
+                regular web app .............. Auth Code
+                machine-to-machine ........... Client Credentials
+                (implicit &amp; password grant ... deprecated)
+
+  VALIDATE JWT  signature(JWKS by kid) + iss + aud + exp + scope
+                PIN alg = RS256   (never trust token's alg header)
+
+  STORE TOKENS  best: BFF (httpOnly cookie) > in-memory > NEVER localStorage
+
+  CSRF/REPLAY   state = CSRF on /authorize ; nonce = bind id_token (OIDC)
+
+  REVOCATION    short access TTL + refresh revocation + jti denylist
+                (stateless JWT can't be un-signed before exp)
+
+  DEBUG 401     aud → iss(/) → alg → exp/skew → scope → JWKS → wrong token
+
+  DESIGN SSO    central IdP (OIDC) + shared IdP cookie + silent prompt=none
+  DESIGN µSVC   authenticate@edge, authorize per-service, M2M between services
+
+  ANSWER SHAPE  name it → why → trade-off / failure mode
+    </pre>
+  </section>
+
+  <!-- ============================================================= 20 -->
+  <section id="takeaways">
+    <h2>20. Key Takeaways</h2>
+    <ul>
+      <li><strong>Interviews score reasoning, not recall.</strong> The trade-off sentence is what separates junior from senior answers.</li>
+      <li><strong>Own the first-principles chain:</strong> AuthN&rarr;AuthZ, OAuth(delegation)&rarr;OIDC(identity), JWT(container), session(persistence).</li>
+      <li><strong>ID token = who; access token = what.</strong> Never send the ID token to an API. This is the most common trap.</li>
+      <li><strong>JWT validation = signature + iss + aud + exp + scope, with the algorithm pinned to RS256.</strong> Forgetting <code>aud</code> or trusting the header's <code>alg</code> are the classic bugs.</li>
+      <li><strong>Auth Code + PKCE</strong> for public clients; <strong>client credentials</strong> for M2M. Implicit and password grants are dead.</li>
+      <li><strong>Token storage:</strong> BFF &gt; in-memory &gt;&gt; localStorage (XSS-readable).</li>
+      <li><strong>Design SSO</strong> = central IdP + shared session + silent auth + single logout. <strong>Design microservices auth</strong> = authenticate at the edge, authorize per service, M2M between services.</li>
+      <li><strong>Debug 401s with a ladder:</strong> aud &rarr; iss &rarr; alg &rarr; exp/skew &rarr; scope &rarr; JWKS &rarr; wrong token.</li>
+      <li><strong>Rehearse out loud.</strong> Automaticity in the structures frees your mind for the novel twist — that is what gets the offer.</li>
+    </ul>
+    <div class="callout key"><span class="tag">Key</span><p>Every strong answer follows the same three beats: <strong>name the mechanism, explain why it exists, state its trade-off or failure mode.</strong> Master that rhythm and you can sound senior even on a question you have never seen — which is exactly what an interview is designed to test.</p></div>
+  </section>
+
+  <nav class="pager">
+    <a class="prev" href="chapter-29.html">← Previous</a>
+    <a class="next" href="chapter-31.html">Next →</a>
+  </nav>
+</main>
+<footer class="site-footer">Master Auth0 End-to-End · Chapter 30 of 32</footer>
+</body>
+</html>

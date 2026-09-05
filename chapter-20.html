@@ -1,0 +1,784 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 20 — Project 4 — Spring Authorization Server + Auth0 | Master Auth0</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">🔐 Master Auth0</a>
+  <nav class="topnav">
+    <a href="chapter-19.html">← Prev</a>
+    <a href="index.html">Contents</a>
+    <a href="chapter-21.html">Next →</a>
+  </nav>
+</header>
+<main class="container">
+  <div class="chapter-head">
+    <span class="phase">Phase 8 · Integration Projects</span>
+    <h1>Chapter 20 — Project 4 — Spring Authorization Server + Auth0</h1>
+    <p class="lead">Up to now you have treated Auth0 as <em>the</em> authorization server — the single thing that mints tokens for your whole world. In this project we flip that assumption on its head and build something more sophisticated: <strong>your own</strong> OAuth 2.1 / OpenID Connect authorization server, on Java 21 with Spring Authorization Server, that issues first-party tokens to your internal clients <em>and</em> federates upstream to Auth0 so your users can still log in with everything Auth0 brings — social, enterprise SSO, MFA, passkeys, Actions. You will learn precisely when running your own AS alongside a managed IdP is the right call (and when it is reckless over-engineering), how token relay through an API gateway keeps every hop verifiable, how dynamic and static client registration actually work, and how to combine a first-party auth server with Auth0 connections so that one user identity flows cleanly from the browser, through your AS, up to Auth0, and back down into your microservices. By the end you will be able to draw the full topology on a whiteboard in an interview and defend every arrow.</p>
+  </div>
+
+  <!-- ============================================================= 1 -->
+  <section id="theory">
+    <h2>1. Theory — First Principles: Why Two Authorization Servers?</h2>
+
+    <p>An <strong>OAuth 2.0 / OpenID Connect Authorization Server (AS)</strong> is the component that authenticates a resource owner (your user) and issues <strong>tokens</strong> — an access token (a bearer credential for calling APIs), an ID token (a signed assertion of <em>who</em> logged in), and optionally a refresh token (a long-lived credential to get new access tokens). Auth0 is, fundamentally, a managed, multi-tenant authorization server. So the obvious question is: <em>if Auth0 is already an AS, why on earth would you build a second one?</em></p>
+
+    <p>The answer comes from separating four responsibilities that beginners tend to collapse into one:</p>
+
+    <table>
+      <thead><tr><th>Responsibility</th><th>Question it answers</th><th>Who is best at it</th></tr></thead>
+      <tbody>
+        <tr><td><strong>User authentication</strong></td><td>Is this human really Jane?</td><td>Auth0 (social, enterprise, MFA, passkeys, breach detection)</td></tr>
+        <tr><td><strong>Token issuance &amp; shape</strong></td><td>What claims/scopes/audiences go in the token, in what format, signed by which key?</td><td>You — if you have non-negotiable requirements Auth0 cannot fully express</td></tr>
+        <tr><td><strong>Client governance</strong></td><td>Which apps may request tokens, with which grants and redirect URIs?</td><td>Either — but your AS can own first-party clients tightly</td></tr>
+        <tr><td><strong>Consent &amp; policy at issuance</strong></td><td>Should this token be issued <em>right now</em>, given device, risk, contracts?</td><td>Your AS, when policy is too proprietary or fast-changing to externalize</td></tr>
+      </tbody>
+    </table>
+
+    <p>The key insight is that <strong>authentication and token issuance are separable</strong>. OpenID Connect was deliberately designed so that an AS can itself be a <em>relying party</em> of <em>another</em> AS. This is called <strong>federation</strong> (also "brokering" or "chaining"). Your Spring Authorization Server can delegate the "is this really Jane?" question upstream to Auth0, receive the proof, and then mint <em>its own</em> tokens for your internal ecosystem. You get Auth0's best-in-class login experience <em>and</em> total control over the tokens your services actually consume.</p>
+
+    <div class="callout key"><span class="tag">Key</span><p>An authorization server can be a client of another authorization server. "Federating to Auth0" means your Spring AS performs an OIDC login <em>against</em> Auth0 the same way a normal web app would — then it stops being a client and becomes an issuer, signing brand-new tokens for your own clients.</p></div>
+
+    <h3>The default position: do NOT build your own AS</h3>
+    <p>Before the seduction of building, internalize the senior-engineer default: <strong>you almost never need your own authorization server.</strong> Auth0 already issues compliant tokens, runs custom logic via Actions, supports custom claims, organizations, fine-grained authorization, and rotates signing keys for you. Running an AS means owning key management, token revocation, consent storage, client metadata, security patching, and 24/7 availability of the single most attackable component in your stack. Build one only when a concrete, written requirement forces it. Section 11 lists the legitimate triggers.</p>
+  </section>
+
+  <!-- ============================================================= 2 -->
+  <section id="story">
+    <h2>2. Story-Based Explanation — Northwind's Two-Speed Problem</h2>
+    <p>You are the platform lead at <strong>Northwind Logistics</strong>. The company has two very different identity worlds glued into one product:</p>
+    <ol>
+      <li><strong>The customer-facing portal.</strong> Shippers and drivers log in. They want Google login, "Sign in with Apple," passkeys, and the occasional enterprise SSO when a big freight customer demands SAML. This is classic Auth0 territory and it works beautifully.</li>
+      <li><strong>The internal machine ecosystem.</strong> Forty microservices, a legacy mainframe gateway, and three regional warehouse systems all call each other. They need access tokens with a very specific shape: a custom <code>nw_region</code> claim, an <code>act</code> (actor) claim for delegation, audiences that map to internal service IDs, and — critically — a <strong>second signing key that Northwind's security team rotates on a hardware HSM they already own for SOC 2 reasons.</strong></li>
+    </ol>
+
+    <p>For months the team tried to bend Auth0 into shape #2 with Actions and custom claims. It mostly worked, but two requirements never fit cleanly: the HSM-resident signing key (Auth0 manages its own keys) and an internal-only <strong>token exchange</strong> grant for service-to-service delegation with tight, contract-bound rules that change weekly and must be auditable inside Northwind's own repo.</p>
+
+    <p>The architect's decision: <strong>keep Auth0 for human authentication</strong> (it is unbeatable there), and <strong>stand up a Spring Authorization Server for internal token issuance.</strong> When a human logs in, the Spring AS redirects them to Auth0, Auth0 proves who they are, and the Spring AS then mints internal tokens signed by the HSM key with exactly the claims the fleet expects. Machines talk only to the Spring AS. Humans never see it — they see Auth0's polished login. An <strong>API gateway</strong> sits in front, relaying tokens inward and re-validating at every boundary.</p>
+
+    <p>This is the architecture we build in this chapter. Notice the discipline: Auth0 is not replaced — it is <em>federated to</em>. Each system does what it is best at.</p>
+
+    <div class="callout note"><span class="tag">Note</span><p>Northwind's trigger was concrete: an HSM-resident signing key plus proprietary, fast-changing delegation policy. "We want control" is <em>not</em> a trigger. "Our auditors require keys never leave our HSM" is.</p></div>
+  </section>
+
+  <!-- ============================================================= 3 -->
+  <section id="diagrams">
+    <h2>3. ASCII Diagrams — The Full Topology</h2>
+
+    <p>First, the high-level brokering topology. Read it top to bottom: the browser only ever talks to your AS and the gateway; your AS talks to Auth0; services talk to the gateway.</p>
+
+    <pre class="diagram">
+                          NORTHWIND IDENTITY TOPOLOGY
+  +-------------+                                              +-------------+
+  |   Browser   |                                              |    Auth0    |
+  | (human user)|                                              | (upstream   |
+  +------+------+                                               |  IdP /      |
+         |  1. GET /authorize (to YOUR AS)                      |  social/SSO)|
+         v                                                      +------+------+
+  +------------------------------------------------------------+       ^
+  |              SPRING AUTHORIZATION SERVER (yours)            |       |
+  |  - is an OIDC *Provider* to your clients                    |  2. OIDC login
+  |  - is an OIDC *Client* (Relying Party) to Auth0  ----------------->-+
+  |  - mints FIRST-PARTY tokens signed by YOUR (HSM) key        |  3. id_token
+  +------+-----------------------------------------------------+        back
+         |  4. your access_token (custom claims, your issuer)
+         v
+  +-------------------------+         5. relay token (Authorization: Bearer)
+  |     API GATEWAY         | ---------------------------------------------+
+  | - validates YOUR token  |                                             |
+  | - routes + relays       |                                             v
+  +-------------------------+                                  +---------------------+
+                                                              |   Microservices     |
+                                                              | resource servers,   |
+                                                              | validate via JWKS    |
+                                                              | of YOUR AS           |
+                                                              +---------------------+
+    </pre>
+
+    <p>Now the detailed federated login sequence. This is the single most important diagram in the chapter — every box is a real HTTP redirect or call.</p>
+
+    <pre class="diagram">
+  Browser        Spring AS (you)         Auth0 (upstream)      Your API
+    |                  |                       |                   |
+    | (a) GET /authorize?client_id=portal...   |                   |
+    |----------------->|                       |                   |
+    |                  | no upstream session;  |                   |
+    |                  | start OIDC to Auth0   |                   |
+    | (b) 302 to Auth0 /authorize (PKCE)       |                   |
+    |<-----------------|                       |                   |
+    | (c) GET Auth0 /authorize ----------------------->            |
+    |------------------------------------------>|                   |
+    |                  |        Auth0 shows login (social/SSO/MFA)  |
+    | (d) user authenticates with Auth0         |                   |
+    |<------------------------------------------|                   |
+    | (e) 302 back to Spring AS /login/oauth2/code/auth0?code=...   |
+    |------------------------------------------>|                   |
+    |                  | (f) POST /oauth/token  |                   |
+    |                  |    (code + PKCE verifier)                  |
+    |                  |---------------------->|                    |
+    |                  | (g) Auth0 id_token +   |                   |
+    |                  |     access_token       |                   |
+    |                  |<----------------------|                    |
+    |                  | (h) validate id_token  |                   |
+    |                  |     -> establish AS    |                   |
+    |                  |        session for     |                   |
+    |                  |        the user        |                   |
+    | (i) 302 back to portal redirect_uri?code=YOUR_code           |
+    |<-----------------|                       |                    |
+    | (j) portal POST /oauth2/token to Spring AS (PKCE)            |
+    |----------------->|                       |                    |
+    |                  | (k) MINT first-party  |                    |
+    |                  |     access+id token,   |                   |
+    |                  |     YOUR issuer, YOUR  |                   |
+    |                  |     HSM key, custom    |                   |
+    |                  |     claims             |                   |
+    | (l) tokens       |                       |                    |
+    |<-----------------|                       |                    |
+    | (m) call API: Authorization: Bearer YOUR_access_token         |
+    |-------------------------------------------------------------->|
+    |                  |                       | (n) validate via    |
+    |                  |                       |     Spring AS JWKS   |
+    |                  |                       |     -> 200 OK        |
+    |<--------------------------------------------------------------|
+    </pre>
+
+    <div class="callout tip"><span class="tag">Tip</span><p>Trace the issuers. In steps (g) the token is issued by <code>https://YOUR_TENANT.auth0.com/</code>. In step (k) the token is issued by <code>https://as.northwind.internal</code>. Two different issuers, two different audiences, two different signing keys — and your microservices only ever trust the second one. Mixing them up is the #1 federation bug.</p></div>
+  </section>
+
+  <!-- ============================================================= 4 -->
+  <section id="analogy">
+    <h2>4. Real-World Analogy — The Embassy and the Local Visa Office</h2>
+    <p>Imagine you are a citizen of country A travelling to country B.</p>
+    <ul>
+      <li><strong>Auth0 is your home country's passport office.</strong> It is exceptionally good at one thing: proving <em>who you are</em>. It checks your biometrics, your history, your MFA. Your passport (the Auth0 ID token) is a globally respected proof of identity.</li>
+      <li><strong>Your Spring Authorization Server is country B's local visa office.</strong> Country B does not re-run your biometrics — it <em>trusts</em> your passport. But country B does not let you wander around on a passport alone. It inspects your passport, then issues its <strong>own</strong> document — a visa (your first-party access token) — stamped with country-B-specific rules: which provinces you may enter (audiences), how long you may stay (expiry), what you may do (scopes), signed with <em>country B's</em> seal (your HSM key).</li>
+      <li><strong>The API gateway is the border checkpoint.</strong> Inside country B, nobody looks at your home passport again — every internal checkpoint inspects the <em>visa</em>. If your visa is forged or expired, you are stopped, regardless of how valid your passport is.</li>
+    </ul>
+    <p>This is exactly federation. The passport office (Auth0) handles identity. The visa office (Spring AS) handles authorization within your domain. The two are loosely coupled by trust, not merged. And — crucially — once you are inside, the home passport is irrelevant; only the locally issued visa matters. That is why your services validate <em>your</em> JWKS, never Auth0's.</p>
+
+    <div class="callout note"><span class="tag">Note</span><p>The analogy also explains <strong>token relay</strong>: as you pass through successive internal checkpoints (gateway → service → another service), each one re-checks the same visa. The visa is "relayed" inward, not re-issued at every door.</p></div>
+  </section>
+
+  <!-- ============================================================= 5 -->
+  <section id="internals">
+    <h2>5. Internal Working — What Spring Authorization Server Actually Does</h2>
+
+    <p>Spring Authorization Server (SAS) is a focused implementation of OAuth 2.1 and OpenID Connect Core 1.0, built on Spring Security. It is <em>not</em> a full IdP product — it has no user database, no login UI of its own beyond what you wire up, no admin console. That minimalism is the point: you compose it from filters. Here is what happens inside, endpoint by endpoint.</p>
+
+    <h3>The endpoints SAS exposes</h3>
+    <table>
+      <thead><tr><th>Endpoint</th><th>Purpose</th><th>Spec</th></tr></thead>
+      <tbody>
+        <tr><td><code>/.well-known/openid-configuration</code></td><td>Discovery — tells clients where everything is</td><td>OIDC Discovery</td></tr>
+        <tr><td><code>/oauth2/authorize</code></td><td>Authorization endpoint — starts the code flow</td><td>OAuth 2.1</td></tr>
+        <tr><td><code>/oauth2/token</code></td><td>Token endpoint — exchanges code for tokens</td><td>OAuth 2.1</td></tr>
+        <tr><td><code>/oauth2/jwks</code></td><td>Publishes public keys so resource servers can verify signatures</td><td>JWK Set</td></tr>
+        <tr><td><code>/oauth2/introspect</code></td><td>Opaque-token lookup for resource servers</td><td>RFC 7662</td></tr>
+        <tr><td><code>/oauth2/revoke</code></td><td>Revokes a refresh/access token</td><td>RFC 7009</td></tr>
+        <tr><td><code>/connect/register</code></td><td>Dynamic Client Registration (optional)</td><td>RFC 7591</td></tr>
+        <tr><td><code>/userinfo</code></td><td>Returns claims about the authenticated user</td><td>OIDC Core</td></tr>
+      </tbody>
+    </table>
+
+    <h3>The internal request pipeline</h3>
+    <p>Every request flows through a chain of Spring Security <em>filters</em>. SAS contributes its own filters that the <code>OAuth2AuthorizationServerConfigurer</code> installs. Conceptually:</p>
+
+    <pre class="diagram">
+   incoming HTTP
+        |
+        v
+  [SecurityFilterChain #1: Authorization Server endpoints]
+        |  OAuth2AuthorizationEndpointFilter  -> handles /oauth2/authorize
+        |  OAuth2TokenEndpointFilter          -> handles /oauth2/token
+        |  OidcProviderConfigurationEndpoint  -> /.well-known/...
+        |  NimbusJwkSetEndpointFilter         -> /oauth2/jwks
+        |        |
+        |        |  (if no authenticated principal yet)
+        |        v
+        |   redirect to /login  ----+
+        |                            |
+        v                            v
+  [SecurityFilterChain #2: default/login]
+        |  oauth2Login()  -> federates to Auth0 (the RP filters)
+        |        OAuth2LoginAuthenticationFilter
+        |        OAuth2AuthorizationRequestRedirectFilter
+        |        v
+        |   establishes the upstream session via Auth0
+        +--> back to chain #1, which now mints YOUR tokens
+    </pre>
+
+    <h3>How a token is actually minted</h3>
+    <p>When the token endpoint runs, SAS builds a <code>JwtEncodingContext</code> and asks an <code>OAuth2TokenCustomizer&lt;JwtEncodingContext&gt;</code> bean to add claims. It then signs using the <code>JWKSource&lt;SecurityContext&gt;</code> you provided (an in-memory RSA key in dev, an HSM-backed key in prod). The federated Auth0 identity is available in the security context as an <code>OidcUser</code>, so your customizer can copy or transform Auth0 claims (email, sub, custom claims from Actions) into your first-party token.</p>
+
+    <div class="callout key"><span class="tag">Key</span><p>The bridge between the two worlds is one bean: the <strong>token customizer</strong>. It reads the upstream Auth0 identity (an <code>OidcUser</code>) and writes your downstream claims. This is where federation becomes concrete — Auth0's <code>sub</code> becomes a lookup key into your user store, and your custom claims (<code>nw_region</code>, roles, entitlements) get stamped onto the token your services trust.</p></div>
+  </section>
+
+  <!-- ============================================================= 6 -->
+  <section id="code-walkthrough">
+    <h2>6. Code Walkthrough — Spring Authorization Server on Java 21</h2>
+
+    <p>We build the project piece by piece. Target: Spring Boot 3.4+, Spring Security 6.4+, Spring Authorization Server 1.4+, Java 21.</p>
+
+    <h3>6.1 Dependencies (Maven)</h3>
+    <pre><code class="language-xml">&lt;dependencies&gt;
+  &lt;!-- The authorization server itself --&gt;
+  &lt;dependency&gt;
+    &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+    &lt;artifactId&gt;spring-boot-starter-oauth2-authorization-server&lt;/artifactId&gt;
+  &lt;/dependency&gt;
+  &lt;!-- Needed so OUR AS can be a CLIENT of Auth0 (federation) --&gt;
+  &lt;dependency&gt;
+    &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+    &lt;artifactId&gt;spring-boot-starter-oauth2-client&lt;/artifactId&gt;
+  &lt;/dependency&gt;
+  &lt;dependency&gt;
+    &lt;groupId&gt;org.springframework.boot&lt;/groupId&gt;
+    &lt;artifactId&gt;spring-boot-starter-web&lt;/artifactId&gt;
+  &lt;/dependency&gt;
+&lt;/dependencies&gt;</code></pre>
+
+    <h3>6.2 Federating to Auth0 — the client (Relying Party) side</h3>
+    <p>This is the configuration that makes our AS log in <em>against</em> Auth0. It is ordinary <code>spring-security-oauth2-client</code> config — the same you'd write for any web app that uses Auth0.</p>
+
+    <pre><code class="language-yaml">spring:
+  security:
+    oauth2:
+      client:
+        registration:
+          auth0:                                   # an upstream IdP registration
+            client-id: ${AUTH0_CLIENT_ID}
+            client-secret: ${AUTH0_CLIENT_SECRET}
+            scope: [openid, profile, email]
+            authorization-grant-type: authorization_code
+            client-name: Auth0
+            # where Auth0 sends the user back INTO our AS:
+            redirect-uri: "{baseUrl}/login/oauth2/code/auth0"
+        provider:
+          auth0:
+            issuer-uri: https://YOUR_TENANT.eu.auth0.com/   # trailing slash matters
+            user-name-attribute: sub</code></pre>
+
+    <div class="callout warn"><span class="tag">Warn</span><p>The <code>issuer-uri</code> <strong>must</strong> include the trailing slash for Auth0, and must exactly equal the <code>iss</code> claim Auth0 puts in its tokens. A mismatch causes a silent <code>id_token validation failed</code> at step (h). Spring fetches Auth0's discovery document from <code>{issuer-uri}.well-known/openid-configuration</code> at startup, so the AS must be able to reach Auth0 on boot.</p></div>
+
+    <h3>6.3 The two security filter chains</h3>
+    <pre><code class="language-java">@Configuration
+public class SecurityConfig {
+
+  // Chain #1: the OAuth2 Authorization Server endpoints (highest priority)
+  @Bean
+  @Order(1)
+  public SecurityFilterChain authorizationServerChain(HttpSecurity http) throws Exception {
+    OAuth2AuthorizationServerConfigurer authServer =
+        OAuth2AuthorizationServerConfigurer.authorizationServer();
+
+    http
+      .securityMatcher(authServer.getEndpointsMatcher())
+      .with(authServer, server -&gt; server.oidc(Customizer.withDefaults())) // enable OIDC
+      .authorizeHttpRequests(auth -&gt; auth.anyRequest().authenticated())
+      // If the user is NOT yet authenticated at the AS, send them to login,
+      // which (chain #2) federates to Auth0:
+      .exceptionHandling(e -&gt; e.defaultAuthenticationEntryPointFor(
+          new LoginUrlAuthenticationEntryPoint("/oauth2/authorization/auth0"),
+          new MediaTypeRequestMatcher(MediaType.TEXT_HTML)))
+      // Our AS also accepts Auth0's tokens during the federated callback:
+      .oauth2ResourceServer(rs -&gt; rs.jwt(Customizer.withDefaults()));
+
+    return http.build();
+  }
+
+  // Chain #2: default chain handling federated login to Auth0
+  @Bean
+  @Order(2)
+  public SecurityFilterChain federationChain(HttpSecurity http) throws Exception {
+    http
+      .authorizeHttpRequests(auth -&gt; auth.anyRequest().authenticated())
+      // THIS line makes our AS a client of Auth0:
+      .oauth2Login(Customizer.withDefaults());
+    return http.build();
+  }
+}</code></pre>
+
+    <p>Notice the elegant trick: the AS's authentication entry point points at <code>/oauth2/authorization/auth0</code> — the Spring OAuth2 <em>client</em> entry point. So when a portal app hits <code>/oauth2/authorize</code> and there is no AS session, the user is bounced to Auth0, logs in, comes back, an AS session is created, and the original authorize request resumes and mints our token.</p>
+
+    <h3>6.4 Registering a first-party client (static)</h3>
+    <pre><code class="language-java">@Bean
+public RegisteredClientRepository registeredClientRepository() {
+  RegisteredClient portal = RegisteredClient.withId(UUID.randomUUID().toString())
+      .clientId("northwind-portal")
+      .clientAuthenticationMethod(ClientAuthenticationMethod.NONE) // public SPA -&gt; PKCE
+      .authorizationGrantType(AuthorizationGrantType.AUTHORIZATION_CODE)
+      .authorizationGrantType(AuthorizationGrantType.REFRESH_TOKEN)
+      .redirectUri("https://portal.northwind.com/callback")
+      .scope(OidcScopes.OPENID)
+      .scope(OidcScopes.PROFILE)
+      .scope("shipments:read")
+      .clientSettings(ClientSettings.builder()
+          .requireProofKey(true)              // enforce PKCE
+          .requireAuthorizationConsent(false) // first-party: no consent screen
+          .build())
+      .tokenSettings(TokenSettings.builder()
+          .accessTokenTimeToLive(Duration.ofMinutes(10))
+          .accessTokenFormat(OAuth2TokenFormat.SELF_CONTAINED) // JWT
+          .build())
+      .build();
+
+  return new InMemoryRegisteredClientRepository(portal);
+  // In prod: JdbcRegisteredClientRepository backed by Postgres.
+}</code></pre>
+
+    <h3>6.5 The signing key (JWKS)</h3>
+    <pre><code class="language-java">@Bean
+public JWKSource&lt;SecurityContext&gt; jwkSource() {
+  // DEV: generate an RSA key in memory.
+  // PROD: load from an HSM / KMS via a PKCS#11 KeyStore; the private
+  // key never leaves the hardware.
+  RSAKey rsaKey = generateRsa();                 // helper using KeyPairGenerator
+  JWKSet jwkSet = new JWKSet(rsaKey);
+  return new ImmutableJWKSet&lt;&gt;(jwkSet);
+}
+
+@Bean
+public AuthorizationServerSettings authorizationServerSettings() {
+  return AuthorizationServerSettings.builder()
+      .issuer("https://as.northwind.internal")   // OUR issuer, not Auth0's
+      .build();
+}</code></pre>
+
+    <h3>6.6 The token customizer — where federation becomes real</h3>
+    <pre><code class="language-java">@Bean
+public OAuth2TokenCustomizer&lt;JwtEncodingContext&gt; tokenCustomizer(UserService users) {
+  return context -&gt; {
+    if (!context.getTokenType().getValue().equals("access_token")) return;
+
+    // The principal here carries the UPSTREAM Auth0 identity:
+    Authentication principal = context.getPrincipal();
+    String auth0Sub = principal.getName();                  // e.g. "auth0|abc123"
+
+    // Map Auth0's sub to our internal user + entitlements:
+    InternalUser u = users.byExternalId(auth0Sub);
+
+    context.getClaims().claims(claims -&gt; {
+      claims.put("nw_region", u.region());                  // custom claim
+      claims.put("roles", u.roles());                       // first-party RBAC
+      claims.put("entitlements", u.entitlements());
+      // Keep a link back to the federated identity for audit:
+      claims.put("ext_idp", "auth0");
+      claims.put("ext_sub", auth0Sub);
+    });
+  };
+}</code></pre>
+
+    <div class="callout tip"><span class="tag">Tip</span><p>This customizer is the seam between the two authorization servers. Auth0 answered "who is this?" and gave you <code>auth0|abc123</code>. Your AS answers "what may they do here?" and stamps <code>roles</code>, <code>nw_region</code>, and <code>entitlements</code>. Keep authorization data in <em>your</em> token, not Auth0's — it changes faster and is your domain's concern.</p></div>
+  </section>
+
+  <!-- ============================================================= 7 -->
+  <section id="practical">
+    <h2>7. Practical Implementation — Wiring the Gateway and a Resource Server</h2>
+
+    <h3>7.1 A resource server (microservice) trusting YOUR AS</h3>
+    <pre><code class="language-yaml"># shipments-service application.yml
+spring:
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: https://as.northwind.internal   # OUR AS, never Auth0
+          audiences: shipments-api</code></pre>
+
+    <pre><code class="language-java">@Configuration
+class ResourceServerConfig {
+  @Bean
+  SecurityFilterChain api(HttpSecurity http) throws Exception {
+    http
+      .authorizeHttpRequests(a -&gt; a
+        .requestMatchers("/shipments/**").hasAuthority("SCOPE_shipments:read")
+        .anyRequest().authenticated())
+      .oauth2ResourceServer(rs -&gt; rs.jwt(jwt -&gt; jwt
+        .jwtAuthenticationConverter(scopeConverter())));
+    return http.build();
+  }
+}</code></pre>
+
+    <h3>7.2 Token relay through Spring Cloud Gateway</h3>
+    <p>The gateway sits in front of every service. With the <code>TokenRelay</code> filter it forwards the incoming bearer token to downstream services automatically — and, when configured as an OAuth2 client, it can also refresh tokens.</p>
+
+    <pre><code class="language-yaml"># api-gateway application.yml
+spring:
+  cloud:
+    gateway:
+      default-filters:
+        - TokenRelay=         # copy Authorization: Bearer to downstream calls
+      routes:
+        - id: shipments
+          uri: lb://shipments-service
+          predicates:
+            - Path=/api/shipments/**
+          filters:
+            - StripPrefix=1
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: https://as.northwind.internal</code></pre>
+
+    <pre><code class="language-java">// Gateway validates the token at the edge, then relays it inward.
+@Bean
+SecurityWebFilterChain gatewaySecurity(ServerHttpSecurity http) {
+  http
+    .authorizeExchange(ex -&gt; ex.anyExchange().authenticated())
+    .oauth2ResourceServer(rs -&gt; rs.jwt(Customizer.withDefaults()));
+  return http.build();
+}</code></pre>
+
+    <h3>7.3 Service-to-service: client credentials against YOUR AS</h3>
+    <p>Machines that are not acting for a human use the client-credentials grant directly against your Spring AS — no Auth0 involved, because there is no human to authenticate.</p>
+    <pre><code class="language-java">RegisteredClient billingDaemon = RegisteredClient.withId(UUID.randomUUID().toString())
+    .clientId("billing-daemon")
+    .clientSecret("{bcrypt}$2a$10$...")                 // confidential client
+    .clientAuthenticationMethod(ClientAuthenticationMethod.CLIENT_SECRET_BASIC)
+    .authorizationGrantType(AuthorizationGrantType.CLIENT_CREDENTIALS)
+    .scope("invoices:write")
+    .build();</code></pre>
+
+    <div class="callout note"><span class="tag">Note</span><p>This is the cleanest demonstration of <em>why</em> you have your own AS: the billing daemon needs an internal token with <code>invoices:write</code> for audience <code>billing-api</code>, signed by your HSM key. There is no human, so federating to Auth0 makes no sense. Your AS issues it directly.</p></div>
+  </section>
+
+  <!-- ============================================================= 8 -->
+  <section id="prod-architecture">
+    <h2>8. Production Architecture</h2>
+
+    <pre class="diagram">
+                          PRODUCTION DEPLOYMENT
+  Internet
+     |
+  [WAF / CDN]
+     |
+  +--------------------+         +-----------------------------+
+  |  API Gateway (HA)  |&lt;------- | Spring Authorization Server |
+  |  - TLS terminate   |  JWKS   | (3+ replicas, stateless     |
+  |  - validate JWT    |&lt;------- |  except shared stores)      |
+  |  - TokenRelay      |         |  - issuer: as.northwind     |
+  +---------+----------+         |  - federates -> Auth0       |
+            |                     +------+----------+-----------+
+            |                            |          |
+            v                            v          v
+  +-------------------+        +-----------------+  +------------------+
+  | Microservices     |        | Postgres (RDS)  |  |  HSM / KMS       |
+  | (resource servers)|        | - reg. clients  |  |  - signing key   |
+  | validate via JWKS |        | - authorizations|  |    never exported |
+  +-------------------+        | - consents      |  +------------------+
+                              +-----------------+
+                                       ^
+                                       |
+                              +-----------------+
+                              |   Auth0 tenant  |  (upstream IdP:
+                              |   social/SSO/MFA |   humans authenticate here)
+                              +-----------------+
+    </pre>
+
+    <p>Production essentials:</p>
+    <ul>
+      <li><strong>State out of the JVM.</strong> Use <code>JdbcRegisteredClientRepository</code>, <code>JdbcOAuth2AuthorizationService</code>, and <code>JdbcOAuth2AuthorizationConsentService</code> so any replica can serve any request. In-memory stores only work for a single node and lose all sessions on restart.</li>
+      <li><strong>HSM/KMS-backed keys.</strong> The <code>JWKSource</code> reads a non-exportable private key (AWS KMS, Azure Key Vault, or PKCS#11 HSM). Publish multiple keys in JWKS during rotation so in-flight tokens stay verifiable.</li>
+      <li><strong>Key rotation.</strong> Add the new key to JWKS, start signing with it, keep the old public key published until the longest-lived token expires, then drop it. Resource servers cache JWKS — set a sane cache TTL (e.g., 5 min) so rotation propagates.</li>
+      <li><strong>High availability of the AS.</strong> It is now a single point of failure for <em>token issuance</em>. Run 3+ replicas behind a load balancer; health-check the token endpoint, not just <code>/health</code>.</li>
+      <li><strong>Auth0 dependency.</strong> If Auth0 is down, new human logins fail (but existing valid tokens still work until expiry). Cache JWKS and discovery; set generous timeouts; consider a maintenance fallback page.</li>
+      <li><strong>Observability.</strong> Emit an audit event per token issued with <code>client_id</code>, <code>ext_sub</code>, scopes, and audience. Correlate gateway request IDs through to services.</li>
+    </ul>
+
+    <div class="callout warn"><span class="tag">Warn</span><p>Putting your own AS in the critical path means you now own its uptime. Auth0's 99.99% SLA does not protect a poorly-run self-hosted AS. Budget for on-call, patching, and DR drills before you commit.</p></div>
+  </section>
+
+  <!-- ============================================================= 9 -->
+  <section id="security">
+    <h2>9. Security Analysis</h2>
+
+    <h3>Threats specific to the federated, two-AS design</h3>
+    <table>
+      <thead><tr><th>Threat</th><th>Vector</th><th>Mitigation</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Issuer confusion</strong></td><td>A service trusts both Auth0's and your AS's issuers; attacker presents an Auth0 token to an internal API</td><td>Services trust <em>only</em> <code>as.northwind.internal</code> + check <code>aud</code>. Never add Auth0's issuer to internal resource servers.</td></tr>
+        <tr><td><strong>Authorization code interception</strong></td><td>Public clients leaking the code</td><td>PKCE mandatory (<code>requireProofKey(true)</code>); exact redirect-URI matching.</td></tr>
+        <tr><td><strong>Open redirect via redirect_uri</strong></td><td>Loose redirect-URI matching on registered clients</td><td>Exact-match URIs only; no wildcards in the path; HTTPS only.</td></tr>
+        <tr><td><strong>Token substitution / confused deputy</strong></td><td>Token minted for service A replayed at service B</td><td>Per-service <code>aud</code>; resource servers reject wrong audience.</td></tr>
+        <tr><td><strong>Upstream id_token spoofing</strong></td><td>Forged Auth0 callback</td><td>Validate Auth0 <code>id_token</code> signature, <code>iss</code>, <code>aud</code>, <code>nonce</code>, <code>exp</code>; use PKCE/state on the upstream leg.</td></tr>
+        <tr><td><strong>Signing-key compromise</strong></td><td>Private key exfiltration</td><td>HSM/KMS non-exportable keys; rotation; short token TTL limits blast radius.</td></tr>
+        <tr><td><strong>Refresh-token theft</strong></td><td>Long-lived credential stolen</td><td>Rotate refresh tokens, detect reuse, bind to client; consider DPoP/sender-constraining.</td></tr>
+      </tbody>
+    </table>
+
+    <h3>The cardinal rule</h3>
+    <p>Your microservices must validate tokens from <strong>exactly one</strong> issuer — yours. The whole security benefit of federation collapses if a service also accepts Auth0-issued tokens directly, because then an attacker who can get <em>any</em> Auth0 token (e.g., from a different app on the same tenant) could call your internal APIs. The boundary is intentional and one-directional.</p>
+
+    <div class="callout danger"><span class="tag">Danger</span><p>Never disable signature validation "to make it work in dev." Never use the same RSA key in dev and prod. Never publish the <em>private</em> key in JWKS — JWKS is public keys only. A single leaked private key lets anyone forge tokens for every service that trusts your AS.</p></div>
+  </section>
+
+  <!-- ============================================================= 10 -->
+  <section id="performance">
+    <h2>10. Performance Considerations</h2>
+    <ul>
+      <li><strong>JWT validation is cheap and stateless.</strong> Resource servers verify the RSA/EC signature locally using cached JWKS — no network call per request. This is the single biggest performance reason to use self-contained JWTs over opaque tokens + introspection.</li>
+      <li><strong>JWKS caching.</strong> Spring's <code>NimbusJwtDecoder</code> caches the key set (default ~5 min). Tune the cache so you avoid a JWKS fetch storm on every cold start, but keep it short enough that key rotation propagates promptly.</li>
+      <li><strong>Federation cost is paid once per session, not per request.</strong> The expensive multi-redirect dance with Auth0 happens only at login. After that, the user has an AS session and tokens; subsequent API calls never touch Auth0.</li>
+      <li><strong>Token size.</strong> Stuffing large <code>entitlements</code> arrays into the access token bloats every request header. If entitlements are big, put a reference (e.g., a version stamp) in the token and resolve details server-side, or use a fine-grained-authz service.</li>
+      <li><strong>Database hot path.</strong> With JDBC stores, the authorization-code lookup and refresh-token rotation hit the DB. Index <code>authorization_code_value</code> and refresh-token columns; use connection pooling (HikariCP).</li>
+      <li><strong>Signing throughput.</strong> RSA signing is more CPU-heavy than EC. For high token-issuance volume, prefer <code>ES256</code> (EC P-256) keys — smaller signatures, faster signing — if your resource servers support it.</li>
+      <li><strong>Stateless scaling.</strong> Because validation is local, you can scale resource servers horizontally without coordination. The AS itself scales by sharing the JDBC store across replicas.</li>
+    </ul>
+
+    <div class="callout tip"><span class="tag">Tip</span><p>Measure the login latency budget separately from the API latency budget. Federation adds 3–5 redirects (hundreds of ms) but only at session start. If interviewers ask "doesn't federation make every call slow?" the correct answer is no — it is a one-time login cost.</p></div>
+  </section>
+
+  <!-- ============================================================= 11 -->
+  <section id="mistakes">
+    <h2>11. Common Mistakes</h2>
+    <ol>
+      <li><strong>Building an AS when Auth0 already suffices.</strong> The #1 mistake. Legitimate triggers: HSM-resident signing keys you must own, proprietary issuance policy that must live in your repo, air-gapped/sovereign deployments, an internal token-exchange grant Auth0 cannot model, or contractual data-residency for token state. "We want control" and "to learn" are not production triggers.</li>
+      <li><strong>Trailing-slash mismatch on Auth0 <code>issuer-uri</code>.</strong> Causes silent id_token validation failure. The configured value must equal Auth0's <code>iss</code> exactly.</li>
+      <li><strong>Resource servers trusting two issuers.</strong> Accepting both Auth0 and your AS tokens defeats the security boundary (see §9).</li>
+      <li><strong>In-memory stores in production.</strong> Sessions and authorizations vanish on restart and don't share across replicas. Use JDBC stores.</li>
+      <li><strong>Publishing the private key in JWKS.</strong> JWKS is public keys only. A horrifying but real mistake when serializing the full <code>JWKSet</code> incorrectly — always use the public-only view.</li>
+      <li><strong>No PKCE on public clients.</strong> SPAs and mobile must use PKCE; never use a client secret in a browser.</li>
+      <li><strong>Long-lived access tokens.</strong> Self-contained JWTs cannot be revoked before expiry. Keep them short (5–15 min) and rely on refresh tokens.</li>
+      <li><strong>Forgetting the audience.</strong> Without per-service <code>aud</code>, any token works at any service — confused-deputy risk.</li>
+      <li><strong>Copying ALL Auth0 claims into your token blindly.</strong> Map deliberately. Your token's authorization claims are <em>your</em> concern, not whatever Auth0 happened to include.</li>
+      <li><strong>Skipping JWKS reachability at boot.</strong> If the AS can't reach Auth0's discovery endpoint on startup, federation config fails. Plan for network egress and timeouts.</li>
+    </ol>
+  </section>
+
+  <!-- ============================================================= 12 -->
+  <section id="best-practices">
+    <h2>12. Best Practices</h2>
+    <ul>
+      <li><strong>Default to Auth0-only.</strong> Add your own AS only against a written requirement. Document the trigger in an ADR.</li>
+      <li><strong>One issuer per token domain.</strong> Humans authenticate at Auth0; internal tokens are issued by your AS; services trust your AS alone.</li>
+      <li><strong>PKCE everywhere</strong> for public clients; confidential clients use <code>client_secret_basic</code> or, better, <code>private_key_jwt</code> / mTLS.</li>
+      <li><strong>Short access tokens, rotating refresh tokens</strong> with reuse detection.</li>
+      <li><strong>Per-service audiences and least-privilege scopes.</strong></li>
+      <li><strong>HSM/KMS keys</strong> with documented rotation runbooks; overlap old and new public keys in JWKS during rotation.</li>
+      <li><strong>JDBC-backed stores</strong> for clients, authorizations, and consents; back them up.</li>
+      <li><strong>Validate the upstream leg fully:</strong> Auth0 <code>iss</code>, <code>aud</code>, <code>nonce</code>, <code>exp</code>, signature, plus PKCE and <code>state</code>.</li>
+      <li><strong>Map federated identity deliberately</strong> in the token customizer; keep an audit link (<code>ext_idp</code>, <code>ext_sub</code>).</li>
+      <li><strong>Treat the gateway as a policy edge:</strong> validate at the edge, relay inward, re-validate at each service.</li>
+      <li><strong>Use Auth0 for what it is great at</strong> — Actions for risk/MFA, Organizations for B2B, connections for social/enterprise — and let those flow through into your federation.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================= 13 -->
+  <section id="interview">
+    <h2>13. Interview Questions (with Model Answers)</h2>
+
+    <h4>Q1. When would you run your own authorization server alongside Auth0?</h4>
+    <p><strong>Model answer:</strong> Only against a concrete requirement Auth0 cannot meet: HSM-resident signing keys you must own for compliance; proprietary, fast-changing token-issuance policy that must live in your codebase and audit trail; air-gapped or data-sovereign deployments; a custom grant (e.g., internal token exchange/delegation) Auth0 doesn't model; or contractual control over where token state is stored. Otherwise, Auth0 alone is the right, lower-risk choice. I'd federate to Auth0 for human authentication and mint first-party tokens for internal services.</p>
+
+    <h4>Q2. What does "federating to Auth0" actually mean technically?</h4>
+    <p><strong>Model answer:</strong> My Spring AS acts as an OIDC <em>Relying Party</em> to Auth0: it runs the authorization-code-plus-PKCE flow against Auth0's <code>/authorize</code> and <code>/oauth/token</code>, validates the returned <code>id_token</code> (signature, iss, aud, nonce, exp), and establishes a local session. Then it switches roles to OIDC <em>Provider</em> and issues its own tokens to my clients. Two issuers, two keys, one trust link.</p>
+
+    <h4>Q3. Why must internal services trust only your AS, not Auth0?</h4>
+    <p><strong>Model answer:</strong> To preserve the trust boundary. If a service accepted Auth0-issued tokens, anyone holding any token from that Auth0 tenant could call internal APIs, bypassing my authorization layer and custom claims. The federation is intentionally one-directional: Auth0 → my AS → services.</p>
+
+    <h4>Q4. How does token relay work and why re-validate at each hop?</h4>
+    <p><strong>Model answer:</strong> The gateway forwards the same bearer token downstream (Spring Cloud Gateway's <code>TokenRelay</code> filter). Each service re-validates locally using cached JWKS and checks scopes/audience. Re-validation is defense-in-depth: a compromised gateway or internal mis-route can't grant access without a valid token for that audience.</p>
+
+    <h4>Q5. Static vs dynamic client registration — when each?</h4>
+    <p><strong>Model answer:</strong> Static (<code>RegisteredClientRepository</code>, code or JDBC) for a known set of first-party clients — tighter governance, reviewed in PRs. Dynamic (RFC 7591 <code>/connect/register</code>) when third parties or many tenants must self-register; gate it behind an initial access token and strict policy, because open DCR is an attack surface.</p>
+
+    <h4>Q6. Doesn't adding an AS make every API call slower?</h4>
+    <p><strong>Model answer:</strong> No. The federation redirects happen once per login. After that, tokens are JWTs validated locally by resource servers with cached JWKS — no per-request network calls to either Auth0 or the AS.</p>
+
+    <h4>Q7. How do you rotate signing keys without breaking live tokens?</h4>
+    <p><strong>Model answer:</strong> Add the new key to JWKS, start signing with it, keep the old public key published until all tokens signed with it expire, then remove it. Resource servers cache JWKS with a short TTL so they pick up the new key. Key IDs (<code>kid</code>) in the header let verifiers select the right key.</p>
+
+    <h4>Q8. Where do custom claims like roles belong — Auth0 or your AS?</h4>
+    <p><strong>Model answer:</strong> Authorization claims that are my domain's concern (roles, entitlements, region) belong in <em>my</em> token, added by the token customizer. Auth0 owns authentication facts (verified email, MFA level). Mapping Auth0's <code>sub</code> to my user record in the customizer is the seam.</p>
+  </section>
+
+  <!-- ============================================================= 14 -->
+  <section id="cert-tips">
+    <h2>14. Certification Tips</h2>
+    <ul>
+      <li><strong>Know the role-switching vocabulary.</strong> The exam tests whether you understand that one component can be both an OIDC Provider and an OIDC Relying Party. Auth0 calls upstream-IdP brokering "Connections" / "Enterprise federation"; in OAuth terms your AS is an RP to Auth0.</li>
+      <li><strong>Auth0 connection types.</strong> Be able to name database, social, enterprise (SAML, OIDC, WS-Fed), and passwordless connections — and that an upstream OIDC connection is how Auth0 itself federates outward.</li>
+      <li><strong>Issuer + audience validation</strong> is a recurring exam theme. Memorize: validate <code>iss</code>, <code>aud</code>, <code>exp</code>, signature, and <code>nonce</code> for ID tokens.</li>
+      <li><strong>PKCE is mandatory for public clients</strong> in OAuth 2.1 — exam-favorite fact.</li>
+      <li><strong>Grant types:</strong> authorization_code (+PKCE) for users, client_credentials for machines, refresh_token for renewal. Implicit and ROPC are deprecated.</li>
+      <li><strong>JWKS contains public keys only.</strong> Expect a trap answer offering "private key endpoint."</li>
+      <li><strong>Self-contained vs reference (opaque) tokens</strong> and the trade-off: revocation vs validation cost.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================= 15 -->
+  <section id="hands-on">
+    <h2>15. Hands-On Exercises</h2>
+    <ol>
+      <li><strong>Boot the AS.</strong> Create the Spring Boot project with the two starters from §6.1. Add the two filter chains and an in-memory client. Hit <code>http://localhost:9000/.well-known/openid-configuration</code> and confirm your issuer appears.</li>
+      <li><strong>Federate to Auth0.</strong> Create a Regular Web Application in Auth0, set its callback to <code>http://localhost:9000/login/oauth2/code/auth0</code>, and fill in the YAML from §6.2. Trigger an authorize request and verify you are redirected to Auth0's login.</li>
+      <li><strong>Inspect both tokens.</strong> Decode the Auth0 <code>id_token</code> and your AS access token at jwt.io (or locally). Compare <code>iss</code>, <code>aud</code>, <code>kid</code>. Confirm they differ.</li>
+      <li><strong>Add a custom claim.</strong> Implement the token customizer from §6.6 to add <code>nw_region</code>. Re-issue and confirm the claim appears in <em>your</em> token but not Auth0's.</li>
+      <li><strong>Stand up a resource server</strong> (§7.1) and call it with your access token. Then call it with the Auth0 token directly and confirm it is <em>rejected</em> (wrong issuer) — this proves the boundary.</li>
+      <li><strong>Client credentials.</strong> Register the billing daemon (§7.3) and obtain a token with <code>curl</code> using <code>grant_type=client_credentials</code>. No browser, no Auth0.</li>
+    </ol>
+  </section>
+
+  <!-- ============================================================= 16 -->
+  <section id="assignment">
+    <h2>16. Assignment</h2>
+    <p>Build the complete Northwind slice and write a one-page architecture decision record (ADR).</p>
+    <ol>
+      <li>Stand up the Spring AS federating to Auth0, with JDBC-backed client, authorization, and consent stores (use Postgres via Docker).</li>
+      <li>Register two clients: a public SPA (<code>northwind-portal</code>, PKCE) and a confidential daemon (<code>billing-daemon</code>, client_credentials).</li>
+      <li>Implement the token customizer mapping Auth0 <code>sub</code> → internal user → roles + region.</li>
+      <li>Put Spring Cloud Gateway in front with <code>TokenRelay</code>, routing to a <code>shipments-service</code> resource server that enforces <code>SCOPE_shipments:read</code> and audience <code>shipments-api</code>.</li>
+      <li>Demonstrate key rotation: publish two keys in JWKS, sign with the newer, and show old tokens still validate.</li>
+      <li><strong>ADR:</strong> state the concrete trigger that justifies running your own AS, list the risks you accept (uptime, key management), and the mitigations. Conclude with whether, for <em>your</em> hypothetical org, this is justified or over-engineering.</li>
+    </ol>
+    <div class="callout tip"><span class="tag">Tip</span><p>Grade yourself on the ADR more than the code. The senior skill being tested is judgment about <em>whether</em> to build, not just <em>how</em>.</p></div>
+  </section>
+
+  <!-- ============================================================= 17 -->
+  <section id="mini-project">
+    <h2>17. Mini Project — "Delegation Exchange"</h2>
+    <p>Implement an internal <strong>token exchange</strong> (RFC 8693-style) scenario that justifies your own AS — the kind of thing that pushes teams off Auth0-only.</p>
+    <p><strong>Scenario:</strong> The <code>orders-service</code>, acting on behalf of a logged-in user, must call <code>fulfillment-service</code> but with a <em>narrowed</em> token that carries an <code>act</code> (actor) claim proving "orders-service acting for user X" and a reduced scope. Auth0 can do token exchange, but Northwind needs the actor-chain logic and contract checks in its own repo.</p>
+    <ol>
+      <li>Configure the Spring AS to accept a custom exchange request from <code>orders-service</code> (confidential client) presenting the user's original access token.</li>
+      <li>In a custom token endpoint / customizer, validate the incoming token, then mint a <em>new</em> downstream token with: reduced scope (<code>fulfillment:write</code> only), audience <code>fulfillment-api</code>, an <code>act</code> claim <code>{ "sub": "orders-service" }</code>, and the original user as the primary <code>sub</code>.</li>
+      <li>Have <code>fulfillment-service</code> log the actor chain for audit and enforce the reduced scope.</li>
+      <li>Write a short note: why this is cleaner in your own AS than stretching Auth0, and the security checks the exchange must perform (don't widen scope, verify the original token, bind audience).</li>
+    </ol>
+    <div class="callout note"><span class="tag">Note</span><p>This mini project is the canonical "we genuinely needed our own AS" story. Delegation with proprietary, evolving actor-chain rules is one of the cleanest legitimate triggers.</p></div>
+  </section>
+
+  <!-- ============================================================= 18 -->
+  <section id="quiz">
+    <h2>18. Quiz — 22 Questions</h2>
+    <ol>
+      <li>What two distinct OAuth/OIDC roles does the Spring AS play in this architecture?</li>
+      <li>What does "federating to Auth0" mean in technical terms?</li>
+      <li>Which signing key signs the tokens your microservices validate — Auth0's or yours?</li>
+      <li>Why must internal resource servers trust exactly one issuer?</li>
+      <li>What is the single bean that bridges the upstream Auth0 identity into your first-party token?</li>
+      <li>Why does the Auth0 <code>issuer-uri</code> typically need a trailing slash?</li>
+      <li>Name three legitimate triggers for running your own AS alongside Auth0.</li>
+      <li>What is the TokenRelay filter and where does it run?</li>
+      <li>Why re-validate the token at each service even after the gateway validated it?</li>
+      <li>Static vs dynamic client registration: when do you use each?</li>
+      <li>Which grant type do machine-to-machine clients use, and do they touch Auth0?</li>
+      <li>Why is per-service audience (<code>aud</code>) important?</li>
+      <li>What goes in a JWKS endpoint — public or private keys?</li>
+      <li>How do you rotate signing keys without invalidating live tokens?</li>
+      <li>Why doesn't federation slow down every API call?</li>
+      <li>Which claims belong in <em>your</em> token vs Auth0's token?</li>
+      <li>What must you validate on the Auth0 <code>id_token</code> during the federated callback?</li>
+      <li>Why is PKCE mandatory for the public SPA client?</li>
+      <li>What store types should replace in-memory ones for production?</li>
+      <li>What is the security risk if a service accepts both Auth0 and your AS issuers?</li>
+      <li>In the delegation mini-project, what does the <code>act</code> claim represent?</li>
+      <li>Why are short-lived access tokens important when using self-contained JWTs?</li>
+    </ol>
+
+    <details>
+      <summary>Show answer key</summary>
+      <ol>
+        <li>It is an OIDC <strong>Provider</strong> (issuer) to your first-party clients, and an OIDC <strong>Relying Party / client</strong> to Auth0.</li>
+        <li>Your AS runs an OIDC authorization-code+PKCE login against Auth0, validates Auth0's id_token, establishes a session, then issues its own tokens.</li>
+        <li><strong>Yours</strong> — services validate via your AS's JWKS, never Auth0's.</li>
+        <li>So an attacker holding any Auth0-tenant token can't call internal APIs; the boundary stays one-directional.</li>
+        <li>The <code>OAuth2TokenCustomizer&lt;JwtEncodingContext&gt;</code> bean (the token customizer).</li>
+        <li>Because Spring must match the configured issuer exactly to Auth0's <code>iss</code> claim, which ends with a slash; it also derives the discovery URL from it.</li>
+        <li>Any three: HSM/KMS-resident keys you must own; proprietary/fast-changing issuance policy in your repo; air-gapped/sovereign deployment; a custom grant (token exchange/delegation); contractual control of token state.</li>
+        <li>A Spring Cloud Gateway filter that forwards the incoming bearer token to downstream services; it runs at the gateway.</li>
+        <li>Defense in depth — a compromised gateway or mis-route can't grant access without a token valid for that service's audience and scope.</li>
+        <li>Static for a known, governed set of first-party clients; dynamic (RFC 7591) for self-service/multi-tenant registration, gated by an initial access token.</li>
+        <li><code>client_credentials</code>; no — there is no human, so they go directly to your AS, not Auth0.</li>
+        <li>It binds a token to a specific service so it can't be replayed at another service (prevents confused-deputy).</li>
+        <li><strong>Public</strong> keys only.</li>
+        <li>Add the new key to JWKS, sign with it, keep the old public key published until all old tokens expire, then remove it; verifiers select by <code>kid</code> and cache JWKS briefly.</li>
+        <li>The redirect dance with Auth0 happens once per login; afterwards JWTs are validated locally with cached JWKS — no per-request calls.</li>
+        <li>Authorization claims (roles, entitlements, region) in <em>your</em> token; authentication facts (verified email, MFA) in Auth0's.</li>
+        <li>Signature, <code>iss</code>, <code>aud</code>, <code>exp</code>, and <code>nonce</code> (plus <code>state</code>/PKCE on the request).</li>
+        <li>Because a public client can't keep a secret; PKCE prevents authorization-code interception attacks.</li>
+        <li>JDBC-backed <code>RegisteredClientRepository</code>, <code>OAuth2AuthorizationService</code>, and <code>OAuth2AuthorizationConsentService</code>.</li>
+        <li>Any valid Auth0 token (even from another app) could access internal APIs, bypassing your authorization layer.</li>
+        <li>The actor — the service acting on behalf of the user (delegation), e.g. <code>{ "sub": "orders-service" }</code>.</li>
+        <li>Self-contained JWTs can't be revoked before expiry, so short TTL limits the window of a stolen token; refresh tokens handle renewal.</li>
+      </ol>
+    </details>
+  </section>
+
+  <!-- ============================================================= 19 -->
+  <section id="cheatsheet">
+    <h2>19. Cheat Sheet</h2>
+    <pre class="diagram">
+  ROLES
+    Spring AS  ==  OIDC Provider (to your clients)  +  OIDC RP (to Auth0)
+    Auth0      ==  upstream IdP (authentication, social/SSO/MFA)
+    Gateway    ==  edge validation + TokenRelay
+    Services   ==  resource servers, validate YOUR JWKS only
+
+  ISSUERS / KEYS (never mix)
+    Auth0 token : iss=https://TENANT.auth0.com/   key=Auth0   aud=app
+    Your  token : iss=https://as.northwind.internal key=HSM   aud=service-id
+
+  STARTERS
+    spring-boot-starter-oauth2-authorization-server   (be a Provider)
+    spring-boot-starter-oauth2-client                  (be an RP to Auth0)
+    spring-boot-starter-oauth2-resource-server         (validate tokens)
+
+  KEY BEANS
+    RegisteredClientRepository       -> who may request tokens
+    JWKSource&lt;SecurityContext&gt;        -> signing keys (HSM in prod)
+    AuthorizationServerSettings      -> .issuer(...)
+    OAuth2TokenCustomizer            -> map Auth0 sub -> your claims
+
+  ENDPOINTS (Spring AS)
+    /.well-known/openid-configuration   /oauth2/authorize
+    /oauth2/token   /oauth2/jwks   /oauth2/introspect   /oauth2/revoke
+    /userinfo   /connect/register (DCR)
+
+  FEDERATION CALLBACK
+    /login/oauth2/code/auth0   (Auth0 sends user back here)
+
+  GRANTS
+    authorization_code + PKCE  -> humans (public clients)
+    client_credentials         -> machines (no Auth0)
+    refresh_token              -> renewal
+
+  GOLDEN RULES
+    1. Default to Auth0-only; build an AS only on a written trigger.
+    2. Services trust ONE issuer (yours) + check aud.
+    3. JWKS = public keys only; rotate via overlap.
+    4. PKCE for public; short access tokens; rotate refresh tokens.
+    5. Map identity in the token customizer; keep ext_idp/ext_sub for audit.
+    </pre>
+  </section>
+
+  <!-- ============================================================= 20 -->
+  <section id="takeaways">
+    <h2>20. Key Takeaways</h2>
+    <ul>
+      <li><strong>An AS can be a client of another AS.</strong> Federation = your Spring AS logs in against Auth0, then issues its own tokens. Auth0 answers "who?"; your AS answers "what may they do here?".</li>
+      <li><strong>The default is Auth0-only.</strong> Running your own AS is justified only by concrete triggers — HSM keys, proprietary issuance/delegation policy, sovereignty, or a custom grant. "Control" alone is not a trigger.</li>
+      <li><strong>Two issuers, two keys, one trust link.</strong> Your microservices validate <em>your</em> JWKS exclusively. Mixing issuers destroys the boundary.</li>
+      <li><strong>The token customizer is the seam.</strong> It maps Auth0's <code>sub</code> to your user and stamps your authorization claims.</li>
+      <li><strong>Token relay re-validates at every hop.</strong> The gateway forwards the bearer token; each service re-checks signature, audience, and scope.</li>
+      <li><strong>Federation cost is per-login, not per-request.</strong> JWT validation is local and cheap.</li>
+      <li><strong>Production means ownership.</strong> JDBC stores, HSM/KMS keys with rotation runbooks, HA replicas, and the acceptance that you now own token-issuance uptime.</li>
+      <li><strong>Static client registration for first-party governance; dynamic only when self-service is required</strong> — and always gated.</li>
+    </ul>
+    <div class="callout key"><span class="tag">Key</span><p>If you remember one sentence: <em>federate to Auth0 for identity, issue your own tokens for authorization, and let your services trust only you.</em></p></div>
+  </section>
+
+  <nav class="pager">
+    <a class="prev" href="chapter-19.html">← Previous</a>
+    <a class="next" href="chapter-21.html">Next →</a>
+  </nav>
+</main>
+<footer class="site-footer">Master Auth0 End-to-End · Chapter 20 of 32</footer>
+</body>
+</html>

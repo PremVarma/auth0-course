@@ -1,0 +1,633 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 16 — Enterprise Identity: RBAC/ABAC/PBAC, SCIM, SAML and Federation | Master Auth0</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">🔐 Master Auth0</a>
+  <nav class="topnav">
+    <a href="chapter-15.html">← Prev</a>
+    <a href="index.html">Contents</a>
+    <a href="chapter-17.html">Next →</a>
+  </nav>
+</header>
+<main class="container">
+  <div class="chapter-head">
+    <span class="phase">Phase 7 · Enterprise Identity</span>
+    <h1>Chapter 16 — Enterprise Identity: RBAC/ABAC/PBAC, SCIM, SAML and Federation</h1>
+    <p class="lead">Selling software to a single consumer is easy: they sign up, you store a password hash, you're done. Selling to an <em>enterprise</em> is a different universe. A 40,000-person bank will not type passwords into your app — their IT department demands that <strong>their</strong> identity provider authenticate every employee, that accounts appear and vanish automatically as people are hired and fired, and that access is governed by roles, attributes, and policy that auditors can inspect. This chapter is the bridge from "login" to "enterprise-grade access governance." We will build, from first principles, the three authorization models (RBAC, ABAC, PBAC), automated lifecycle with SCIM, the full SAML 2.0 protocol, and federation with Microsoft Entra ID, Google Workspace, Okta, and on-prem Active Directory/LDAP — plus how to reason about B2B vs B2C vs B2E so you choose the right architecture before you write a line of code.</p>
+  </div>
+
+  <!-- ============================================================= 1 -->
+  <section id="theory">
+    <h2>1. Theory — First Principles of Enterprise Authorization</h2>
+
+    <p>Two questions sit at the heart of every secured system, and confusing them is the single most common cause of broken access control:</p>
+    <ul>
+      <li><strong>Authentication (AuthN):</strong> <em>Who are you?</em> Proving identity. This is what login, SAML, OIDC, and federation solve.</li>
+      <li><strong>Authorization (AuthZ):</strong> <em>What are you allowed to do?</em> Granting or denying an action on a resource. This is what RBAC, ABAC, and PBAC solve.</li>
+    </ul>
+
+    <p>Enterprise identity is the discipline of doing both at scale, across organizational boundaries, with an audit trail. To understand it we need a vocabulary that has been stable since the 1970s:</p>
+
+    <table>
+      <thead><tr><th>Term</th><th>Meaning</th><th>Example</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Subject</strong></td><td>The actor requesting access (a user, a service)</td><td><code>jane@acme.com</code></td></tr>
+        <tr><td><strong>Action</strong></td><td>The operation requested</td><td><code>read</code>, <code>delete</code>, <code>approve</code></td></tr>
+        <tr><td><strong>Resource</strong></td><td>The object acted upon</td><td>invoice #482, repo <code>billing</code></td></tr>
+        <tr><td><strong>Permission</strong></td><td>An action+resource pair the system understands</td><td><code>read:invoices</code></td></tr>
+        <tr><td><strong>Context</strong></td><td>Environmental facts at decision time</td><td>time, IP, device, MFA level</td></tr>
+        <tr><td><strong>Policy</strong></td><td>The rule that maps (subject, action, resource, context) → allow/deny</td><td>"managers may approve under $10k"</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Why authorization is hard: the combinatorial explosion</h3>
+    <p>If you have <em>U</em> users and <em>P</em> permissions and you assign permissions directly to users, you maintain up to <em>U × P</em> grants. For 10,000 users and 200 permissions that is 2,000,000 individual decisions to keep correct as people join, move teams, and leave. No human can audit that. Every authorization model below is fundamentally a strategy to <strong>compress</strong> that matrix into something maintainable and reviewable. RBAC inserts a "role" layer; ABAC replaces grants with attribute rules; PBAC externalizes the rules into governed policy. The trade-off is always the same: <em>flexibility vs. simplicity vs. auditability</em>.</p>
+
+    <div class="callout key"><span class="tag">Key</span><p>Authentication answers <em>who</em>. Authorization answers <em>what they may do</em>. Federation lets <em>another organization</em> answer the first question for you, while you keep control of the second. Keep these three planes mentally separate — Auth0 lets you mix and match them, but only if you know which is which.</p></div>
+  </section>
+
+  <!-- ============================================================= 2 -->
+  <section id="story">
+    <h2>2. Story-Based Explanation — Acme Corp Wins a Whale</h2>
+    <p>You run <strong>Helios Analytics</strong>, a SaaS dashboard. For two years your only customers were individuals who self-registered with email and password — classic <strong>B2C</strong>. Then your sales team closes <strong>GlobalBank</strong>, a 40,000-employee customer. The euphoria lasts exactly one meeting, because GlobalBank's CISO hands you a checklist:</p>
+    <ol>
+      <li><em>"Our employees will <strong>not</strong> create Helios passwords. They log in with their corporate Microsoft Entra ID. SSO via SAML or OIDC, non-negotiable."</em> → <strong>Federation.</strong></li>
+      <li><em>"When HR off-boards someone on Friday, their Helios access must be gone by Friday — not whenever you notice."</em> → <strong>SCIM deprovisioning.</strong></li>
+      <li><em>"Analysts see dashboards; only Finance Admins export billing. Prove who can do what."</em> → <strong>RBAC.</strong></li>
+      <li><em>"Exports of EU customer data are forbidden from outside the EU, even for admins."</em> → <strong>ABAC / PBAC.</strong></li>
+      <li><em>"We have two subsidiaries that must stay logically isolated from each other inside Helios."</em> → <strong>B2B Organizations.</strong></li>
+    </ol>
+    <p>Notice that <em>none</em> of these are about login screens. They are about <strong>governance</strong>: who controls identity, how it flows in and out, and what policy gates each action. This chapter is the toolkit for answering that CISO with "yes, and here's how." We will return to GlobalBank repeatedly as our running example.</p>
+    <div class="callout note"><span class="tag">Note</span><p>The moment a single buyer represents thousands of users you don't individually control, you have crossed into <strong>enterprise identity</strong>. The economics flip: one integration unlocks 40,000 seats, so the buyer gets to dictate the identity terms.</p></div>
+  </section>
+
+  <!-- ============================================================= 3 -->
+  <section id="diagrams">
+    <h2>3. ASCII Diagrams — The Enterprise Identity Landscape</h2>
+
+    <h3>3.1 The three authorization models compared</h3>
+    <pre class="diagram">
+  RBAC  (role-based)            ABAC (attribute-based)        PBAC (policy-based)
+  ─────────────────            ──────────────────────        ───────────────────
+  User ─▶ Role ─▶ Perms        Subject.attrs  ┐              Request ─▶ [ PDP ]
+                               Resource.attrs ├─▶ RULE ─▶          policy engine
+  jane ─▶ admin ─▶ {read,      Action         │   allow/         (OPA / Cedar /
+                   write,      Context.attrs  ┘   deny           Auth0 Rules+FGA)
+                   delete}                                          │
+                                                                   ▼
+  "static buckets"            "dynamic conditions"          "centrally governed
+   simple, coarse              flexible, fine-grained         rules, auditable"
+    </pre>
+
+    <h3>3.2 SAML 2.0 SP-initiated SSO (the flow GlobalBank wants)</h3>
+    <pre class="diagram">
+  User-Agent          Helios (SP via Auth0)         Entra ID (IdP)
+     │                        │                          │
+     │  1. GET /dashboard     │                          │
+     │───────────────────────▶│ (no session)             │
+     │                        │                          │
+     │  2. 302 + SAMLRequest  │                          │
+     │◀───────────────────────│ (AuthnRequest, signed)   │
+     │                        │                          │
+     │  3. POST AuthnRequest ─────────────────────────────▶│
+     │                        │              4. user logs │
+     │                        │                 in + MFA  │
+     │                        │                          │
+     │  5. POST SAMLResponse (signed Assertion) back to ACS URL
+     │◀───────────────────────────────────────────────────│
+     │  6. POST /acs ─────────▶│ verify signature,        │
+     │                        │  validate conditions,     │
+     │                        │  map attrs ─▶ profile     │
+     │  7. App session/JWT    │                          │
+     │◀───────────────────────│                          │
+    </pre>
+
+    <h3>3.3 SCIM lifecycle: HR system → Auth0</h3>
+    <pre class="diagram">
+   ┌────────────┐  SCIM 2.0 (REST/JSON)   ┌─────────────────────┐
+   │  Workday /  │  POST   /Users  ───────▶│  Auth0 SCIM endpoint │  create
+   │  Entra ID   │  PATCH  /Users/{id} ───▶│  (Bearer token auth) │  update
+   │ (SCIM client│  DELETE /Users/{id} ───▶│                      │  deprovision
+   │   = source) │  GET    /Users?filter ─▶│  (SCIM server)       │  reconcile
+   └────────────┘                          └─────────────────────┘
+        ▲ "source of truth = HR"                  │
+        │ hire / promote / terminate              ▼
+   employee lifecycle events            users appear/disappear automatically
+    </pre>
+
+    <h3>3.4 Where the planes live</h3>
+    <pre class="diagram">
+   AUTHENTICATION PLANE        AUTHORIZATION PLANE        LIFECYCLE PLANE
+   ────────────────────        ───────────────────        ───────────────
+   SAML / OIDC federation      RBAC roles & perms          SCIM provisioning
+   Entra / Google / Okta       ABAC rules (Actions)        JIT account create
+   AD/LDAP connector           PBAC / FGA / OPA            auto-deprovision
+        │                           │                          │
+        └──────────── Auth0 tenant ties all three together ────┘
+    </pre>
+  </section>
+
+  <!-- ============================================================= 4 -->
+  <section id="analogy">
+    <h2>4. Real-World Analogy — The Corporate Office Building</h2>
+    <p>Imagine a 50-floor office tower. Map each concept to something physical and it sticks forever:</p>
+    <table>
+      <thead><tr><th>Building concept</th><th>Identity concept</th></tr></thead>
+      <tbody>
+        <tr><td>The lobby security desk that checks your company badge</td><td><strong>Authentication / federation</strong> (the IdP vouches for you)</td></tr>
+        <tr><td>Your badge says "Engineering" and that opens floors 10–14</td><td><strong>RBAC</strong> — a role grants a fixed set of doors</td></tr>
+        <tr><td>The server room reader: badge <em>and</em> after-hours <em>and</em> on-call status</td><td><strong>ABAC</strong> — access depends on attributes + context</td></tr>
+        <tr><td>Building rulebook in the security office: "no contractors in the vault, ever"</td><td><strong>PBAC</strong> — central, governed policy that all readers consult</td></tr>
+        <tr><td>HR tells security "Jane started Monday / Jane left Friday" and badges are issued/killed automatically</td><td><strong>SCIM</strong> provisioning &amp; deprovisioning</td></tr>
+        <tr><td>A partner firm's employee uses <em>their own</em> badge that your reader trusts via an agreement</td><td><strong>SAML/OIDC federation</strong> with an external IdP</td></tr>
+        <tr><td>Tenants leasing separate suites who never see each other</td><td><strong>B2B Organizations</strong> (multi-tenant isolation)</td></tr>
+      </tbody>
+    </table>
+    <p>The crucial insight: the badge reader (RBAC) is cheap and fast but blunt. The rulebook in the security office (PBAC) is powerful but you must keep it consistent and audited. Real buildings use <em>all three layers together</em> — and so do real enterprise apps.</p>
+  </section>
+
+  <!-- ============================================================= 5 -->
+  <section id="internals">
+    <h2>5. Internal Working — How Auth0 Implements Each Model</h2>
+
+    <h3>5.1 RBAC inside Auth0</h3>
+    <p>Auth0's Authorization Core stores three primitives on a per-<strong>API</strong> basis (an "API" = a Resource Server identified by an <code>audience</code>):</p>
+    <ul>
+      <li><strong>Permissions</strong> — strings scoped to an API, by convention <code>action:resource</code> (e.g. <code>read:invoices</code>). They are <em>scopes</em> in OAuth terms.</li>
+      <li><strong>Roles</strong> — named bundles of permissions (e.g. <code>finance-admin</code> = {<code>read:invoices</code>, <code>export:billing</code>}).</li>
+      <li><strong>Role assignments</strong> — links between a user (or, in B2B, a user <em>within an organization</em>) and roles.</li>
+    </ul>
+    <p>When a token is minted, Auth0 (a) resolves the user's roles, (b) flattens them to a permission set, (c) optionally injects them into the access token as the <code>permissions</code> claim, and (d) the API enforces by checking the scope. Roles never appear in the token unless you add them via an Action — the token carries <em>permissions</em>, because that's what the API enforces against.</p>
+
+    <h3>5.2 ABAC inside Auth0 — Actions &amp; the token pipeline</h3>
+    <p>Auth0 has no native "ABAC rules engine," but it gives you the hook to build one: <strong>Actions</strong> (Node.js functions) that run in the <em>Login / Machine-to-Machine</em> pipeline. Inside a <code>post-login</code> Action you have <code>event</code> (user, org, request context, geo, IP) and <code>api</code> (deny, add claims, set MFA). That is an Attribute-Based decision point.</p>
+    <pre><code class="language-javascript">// Auth0 Action: post-login — ABAC decision at token-mint time
+exports.onExecutePostLogin = async (event, api) =&gt; {
+  const country  = event.request.geoip?.countryCode;       // context attr
+  const dept     = event.user.app_metadata?.department;    // subject attr
+  const dataReg  = event.organization?.metadata?.region;   // resource attr
+
+  // ABAC rule: EU customer data is only accessible from inside the EU
+  const EU = ["AT","BE","BG","HR","CY","CZ","DK","EE","FI","FR","DE","GR",
+              "HU","IE","IT","LV","LT","LU","MT","NL","PL","PT","RO","SK",
+              "SI","ES","SE"];
+  if (dataReg === "EU" &amp;&amp; !EU.includes(country)) {
+    api.access.deny("EU data may not be accessed from outside the EU");
+    return;
+  }
+  // Enrich token with attributes so the API can do fine-grained checks too
+  api.accessToken.setCustomClaim("https://helios/dept", dept);
+  api.accessToken.setCustomClaim("https://helios/geo", country);
+};</code></pre>
+
+    <h3>5.3 PBAC inside Auth0 — FGA &amp; externalized policy</h3>
+    <p>For true policy-based, relationship-aware authorization ("can user X edit document Y because they're an editor of the folder that contains it?"), Auth0 offers <strong>FGA (Fine-Grained Authorization)</strong>, based on Google's Zanzibar model. You define a <em>model</em> (types and relations) and store <em>tuples</em> (facts), then ask the PDP <code>check(user, relation, object)</code>. This is the externalized Policy Decision Point of PBAC.</p>
+    <pre><code class="language-text"># Auth0 FGA model (DSL) — relationship-based PBAC
+model
+  schema 1.1
+type user
+type folder
+  relations
+    define owner: [user]
+    define editor: [user] or owner
+type document
+  relations
+    define parent: [folder]
+    define editor: [user] or editor from parent   # inherit from folder
+    define viewer: [user] or editor</code></pre>
+    <div class="callout note"><span class="tag">Note</span><p>RBAC is data stored <em>in</em> Auth0 and read at token time. ABAC lives in <em>Actions</em>. PBAC lives in <em>FGA / OPA</em> as an external decision service queried at request time. Knowing <em>where</em> each decision physically executes is what separates a junior from a senior in an interview.</p></div>
+  </section>
+
+  <!-- ============================================================= 6 -->
+  <section id="walkthrough">
+    <h2>6. Code Walkthrough — Reading and Enforcing Permissions</h2>
+
+    <h3>6.1 What a permissioned access token looks like</h3>
+    <pre><code class="language-json">{
+  "iss": "https://globalbank.us.auth0.com/",
+  "sub": "samlp|entra|jane.doe",
+  "aud": "https://api.helios.io",
+  "azp": "Helios SPA",
+  "scope": "openid profile read:invoices export:billing",
+  "permissions": ["read:invoices", "export:billing"],
+  "org_id": "org_GlobalBankEU",
+  "https://helios/dept": "finance",
+  "https://helios/geo": "DE",
+  "exp": 1718800000
+}</code></pre>
+
+    <h3>6.2 Node.js / Express — enforce a permission (RBAC)</h3>
+    <pre><code class="language-javascript">import { auth, requiredScopes } from "express-oauth2-jwt-bearer";
+
+// Validate RS256 JWTs against your tenant's JWKS
+const checkJwt = auth({
+  audience: "https://api.helios.io",
+  issuerBaseURL: "https://globalbank.us.auth0.com/",
+});
+
+// RBAC: deny unless the token carries export:billing
+app.get("/billing/export",
+  checkJwt,
+  requiredScopes("export:billing"),
+  (req, res) =&gt; res.json({ url: signExport(req.auth.payload.org_id) })
+);</code></pre>
+
+    <h3>6.3 Java Spring Boot — RBAC via method security</h3>
+    <pre><code class="language-java">// SecurityConfig.java — map the "permissions" claim to authorities
+@Bean
+SecurityFilterChain api(HttpSecurity http) throws Exception {
+  http.oauth2ResourceServer(o -&gt; o.jwt(j -&gt; j.jwtAuthenticationConverter(conv())));
+  http.authorizeHttpRequests(a -&gt; a.anyRequest().authenticated());
+  return http.build();
+}
+
+JwtAuthenticationConverter conv() {
+  var perms = new JwtGrantedAuthoritiesConverter();
+  perms.setAuthoritiesClaimName("permissions");   // Auth0 RBAC claim
+  perms.setAuthorityPrefix("");                    // keep "export:billing" as-is
+  var c = new JwtAuthenticationConverter();
+  c.setJwtGrantedAuthoritiesConverter(perms);
+  return c;
+}</code></pre>
+    <pre><code class="language-java">// BillingController.java — declarative RBAC at the method
+@RestController
+public class BillingController {
+  @PreAuthorize("hasAuthority('export:billing')")          // RBAC check
+  @GetMapping("/billing/export")
+  public ExportLink export(@AuthenticationPrincipal Jwt jwt) {
+    return billing.export(jwt.getClaimAsString("org_id"));  // tenant-scoped
+  }
+}</code></pre>
+
+    <h3>6.4 FastAPI — ABAC at the endpoint</h3>
+    <pre><code class="language-python">from fastapi import Depends, HTTPException
+# verify_jwt validates RS256 + audience/issuer (see Ch.10) and returns claims
+
+def require(perm: str):
+    def dep(claims: dict = Depends(verify_jwt)):
+        if perm not in claims.get("permissions", []):
+            raise HTTPException(403, "missing permission")
+        return claims
+    return dep
+
+@app.get("/billing/export")
+def export(claims=Depends(require("export:billing"))):
+    # ABAC layer: attribute + context check beyond the role
+    if claims.get("https://helios/dept") != "finance":
+        raise HTTPException(403, "department not permitted")
+    return {"url": sign_export(claims["org_id"])}</code></pre>
+
+    <h3>6.5 FGA check from Node (PBAC)</h3>
+    <pre><code class="language-javascript">import { OpenFgaClient } from "@openfga/sdk";
+const fga = new OpenFgaClient({ apiUrl: process.env.FGA_API_URL,
+  storeId: process.env.FGA_STORE, authorizationModelId: process.env.FGA_MODEL });
+
+app.get("/docs/:id", checkJwt, async (req, res) =&gt; {
+  const { allowed } = await fga.check({
+    user: `user:${req.auth.payload.sub}`,
+    relation: "viewer",
+    object: `document:${req.params.id}`,
+  });
+  if (!allowed) return res.sendStatus(403);
+  res.json(await getDoc(req.params.id));
+});</code></pre>
+  </section>
+
+  <!-- ============================================================= 7 -->
+  <section id="practical">
+    <h2>7. Practical Implementation — Federating GlobalBank's Entra ID</h2>
+
+    <h3>7.1 Choose the protocol: OIDC vs SAML for Entra</h3>
+    <p>Microsoft Entra ID (formerly Azure AD) speaks both OIDC and SAML. <strong>Prefer OIDC</strong> (Auth0's "OpenID Connect" or "Microsoft Azure AD" enterprise connection) for new integrations — it's JSON, simpler, and refresh-token friendly. Use SAML only when the customer mandates it (many regulated buyers do).</p>
+
+    <h3>7.2 Create the enterprise connection (Management API)</h3>
+    <pre><code class="language-bash"># Create a SAML enterprise connection to Entra ID via the Management API
+curl -X POST "https://YOUR_TENANT.us.auth0.com/api/v2/connections" \
+  -H "Authorization: Bearer $MGMT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "name": "globalbank-entra-saml",
+    "strategy": "samlp",
+    "enabled_clients": ["HELIOS_SPA_CLIENT_ID"],
+    "options": {
+      "signInEndpoint": "https://login.microsoftonline.com/TENANT_ID/saml2",
+      "signOutEndpoint": "https://login.microsoftonline.com/TENANT_ID/saml2",
+      "signingCert": "MIID...base64 IdP cert...==",
+      "signatureAlgorithm": "rsa-sha256",
+      "digestAlgorithm": "sha256",
+      "signSAMLRequest": true,
+      "fieldsMap": {
+        "email": "http://schemas.xmlsoap.org/.../emailaddress",
+        "given_name": "http://schemas.xmlsoap.org/.../givenname",
+        "groups": "http://schemas.microsoft.com/ws/2008/06/identity/claims/groups"
+      }
+    }
+  }'</code></pre>
+
+    <h3>7.3 Map IdP groups → Auth0 roles in a post-login Action</h3>
+    <pre><code class="language-javascript">exports.onExecutePostLogin = async (event, api) =&gt; {
+  const groups = event.user.groups || [];          // from SAML "groups" attr
+  const map = {
+    "GlobalBank-Finance-Admins": "finance-admin",
+    "GlobalBank-Analysts":       "analyst",
+  };
+  const roles = groups.map(g =&gt; map[g]).filter(Boolean);
+  // Surface roles + flatten to permissions for the API to enforce
+  api.idToken.setCustomClaim("https://helios/roles", roles);
+  if (roles.includes("finance-admin")) {
+    api.accessToken.addScope("read:invoices");
+    api.accessToken.addScope("export:billing");
+  }
+};</code></pre>
+
+    <h3>7.4 React SPA — trigger the org's connection</h3>
+    <pre><code class="language-jsx">// Login button routes the user straight to GlobalBank's IdP (Home Realm)
+&lt;button onClick={() =&gt; loginWithRedirect({
+  authorizationParams: {
+    organization: "org_GlobalBankEU",      // B2B org context
+    connection:   "globalbank-entra-saml", // skip the Auth0 login screen
+    audience:     "https://api.helios.io",
+    scope:        "openid profile read:invoices",
+  }
+})}&gt;Sign in with GlobalBank&lt;/button&gt;</code></pre>
+  </section>
+
+  <!-- ============================================================= 8 -->
+  <section id="architecture">
+    <h2>8. Production Architecture — Multi-Tenant B2B with Federation + SCIM</h2>
+    <pre class="diagram">
+                         ┌──────────────────────── Auth0 Tenant ───────────────────────┐
+   GlobalBank EU         │                                                              │
+   ┌───────────┐  SAML   │  Enterprise Connection: globalbank-entra-saml                │
+   │ Entra ID  │────────▶│        │                                                     │
+   └───────────┘  SCIM   │        ▼                                                     │
+        │  POST /Users   │  Organization: org_GlobalBankEU  ── roles ──▶ finance-admin  │
+        └───────────────▶│  (members, roles scoped to org)              analyst         │
+                         │        │                                                     │
+   Subsidiary "Helix"    │        ▼   post-login Action (ABAC: geo, dept, MFA)          │
+   ┌───────────┐  OIDC   │  Organization: org_Helix  ── roles ──▶ admin / viewer        │
+   │  Okta     │────────▶│                                                              │
+   └───────────┘         └───────────────┬──────────────────────────────────────────────┘
+                                         │ access_token { org_id, permissions, custom claims }
+                                         ▼
+                         ┌──────────────────────────────────────────┐
+                         │  Helios API (RS256 JWT validation)        │
+                         │   ├─ RBAC: requiredScopes(permission)     │
+                         │   ├─ ABAC: claim/context checks           │
+                         │   └─ PBAC: FGA check(user,rel,object)     │
+                         └──────────────────────────────────────────┘
+    </pre>
+    <p>Design rules that make this production-grade:</p>
+    <ul>
+      <li><strong>One Organization per customer/subsidiary.</strong> Roles and members are scoped to the org, so the same user identity can be <code>admin</code> in one org and <code>viewer</code> in another.</li>
+      <li><strong>Home Realm Discovery:</strong> route <code>jane@globalbank.com</code> to GlobalBank's connection by email domain so users never see a password box.</li>
+      <li><strong>Token = transport, not store.</strong> Put coarse RBAC permissions in the token; keep fine-grained relationship checks in FGA queried per-request. Don't stuff thousands of permissions into a JWT.</li>
+      <li><strong>SCIM source of truth = the customer's HR/IdP.</strong> Auth0 is the SCIM <em>server</em>; never let two systems both think they own the user record.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================= 9 -->
+  <section id="security">
+    <h2>9. Security Analysis — Attacks on SAML, SCIM and RBAC</h2>
+    <table>
+      <thead><tr><th>Threat</th><th>How it works</th><th>Mitigation</th></tr></thead>
+      <tbody>
+        <tr><td><strong>XML Signature Wrapping (XSW)</strong></td><td>Attacker injects a forged assertion alongside the signed one; a sloppy parser validates the signed node but reads the forged one</td><td>Use a vetted SAML library (Auth0's), validate that the signature covers the <em>asserted</em> element, reject multiple assertions</td></tr>
+        <tr><td><strong>Unsigned / wrongly-signed assertions</strong></td><td>IdP forgery or MITM swaps the assertion</td><td>Require signed assertions, pin the IdP signing cert, enforce <code>rsa-sha256</code> (never SHA-1)</td></tr>
+        <tr><td><strong>Assertion replay</strong></td><td>Captured SAMLResponse re-POSTed later</td><td>Enforce <code>NotBefore</code>/<code>NotOnOrAfter</code>, validate <code>InResponseTo</code>, one-time <code>Assertion ID</code> cache</td></tr>
+        <tr><td><strong>Audience confusion</strong></td><td>Assertion meant for app A accepted by app B</td><td>Validate <code>&lt;AudienceRestriction&gt;</code> matches your SP entity ID; validate the <code>Recipient</code> ACS URL</td></tr>
+        <tr><td><strong>SCIM token leak</strong></td><td>Bearer token grants full user CRUD → mass account creation/takeover</td><td>Short-lived/rotatable SCIM tokens, IP allow-list, least privilege, audit every SCIM call</td></tr>
+        <tr><td><strong>Stale role / privilege creep</strong></td><td>User changes teams but keeps old roles forever</td><td>SCIM-driven role sync, periodic access reviews, deprovision on group removal</td></tr>
+        <tr><td><strong>Orphaned accounts</strong></td><td>Off-boarded employee's app session survives</td><td>SCIM <code>DELETE</code>/deactivate + short token TTL + back-channel logout / session revocation</td></tr>
+      </tbody>
+    </table>
+    <div class="callout danger"><span class="tag">Danger</span><p>The classic enterprise breach is the <strong>orphaned account</strong>: someone leaves, their corporate badge is killed, but your app still has a live session or a directly-created Auth0 user. Federation alone does not fix this — you also need SCIM deprovisioning <em>and</em> short token lifetimes. "We turned off SSO" is not the same as "their access is gone."</p></div>
+    <div class="callout warn"><span class="tag">Warn</span><p>Never trust the IdP-supplied <code>email</code> as a user identifier unless the IdP verifies it. Account linking/merging on an unverified email is a takeover vector. Link on the IdP's stable subject identifier instead.</p></div>
+  </section>
+
+  <!-- ============================================================= 10 -->
+  <section id="performance">
+    <h2>10. Performance Considerations</h2>
+    <ul>
+      <li><strong>Don't bloat the token.</strong> Every permission and custom claim grows the JWT, which is sent on <em>every</em> API call. A user with 500 permissions produces a multi-kilobyte token and slows every request. Cap token contents; push fine-grained checks to FGA.</li>
+      <li><strong>Cache JWKS.</strong> Validating RS256 needs the tenant's public keys. Fetch once, cache (Auth0 SDKs do this), and key on <code>kid</code> — never fetch JWKS per request.</li>
+      <li><strong>FGA: batch and cache.</strong> Use <code>BatchCheck</code> for list views (e.g., 50 documents) instead of N round-trips. Cache check results for the request's lifespan; respect tuple-change invalidation.</li>
+      <li><strong>SCIM at scale.</strong> Bulk provisioning of 40,000 users must be paginated and rate-limited. Honor <code>429</code> with backoff; prefer incremental (delta) sync over full reconciliation. Use SCIM filters (<code>?filter=userName eq "x"</code>) to avoid full scans.</li>
+      <li><strong>Group → role mapping cost.</strong> Resolving large IdP group lists in a post-login Action runs on every login; keep the mapping a constant-time object lookup, not an API call per group.</li>
+      <li><strong>Token TTL trade-off.</strong> Short access tokens improve revocation latency (deprovisioning) but increase token-endpoint load. Typical: 10–60 min access tokens + refresh tokens with rotation.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================= 11 -->
+  <section id="mistakes">
+    <h2>11. Common Mistakes</h2>
+    <div class="callout warn"><span class="tag">Mistake 1</span><p><strong>Putting roles in the token instead of permissions.</strong> APIs enforce permissions (scopes). Roles are an authoring convenience. If you ship roles to the API, every role change forces an API code change. Flatten roles → permissions and let the API check permissions.</p></div>
+    <div class="callout warn"><span class="tag">Mistake 2</span><p><strong>One Auth0 connection per customer when you should use Organizations.</strong> Spinning up tenants or duplicating apps per customer doesn't scale. Use <em>one</em> app + Organizations + enterprise connections.</p></div>
+    <div class="callout warn"><span class="tag">Mistake 3</span><p><strong>Federation without deprovisioning.</strong> SSO ≠ lifecycle. Without SCIM, off-boarded users linger. Always pair federation with SCIM (or scheduled reconciliation).</p></div>
+    <div class="callout warn"><span class="tag">Mistake 4</span><p><strong>Hand-rolling a SAML parser.</strong> SAML is a minefield (XSW, canonicalization, namespaces). Always use the vetted library/connection. Never regex XML.</p></div>
+    <div class="callout warn"><span class="tag">Mistake 5</span><p><strong>Treating ABAC/PBAC as "more RBAC."</strong> Don't encode context ("after hours", "from EU") as ever-more-granular roles like <code>finance-admin-eu-business-hours</code>. That's role explosion. Context belongs in attribute/policy checks.</p></div>
+    <div class="callout warn"><span class="tag">Mistake 6</span><p><strong>Mapping IdP groups on the client.</strong> Group→role mapping must happen server-side (Action/backend). A client can lie about its groups.</p></div>
+  </section>
+
+  <!-- ============================================================= 12 -->
+  <section id="best-practices">
+    <h2>12. Best Practices</h2>
+    <ul>
+      <li><strong>Layer the models:</strong> RBAC for the 80% coarse cases, ABAC for contextual gates, PBAC/FGA for relationship/ownership. Don't force one model to do all three jobs.</li>
+      <li><strong>Name permissions <code>verb:resource</code></strong> consistently (<code>read:invoices</code>, not <code>InvoiceReader</code>). Consistency makes audit and code review trivial.</li>
+      <li><strong>Design roles around job functions,</strong> not individuals. If a role has exactly one member, it's probably wrong.</li>
+      <li><strong>Make the customer's IdP the source of truth</strong> for identity and group membership; sync into Auth0 via SCIM. Avoid dual ownership.</li>
+      <li><strong>Prefer OIDC over SAML</strong> for new connections; offer SAML when the buyer requires it.</li>
+      <li><strong>Enforce signed, time-bounded, audience-restricted assertions</strong> with SHA-256; pin the IdP cert and plan for cert rotation.</li>
+      <li><strong>Run periodic access reviews</strong> (quarterly) and log every authz decision for audit.</li>
+      <li><strong>Test deprovisioning</strong> as a first-class scenario: terminate a test user in the IdP and confirm access disappears within your token TTL.</li>
+      <li><strong>Use Home Realm Discovery</strong> by email domain so enterprise users never see credentials they don't have.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================= 13 -->
+  <section id="interview">
+    <h2>13. Interview Questions (with Model Answers)</h2>
+
+    <h3>Q1. Explain RBAC vs ABAC vs PBAC and when you'd choose each.</h3>
+    <blockquote>RBAC assigns permissions to roles and roles to users — simple, auditable, but coarse and prone to role explosion. ABAC decides from attributes of subject/resource/action/context via rules — flexible and fine-grained, but harder to audit and reason about. PBAC externalizes decisions into a governed policy engine (a PDP like OPA/Cedar/FGA) queried at request time — best for centralized governance, relationship/ownership logic, and consistency across services. In practice you layer them: RBAC for the common case, ABAC for contextual constraints, PBAC for ownership and cross-service consistency.</blockquote>
+
+    <h3>Q2. Walk me through SP-initiated SAML SSO.</h3>
+    <blockquote>User hits the SP; SP has no session so it builds a signed AuthnRequest and 302-redirects the browser to the IdP's SSO endpoint. The IdP authenticates the user (and may do MFA), then POSTs a signed SAMLResponse containing an Assertion back to the SP's ACS URL. The SP validates the signature against the pinned IdP cert, checks Conditions (NotBefore/NotOnOrAfter, AudienceRestriction, Recipient, InResponseTo), maps the assertion's attributes to a local profile, and establishes a session. Key validations: signature, time bounds, audience, replay protection.</blockquote>
+
+    <h3>Q3. What is SCIM and why does federation alone not solve the problem it solves?</h3>
+    <blockquote>SCIM (System for Cross-domain Identity Management) is a REST/JSON standard for provisioning and deprovisioning user accounts and groups across systems. Federation handles authentication at login time, but it doesn't create accounts ahead of time, sync attribute/group changes, or remove access when someone leaves. SCIM keeps the lifecycle in sync: HR/IdP (the SCIM client) pushes create/update/delete to the app (the SCIM server), so off-boarding in HR removes app access automatically. Federation answers "can this person log in right now"; SCIM answers "should this account exist at all".</blockquote>
+
+    <h3>Q4. How do you prevent role explosion?</h3>
+    <blockquote>Keep roles tied to job functions and move all contextual/conditional logic out of role names into ABAC or PBAC. Instead of <code>finance-admin-eu-bizhours</code>, use a <code>finance-admin</code> role plus an attribute/policy check on region and time. Also reuse permissions across roles, and run periodic reviews to retire single-member or duplicate roles.</blockquote>
+
+    <h3>Q5. Name three SAML attacks and their mitigations.</h3>
+    <blockquote>(1) XML Signature Wrapping — mitigate by validating that the signature covers the consumed assertion and rejecting multiple assertions; use a vetted library. (2) Replay — enforce NotOnOrAfter, InResponseTo, and a one-time assertion-ID cache. (3) Audience confusion — validate AudienceRestriction and the Recipient ACS URL match your SP. Also: require signed assertions with SHA-256 and pin the IdP cert.</blockquote>
+
+    <h3>Q6. B2B vs B2C vs B2E — how do the identity requirements differ?</h3>
+    <blockquote>B2C: many self-registering consumers, social/password login, focus on conversion, scale, and privacy; you own identity. B2B: you sell to organizations; each customer brings its own IdP, needs SSO/SAML, SCIM, org-scoped roles, and tenant isolation — model with Organizations. B2E: your own employees; identity comes from the corporate directory (Entra/AD/Okta), strong MFA, conditional access, and tight lifecycle via HR/SCIM. The axis is "who owns the identity and who dictates the terms."</blockquote>
+
+    <h3>Q7. Why do you put permissions (not roles) in the access token?</h3>
+    <blockquote>Because the API is the policy enforcement point and it enforces against permissions/scopes. Roles are an authoring abstraction in the IdP. Shipping roles to the API couples the API to your role taxonomy — every role redefinition becomes an API change. Flattening roles to permissions keeps the API stable and the token meaningful to the resource server.</blockquote>
+
+    <h3>Q8. How would you integrate on-prem Active Directory with Auth0 securely?</h3>
+    <blockquote>Use the AD/LDAP Connector: an outbound-only agent installed inside the corporate network that connects to the directory and tunnels to Auth0 over an authenticated, encrypted channel — no inbound firewall ports. Credentials are validated against AD; you can cache for resilience, map groups to roles, and enable Kerberos/IWA for desktop SSO. Prefer migrating to Entra ID/OIDC long-term, but the connector bridges legacy on-prem directories.</blockquote>
+  </section>
+
+  <!-- ============================================================= 14 -->
+  <section id="certification">
+    <h2>14. Certification Tips</h2>
+    <ul>
+      <li><strong>Know the RBAC vocabulary precisely:</strong> permissions belong to APIs (resource servers); roles bundle permissions; the <code>permissions</code> claim is added by enabling RBAC + "Add Permissions in the Access Token" on the API.</li>
+      <li><strong>Organizations</strong> is the B2B feature: members, org-scoped roles, enterprise connections per org, and the <code>org_id</code> claim. Expect questions on membership and connection enablement.</li>
+      <li><strong>Enterprise connection strategies</strong> to memorize: <code>samlp</code> (SAML), <code>oidc</code>/<code>waad</code> (Entra), <code>google-apps</code> (Google Workspace), <code>okta</code>, <code>ad</code> (AD/LDAP connector).</li>
+      <li><strong>SCIM in Auth0</strong> makes Auth0 the SCIM <em>server</em>; the customer IdP is the client. Know the four operations and that it requires an enterprise connection.</li>
+      <li><strong>SAML validation order:</strong> signature → conditions (time, audience, recipient) → attribute mapping. Know <code>NameID</code>, <code>AudienceRestriction</code>, and the ACS URL.</li>
+      <li><strong>Actions</strong> (post-login) are the supported extensibility point; Rules/Hooks are legacy. Group→role mapping and custom claims happen here.</li>
+      <li><strong>Home Realm Discovery / IdP-initiated vs SP-initiated</strong> distinctions appear frequently.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================= 15 -->
+  <section id="hands-on">
+    <h2>15. Hands-On Exercises</h2>
+    <ol>
+      <li><strong>RBAC from scratch.</strong> In an Auth0 tenant: create an API <code>https://api.helios.io</code>, add permissions <code>read:invoices</code> and <code>export:billing</code>, enable RBAC + "Add Permissions in the Access Token". Create roles <code>analyst</code> and <code>finance-admin</code>, assign permissions, assign a test user, and decode the resulting access token to confirm the <code>permissions</code> claim.</li>
+      <li><strong>ABAC Action.</strong> Write a post-login Action that denies login when <code>event.request.geoip.countryCode</code> is outside a list, and adds a <code>https://helios/geo</code> claim. Test by changing the simulated country.</li>
+      <li><strong>SAML connection.</strong> Use a free IdP (e.g., Microsoft Entra ID free tier or a test SAML IdP) to create a <code>samlp</code> enterprise connection. Capture the SAMLResponse with browser dev tools and identify the signature, Conditions, and AttributeStatement.</li>
+      <li><strong>SCIM.</strong> Enable SCIM on the enterprise connection, generate a token, and use <code>curl</code> to POST a user, PATCH it, and DELETE it against the SCIM endpoint. Confirm the user appears/disappears in Auth0.</li>
+      <li><strong>FGA.</strong> Stand up an FGA store with the document/folder model above; write tuples making a user an <code>editor</code> of a folder; verify they inherit <code>editor</code> on a document inside it via <code>check</code>.</li>
+    </ol>
+  </section>
+
+  <!-- ============================================================= 16 -->
+  <section id="assignment">
+    <h2>16. Assignment</h2>
+    <div class="callout note"><span class="tag">Deliverable</span><p>Write a <strong>2-page Enterprise Identity Design Doc</strong> for onboarding a fictional B2B customer "NorthWind Bank" (12,000 employees, Okta IdP, EU + US offices) onto your SaaS. It must specify: (1) the federation protocol and why; (2) the Organizations/roles/permissions model with at least 3 roles and 6 permissions; (3) the SCIM provisioning plan including deprovisioning SLA; (4) at least two ABAC/PBAC rules with justification (one must be data-residency); (5) a security checklist covering SAML/SCIM threats; (6) a token strategy (TTLs, claims). Include one ASCII architecture diagram. Grade yourself against the best-practices and security sections of this chapter.</p></div>
+  </section>
+
+  <!-- ============================================================= 17 -->
+  <section id="mini-project">
+    <h2>17. Mini Project — "Helios Enterprise Gateway"</h2>
+    <p>Build a working slice end-to-end:</p>
+    <ol>
+      <li><strong>Auth0:</strong> one API, one SPA app, one Organization (<code>org_northwind</code>), an enterprise connection (use OIDC/Entra free tier or a mock SAML IdP), roles <code>analyst</code> + <code>finance-admin</code>, RBAC enabled.</li>
+      <li><strong>Action:</strong> post-login Action that maps IdP groups → roles and enforces an ABAC rule (geo-based deny) and adds <code>https://helios/dept</code>.</li>
+      <li><strong>Backend (pick one):</strong> Spring Boot, Express, or FastAPI exposing <code>GET /invoices</code> (needs <code>read:invoices</code>) and <code>GET /billing/export</code> (needs <code>export:billing</code> + dept=finance ABAC).</li>
+      <li><strong>FGA (stretch):</strong> add <code>GET /docs/:id</code> gated by an FGA <code>viewer</code> check using the folder/document model.</li>
+      <li><strong>Frontend:</strong> React SPA that logs in via the org connection, calls both endpoints, and shows 200/403 outcomes per role.</li>
+      <li><strong>SCIM demo:</strong> a script that creates a test user via SCIM, logs in, then deletes via SCIM and shows access is revoked after token expiry.</li>
+    </ol>
+    <p><strong>Acceptance:</strong> an <code>analyst</code> can read invoices but gets 403 on export; a <code>finance-admin</code> in finance can export; logging in from a denied country fails; a SCIM-deleted user loses access within the token TTL. Capture screenshots/logs of each.</p>
+  </section>
+
+  <!-- ============================================================= 18 -->
+  <section id="quiz">
+    <h2>18. Quiz — 22 Questions</h2>
+    <ol>
+      <li>Define authentication vs authorization in one sentence each.</li>
+      <li>In RBAC, what sits between users and permissions, and why?</li>
+      <li>What problem does the "role layer" actually solve mathematically?</li>
+      <li>Give an ABAC rule that cannot be cleanly expressed as a role.</li>
+      <li>What is a Policy Decision Point (PDP) and which Auth0 feature provides one?</li>
+      <li>In an Auth0 access token, do you find <code>roles</code> or <code>permissions</code> by default? Why?</li>
+      <li>Name the two endpoints an Auth0 SAML enterprise connection needs from the IdP.</li>
+      <li>What does the ACS URL receive, and who sends it?</li>
+      <li>List three things the SP must validate on a SAML assertion.</li>
+      <li>What is XML Signature Wrapping and one mitigation?</li>
+      <li>What are the four core SCIM operations?</li>
+      <li>In Auth0 SCIM, is Auth0 the client or the server? Who is the other party?</li>
+      <li>Why is federation insufficient for off-boarding, and what completes it?</li>
+      <li>What is an orphaned account and how do short token TTLs help?</li>
+      <li>Which connection strategy maps to Microsoft Entra ID? To Google Workspace? To Okta?</li>
+      <li>What is the AD/LDAP Connector and why is it outbound-only?</li>
+      <li>Contrast B2C, B2B, and B2E by "who owns the identity."</li>
+      <li>What Auth0 feature provides per-customer tenant isolation in B2B, and what claim identifies it?</li>
+      <li>Where should IdP-group → role mapping execute, and why not on the client?</li>
+      <li>Why shouldn't you encode "after hours" as a role?</li>
+      <li>Name two performance risks of large permission sets in tokens.</li>
+      <li>In FGA, what are a "model" and a "tuple"?</li>
+      <li>(Bonus) What is Home Realm Discovery?</li>
+      <li>(Bonus) Why prefer OIDC over SAML for new enterprise connections?</li>
+    </ol>
+
+    <details>
+      <summary>Show answer key</summary>
+      <ol>
+        <li><strong>AuthN</strong> proves <em>who</em> you are; <strong>AuthZ</strong> determines <em>what</em> you may do.</li>
+        <li>A <strong>role</strong>; it compresses the user×permission matrix so you manage far fewer assignments and can audit by job function.</li>
+        <li>It factors a <em>U × P</em> matrix into <em>U × R</em> + <em>R × P</em>, drastically reducing the number of grants to maintain (R ≪ P).</li>
+        <li>e.g. "Allow export only between 9–5 from an EU IP on an MFA-verified device" — depends on context attributes, not a static bucket.</li>
+        <li>A service that evaluates policy and returns allow/deny; in Auth0 this is <strong>FGA</strong> (and you can integrate OPA/Cedar).</li>
+        <li><strong>permissions</strong> — the API (resource server) enforces against scopes/permissions, not roles; roles are an authoring abstraction.</li>
+        <li><code>signInEndpoint</code> (SSO) and <code>signOutEndpoint</code> (SLO), plus the IdP signing certificate.</li>
+        <li>The <strong>Assertion Consumer Service URL</strong> receives the signed SAMLResponse; the <strong>IdP</strong> sends it (POST binding).</li>
+        <li>Signature (against pinned IdP cert), time bounds (NotBefore/NotOnOrAfter), and audience/recipient (AudienceRestriction + ACS URL); also InResponseTo for replay.</li>
+        <li>Injecting a forged assertion next to the signed one so the parser validates one node but consumes another; mitigate by ensuring the signature covers the consumed assertion and rejecting multiple assertions (use a vetted library).</li>
+        <li>Create (POST), Read/Query (GET), Update (PUT/PATCH), Delete/Deactivate (DELETE).</li>
+        <li>Auth0 is the <strong>server</strong>; the customer's IdP/HR system is the <strong>client</strong> (source of truth).</li>
+        <li>Federation only handles login-time AuthN; it neither pre-creates accounts nor removes them. <strong>SCIM</strong> (or scheduled reconciliation) completes the lifecycle.</li>
+        <li>An account/session that survives after the person leaves; short access-token TTLs bound how long stale access persists after deprovisioning.</li>
+        <li>Entra → <code>waad</code>/<code>oidc</code> (or <code>samlp</code>); Google Workspace → <code>google-apps</code>; Okta → <code>okta</code> (OIDC/SAML).</li>
+        <li>An on-prem agent that validates credentials against AD/LDAP; outbound-only so no inbound firewall ports are exposed — it dials out to Auth0.</li>
+        <li>B2C: you own consumer identity. B2B: the customer org owns identity (brings its IdP). B2E: the corporate directory owns employee identity.</li>
+        <li><strong>Organizations</strong>; the <code>org_id</code> claim identifies the tenant context in the token.</li>
+        <li>Server-side (post-login Action or backend); a client can forge its claimed groups, so client-side mapping is untrusted.</li>
+        <li>It's context, not a job function; encoding it as a role causes role explosion. Use ABAC/PBAC.</li>
+        <li>Larger JWTs sent on every request (bandwidth/parse cost) and potential header-size limits; pushes you toward bloated tokens instead of FGA.</li>
+        <li><strong>Model</strong> = the type/relation schema (what relations exist); <strong>tuple</strong> = a stored fact like <code>user:jane editor document:42</code>.</li>
+        <li>Routing a user to the correct IdP/connection (often by email domain) so they skip an irrelevant login screen.</li>
+        <li>OIDC is JSON-based, simpler to implement, refresh-token friendly, and less exposed to XML-signature attack classes than SAML.</li>
+      </ol>
+    </details>
+  </section>
+
+  <!-- ============================================================= 19 -->
+  <section id="cheatsheet">
+    <h2>19. Cheat Sheet</h2>
+    <table>
+      <thead><tr><th>Topic</th><th>Remember this</th></tr></thead>
+      <tbody>
+        <tr><td>RBAC</td><td>user → role → permissions; permissions belong to an API; token carries <code>permissions</code></td></tr>
+        <tr><td>ABAC</td><td>decide from subject/resource/action/context attributes; lives in post-login <strong>Actions</strong></td></tr>
+        <tr><td>PBAC</td><td>externalized PDP; relationship-based via <strong>FGA</strong> (Zanzibar): <code>check(user, relation, object)</code></td></tr>
+        <tr><td>SAML flow</td><td>SP → AuthnRequest → IdP login → signed Assertion → ACS URL → validate → session</td></tr>
+        <tr><td>SAML validate</td><td>signature → conditions (time, audience, recipient, InResponseTo) → attributes</td></tr>
+        <tr><td>SCIM</td><td>POST/GET/PATCH/DELETE /Users; Auth0 = server, IdP = client; provisioning + deprovisioning</td></tr>
+        <tr><td>Entra</td><td>strategy <code>waad</code>/<code>oidc</code> (or <code>samlp</code>); map <code>groups</code> claim → roles</td></tr>
+        <tr><td>Google</td><td>strategy <code>google-apps</code> (Workspace domain)</td></tr>
+        <tr><td>Okta</td><td>strategy <code>okta</code> (OIDC or SAML)</td></tr>
+        <tr><td>AD/LDAP</td><td><code>ad</code> connector; outbound-only agent; Kerberos/IWA for desktop SSO</td></tr>
+        <tr><td>B2B</td><td>Organizations; <code>org_id</code> claim; org-scoped roles; enterprise connection per org</td></tr>
+        <tr><td>B2C / B2E</td><td>B2C = consumers (you own identity); B2E = employees (corp directory owns identity)</td></tr>
+        <tr><td>Security</td><td>signed SHA-256 assertions, pin cert, time/audience bounds, rotate SCIM token, short TTL</td></tr>
+        <tr><td>Login params</td><td><code>organization</code>, <code>connection</code>, <code>audience</code>, <code>scope</code></td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- ============================================================= 20 -->
+  <section id="takeaways">
+    <h2>20. Key Takeaways</h2>
+    <div class="callout key"><span class="tag">Key</span><p><strong>1.</strong> Enterprise identity is about <em>governance</em>, not login screens: who owns identity, how it flows in/out, and what policy gates each action.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p><strong>2.</strong> RBAC, ABAC, and PBAC are three compression strategies for the user×permission matrix. Layer them: RBAC for coarse access, ABAC for context, PBAC/FGA for relationships and ownership.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p><strong>3.</strong> Tokens carry <em>permissions</em>, not roles. Keep tokens small; push fine-grained checks to a PDP queried per request.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p><strong>4.</strong> SAML SSO = signed Assertion delivered to the ACS URL; you must validate signature, time, audience, and replay. Never hand-roll SAML.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p><strong>5.</strong> Federation handles login; <strong>SCIM</strong> handles lifecycle. Off-boarding requires SCIM + short token TTLs to avoid orphaned access.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p><strong>6.</strong> Model B2B with <strong>Organizations</strong> (one per customer), bring each customer's IdP via enterprise connections (Entra/Google/Okta/AD), and map IdP groups → roles server-side. Choose B2C/B2B/B2E by asking "who owns the identity."</p></div>
+  </section>
+
+  <nav class="pager">
+    <a class="prev" href="chapter-15.html">← Previous</a>
+    <a class="next" href="chapter-17.html">Next →</a>
+  </nav>
+</main>
+<footer class="site-footer">Master Auth0 End-to-End · Chapter 16 of 32</footer>
+</body>
+</html>

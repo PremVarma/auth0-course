@@ -1,0 +1,786 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 6 — OAuth Grant Types: Client Credentials, Device, Refresh, Implicit, Password | Master Auth0</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">🔐 Master Auth0</a>
+  <nav class="topnav">
+    <a href="chapter-05.html">← Prev</a>
+    <a href="index.html">Contents</a>
+    <a href="chapter-07.html">Next →</a>
+  </nav>
+</header>
+<main class="container">
+  <div class="chapter-head">
+    <span class="phase">Phase 2 · OAuth 2.0 Masterclass</span>
+    <h1>Chapter 6 — OAuth Grant Types: Client Credentials, Device, Refresh, Implicit, Password</h1>
+    <p class="lead">In Chapter 5 you mastered the Authorization Code flow with PKCE — the grant for apps where a <em>human</em> logs in through a browser. But the real world has machines talking to machines at 3 a.m., smart TVs with no keyboard, mobile apps that must stay logged in for months, and legacy systems that predate modern redirects. OAuth 2.0 answers each of these with a different <strong>grant type</strong>. This chapter dissects all five remaining grants from first principles: why each exists, exactly how the bytes flow, where each one is dangerous, which ones the OAuth 2.1 working group has deprecated and why, and how to wire every one of them up in Auth0 with real, runnable code. By the end you will be able to look at any application and name the correct grant in seconds — the single most-tested skill on the Auth0 certification and in system-design interviews.</p>
+  </div>
+
+  <!-- ===================== 1. THEORY ===================== -->
+  <section id="theory">
+    <h2>1. Theory — First Principles: What Is a "Grant" and Why Are There Many?</h2>
+
+    <p>Strip OAuth 2.0 down to one sentence and it says: <strong>"How can a client obtain an access token, without being handed the resource owner's password?"</strong> An <em>access token</em> is just a string the client presents to an API ("Resource Server") to prove it is allowed to do something. The whole protocol is the choreography of getting that string safely.</p>
+
+    <p>A <strong>grant type</strong> (the spec also calls it an "authorization grant") is the <em>specific method</em> by which a client proves it deserves a token. Why is one method not enough? Because the security properties available to a client depend entirely on <strong>what kind of thing the client is</strong>:</p>
+
+    <ul>
+      <li><strong>Can it keep a secret?</strong> A backend server can store a client secret in an environment variable no attacker can read. A single-page app shipped to the browser cannot — its source is public. A native CLI on a laptop cannot either.</li>
+      <li><strong>Is a human present?</strong> A nightly billing job has no user. A login page has one. A smart TV has a human, but no convenient way for them to type.</li>
+      <li><strong>Is there a browser / redirect channel?</strong> Authorization Code needs the user-agent to follow a redirect. A device with no browser (or a daemon with no UI) cannot use redirects at all.</li>
+    </ul>
+
+    <p>From these three axes the OAuth designers derived a family of grants. Four "core" grants appear in RFC 6749 (Authorization Code, Implicit, Resource Owner Password Credentials, Client Credentials), one is added by RFC 8628 (Device Authorization), and the Refresh Token "grant" (RFC 6749 §6) is a special grant used <em>only</em> to mint new access tokens from a previously issued refresh token. We covered Authorization Code in Chapter 5; this chapter covers the other five.</p>
+
+    <div class="callout key"><span class="tag">Key</span><p>A grant type is not a feature you pick for taste — it is <em>dictated</em> by your client's trust profile: (1) can it hold a secret, (2) is a user present, (3) is a browser redirect available. Get those three answers and the correct grant falls out automatically.</p></div>
+
+    <h3>The two "shapes" of token requests</h3>
+    <p>Every OAuth grant ends with an HTTP <code>POST</code> to the <strong>token endpoint</strong> (<code>/oauth/token</code> in Auth0). What differs is the <code>grant_type</code> form parameter and the credentials presented alongside it:</p>
+
+    <table>
+      <thead><tr><th>Grant</th><th><code>grant_type</code> value</th><th>Authenticated by</th><th>Returns user identity?</th></tr></thead>
+      <tbody>
+        <tr><td>Client Credentials</td><td><code>client_credentials</code></td><td>Client secret / private-key JWT</td><td>No — it <em>is</em> the user</td></tr>
+        <tr><td>Device Authorization</td><td><code>urn:ietf:params:oauth:grant-type:device_code</code></td><td>Device code + user approval</td><td>Yes</td></tr>
+        <tr><td>Refresh Token</td><td><code>refresh_token</code></td><td>The refresh token itself</td><td>Yes (re-issues user tokens)</td></tr>
+        <tr><td>Implicit (deprecated)</td><td><code>token</code> / <code>id_token</code> (response_type)</td><td>Nothing — token in URL</td><td>Yes</td></tr>
+        <tr><td>Resource Owner Password (ROPC)</td><td><code>password</code></td><td>Username + password</td><td>Yes</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- ===================== 2. STORY ===================== -->
+  <section id="story">
+    <h2>2. Story-Based Explanation — Five Doors Into the Same Building</h2>
+
+    <p>Imagine "CinemaCloud", the booking platform you will build in your capstone. It is one company, but its software wears many hats. Picture each piece of software as a different visitor trying to get into the secured back-office building, where a guard (the Authorization Server) hands out colour-coded badges (tokens).</p>
+
+    <p><strong>Mira, the nightly accountant (Client Credentials).</strong> Every midnight a billing service totals the day's ticket sales and pushes invoices to the payments API. There is no human watching. The service walks up to the guard, shows its own <em>company ID card</em> (a client secret it alone possesses) and says "I am the billing robot, give me my badge." No user is involved — the robot is acting as <em>itself</em>. The guard checks the card and issues a badge scoped to <code>create:invoices</code>.</p>
+
+    <p><strong>Tom, watching the lobby TV (Device flow).</strong> CinemaCloud has a smart-TV app for browsing trailers and signing in to see your watchlist. The TV has no keyboard — typing a password with a remote is misery. So the TV shows a short code: "Go to <code>cinema.cloud/activate</code> on your phone and enter <code>WDJB-MJHT</code>." Tom pulls out his phone, logs in there comfortably, approves the TV, and seconds later the TV lights up — authenticated, without ever touching a password on the TV itself.</p>
+
+    <p><strong>Priya, who never wants to log in again (Refresh tokens).</strong> Priya uses the CinemaCloud mobile app daily. Forcing her to type her password every hour would be torture, but keeping a long-lived access token would be dangerous if her phone is stolen. The compromise: she gets a short-lived badge (access token, ~15 min) <em>plus</em> a special <em>renewal voucher</em> (refresh token). When the badge expires, the app silently swaps the voucher for a fresh badge — and, with <em>rotation</em>, gets a brand-new voucher each time, so a stolen old voucher becomes useless.</p>
+
+    <p><strong>Ravi, the legacy ghost (Implicit).</strong> Years ago, before browsers could safely do cross-origin POSTs, CinemaCloud's old single-page dashboard used the Implicit flow — the token was thrown straight back in the URL fragment. It worked, but tokens leaked into browser history and logs. Ravi's flow is the building's <em>old fire-escape door</em>: still bolted shut for emergencies-of-the-past, but the company has a sign on it reading "DEPRECATED — use the front door (Auth Code + PKCE)."</p>
+
+    <p><strong>Sam, the impatient insider (ROPC).</strong> An internal admin tool, built by Sam in a hurry, just collects the username and password in its own form and sends them to the guard directly: "Here, log this person in." It works, but Sam's tool now <em>sees the password</em> — defeating the entire reason OAuth exists. The guard grudgingly allows it for trusted first-party tools, but security keeps trying to shut it down.</p>
+
+    <div class="callout note"><span class="tag">Note</span><p>One building (your tenant), one guard (the Authorization Server), but five doors. Each door exists because a real visitor couldn't use the others. Memorise the <em>visitor</em>, not the door, and you'll never confuse the grants.</p></div>
+  </section>
+
+  <!-- ===================== 3. ASCII DIAGRAMS ===================== -->
+  <section id="diagrams">
+    <h2>3. ASCII Diagrams — Every Flow Drawn Out</h2>
+
+    <h3>3.1 Client Credentials (Machine-to-Machine)</h3>
+    <pre class="diagram">
+  +--------------+                              +-----------------------+
+  |  M2M Client  |                              |  Auth0 Authorization  |
+  | (no user!)   |                              |  Server /oauth/token  |
+  +------+-------+                              +-----------+-----------+
+         |                                                  |
+         |  POST /oauth/token                               |
+         |  grant_type=client_credentials                   |
+         |  client_id=ABC  client_secret=*****              |
+         |  audience=https://api.cinema.cloud               |
+         |------------------------------------------------->|
+         |                                                  |  verify client
+         |                                                  |  credentials +
+         |                                                  |  authorize scopes
+         |        200 OK                                    |
+         |  { access_token, expires_in, token_type }        |
+         |<-------------------------------------------------|
+         |                                                  |
+         |  GET /invoices   Authorization: Bearer &lt;token&gt;   |
+         |---------------------------->  [ Resource Server / API ]
+         |        200 OK  (data)
+    </pre>
+
+    <h3>3.2 Device Authorization Flow (RFC 8628)</h3>
+    <pre class="diagram">
+ +---------+        +------------------+              +-----------+
+ |  Smart  |        | Auth0 /oauth/    |              |  User on  |
+ |   TV    |        | device/code      |              |  phone/PC |
+ +----+----+        +---------+--------+              +-----+-----+
+      |                       |                             |
+      | (1) POST device/code  |                             |
+      |  client_id,scope      |                             |
+      |---------------------->|                             |
+      |  device_code,         |                             |
+      |  user_code=WDJB-MJHT, |                             |
+      |  verification_uri,    |                             |
+      |  interval=5           |                             |
+      |<----------------------|                             |
+      |                       |                             |
+      | (2) DISPLAY: "Go to cinema.cloud/activate           |
+      |      and enter  W D J B - M J H T"  ----------------+--->(3) opens URL
+      |                       |                             |    logs in,
+      |                       |   (4) approves user_code    |    approves
+      |                       |<----------------------------|
+      | (5) POST /oauth/token  grant_type=device_code       |
+      |     device_code=...   |  (polled every 5s)          |
+      |---------------------->|                             |
+      |  while pending: 400 authorization_pending           |
+      |  on approval: 200 { access_token, refresh_token,    |
+      |                     id_token }                       |
+      |<----------------------|                             |
+    </pre>
+
+    <h3>3.3 Refresh Token Flow + Rotation</h3>
+    <pre class="diagram">
+  LOGIN (Auth Code + PKCE) once:
+     client --> /oauth/token --> { access_token(15m), refresh_token RT1, id_token }
+
+  LATER, access token expired:
+  +--------+                                  +-------------------+
+  | Client |                                  | /oauth/token      |
+  +---+----+                                  +---------+---------+
+      |  grant_type=refresh_token                       |
+      |  refresh_token=RT1                              |
+      |------------------------------------------------>|
+      |                                                 |  validate RT1
+      |   ROTATION ON: invalidate RT1, mint RT2         |
+      |   { access_token(new 15m), refresh_token=RT2 }  |
+      |<------------------------------------------------|
+      |  (store RT2, discard RT1)                       |
+      |                                                 |
+      |  --- if a thief later replays RT1 -------------> |
+      |   REUSE DETECTED -> revoke entire token family  |
+      |          400 invalid_grant                       |
+      |<------------------------------------------------|
+    </pre>
+
+    <h3>3.4 Implicit Flow (Deprecated) — note the token in the URL</h3>
+    <pre class="diagram">
+  +---------+                        +-------------------+
+  |  SPA    |                        | /authorize        |
+  +----+----+                        +---------+---------+
+       |  GET /authorize?response_type=token             |
+       |    client_id&amp;redirect_uri&amp;scope                 |
+       |------------------------------------------------>|
+       |                                                 | user logs in
+       |  302 Redirect to                                |
+       |  https://app/callback#access_token=eyJ...&amp;...   |  &lt;-- TOKEN IN
+       |<------------------------------------------------|      FRAGMENT (!)
+       |  (browser keeps fragment in history, referer)   |
+       |  JS reads location.hash to grab the token       |
+       |  NO client auth, NO code exchange, NO refresh   |
+    </pre>
+
+    <h3>3.5 Resource Owner Password Credentials (ROPC) — discouraged</h3>
+    <pre class="diagram">
+  +---------+   user types pw INTO the app    +-------------------+
+  |  App UI |  (app now SEES the password!)   | /oauth/token      |
+  +----+----+                                 +---------+---------+
+       |  grant_type=password                            |
+       |  username=priya  password=hunter2               |
+       |  client_id&amp;client_secret&amp;audience&amp;scope         |
+       |------------------------------------------------>|
+       |                                                 | verify creds
+       |  200 { access_token, refresh_token, id_token }  |
+       |<------------------------------------------------|
+       |  X no redirect  X no MFA prompt  X no SSO  X no consent
+    </pre>
+  </section>
+
+  <!-- ===================== 4. ANALOGY ===================== -->
+  <section id="analogy">
+    <h2>4. Real-World Analogy — The Office Building's Five Entrances</h2>
+
+    <table>
+      <thead><tr><th>Grant</th><th>Real-world entrance</th><th>Why it fits</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Client Credentials</strong></td><td>Employee swipes their own keycard at the staff door</td><td>No visitor sign-in — the entity authenticates as <em>itself</em> with a secret only it holds.</td></tr>
+        <tr><td><strong>Device flow</strong></td><td>Hotel TV says "scan this QR with your phone to log in to Netflix"</td><td>The hard-to-type device defers the actual login to a second, comfortable device.</td></tr>
+        <tr><td><strong>Refresh Token</strong></td><td>A monthly parking pass that auto-renews; each renewal voids the old sticker</td><td>You don't re-prove identity daily; a long-lived voucher silently mints short-lived passes — and rotation voids stolen stickers.</td></tr>
+        <tr><td><strong>Implicit</strong></td><td>Shouting your access code across a crowded lobby</td><td>The secret travels in the open (URL fragment) where bystanders, history, and logs can overhear it.</td></tr>
+        <tr><td><strong>ROPC</strong></td><td>Handing your house key to a contractor instead of giving them a one-time gate code</td><td>The third party now holds your <em>master credential</em>, not a scoped, revocable token.</td></tr>
+      </tbody>
+    </table>
+
+    <div class="callout tip"><span class="tag">Tip</span><p>The whole point of OAuth was to <em>stop</em> apps from holding your password (the house key) and instead give them scoped, revocable badges. ROPC and Implicit both betray that goal — which is exactly why both are on the way out.</p></div>
+  </section>
+
+  <!-- ===================== 5. INTERNAL WORKING ===================== -->
+  <section id="internals">
+    <h2>5. Internal Working — What the Server Actually Does</h2>
+
+    <h3>5.1 Client Credentials internals</h3>
+    <p>When Auth0 receives <code>grant_type=client_credentials</code>, it: (1) authenticates the <em>client</em> — either by verifying the <code>client_secret</code> against the stored hash, or by validating a <strong>private-key JWT</strong> (<code>client_assertion</code>) signed by the client's private key; (2) looks at the requested <code>audience</code> to find the target API; (3) computes the granted scopes by intersecting the API's "permissions" granted to this M2M application with any requested <code>scope</code>; (4) mints a signed JWT access token whose <code>sub</code> equals the <code>client_id</code> (there is no user, so the subject <em>is</em> the machine), with no refresh token (machines just ask again). Notice: <strong>no <code>id_token</code></strong> is ever issued — Client Credentials is pure OAuth authorization, never authentication of a person.</p>
+
+    <h3>5.2 Device flow internals</h3>
+    <p>The device endpoint creates a record linking three things: a long, secret <code>device_code</code> (kept by the device), a short, human-friendly <code>user_code</code> (shown on screen), and a <code>pending</code> status. The device then <em>polls</em> the token endpoint. The server replies <code>authorization_pending</code> until the user approves on the second device, then flips the record to <code>approved</code> and the next poll returns tokens. The <code>interval</code> field tells the device how fast it may poll; polling faster earns a <code>slow_down</code> error that increases the interval. The <code>device_code</code> expires (default ~15 min via <code>expires_in</code>) so an unapproved session cannot linger forever.</p>
+
+    <h3>5.3 Refresh token rotation internals</h3>
+    <p>A refresh token belongs to a <strong>token family</strong> — a chain identified internally so the server can reason about lineage. With rotation enabled, each successful refresh <em>consumes</em> the presented token and issues a new one (RT1 → RT2 → RT3 …). The old token is marked used. If a <em>used</em> token is ever presented again (classic sign of theft — both the legitimate client and an attacker hold copies), Auth0 triggers <strong>automatic reuse detection</strong>: it revokes the entire family, forcing a fresh login. This converts a stolen refresh token from a permanent backdoor into, at most, a brief window before the next legitimate rotation slams the door.</p>
+
+    <pre class="diagram">
+   Token family lifecycle with rotation + reuse detection
+   ---------------------------------------------------------
+   issue RT1 ──refresh──▶ RT2 ──refresh──▶ RT3  (RT1,RT2 now "used")
+                                            │
+        attacker replays RT1 ───────────────┘
+        server sees "used" token reused  ==>  REVOKE FAMILY
+        legitimate client's RT3 also dies ==>  must re-authenticate
+    </pre>
+
+    <div class="callout note"><span class="tag">Note</span><p>Reuse detection is intentionally blunt — it kills the whole family, even the legitimate session, because the server cannot tell the thief from the victim. A forced re-login is a small price for closing a stolen-token backdoor.</p></div>
+
+    <h3>5.4 Implicit internals (and why it's structurally weak)</h3>
+    <p>Implicit skips the authorization <em>code</em> entirely. The <code>/authorize</code> endpoint, after login, redirects with the access token in the URL <strong>fragment</strong> (<code>#access_token=...</code>). The fragment is chosen because it is never sent to servers — but it <em>is</em> readable by any JavaScript on the page, lands in browser history, and can leak via the <code>Referer</code> header. Crucially there is <strong>no client authentication and no second leg</strong>: whoever first reads the fragment owns the token. There is also no refresh token (issuing one in the open would be reckless), so sessions die quietly or rely on silent iframe re-auth.</p>
+
+    <h3>5.5 ROPC internals</h3>
+    <p>ROPC is the most "direct" grant: the app collects the user's raw username and password and POSTs them to the token endpoint with its own client credentials. The server checks the password against the connection's user store and returns tokens. Because the password flows <em>through the application</em>, every protection layered on the hosted login page — MFA prompts, anomaly/brute-force detection, bot protection, SSO, consent screens, passwordless — is bypassed. ROPC only works against database connections, never against social or enterprise identity providers (you cannot POST a Google password to Auth0).</p>
+  </section>
+
+  <!-- ===================== 6. CODE WALKTHROUGH ===================== -->
+  <section id="walkthrough">
+    <h2>6. Code Walkthrough — Curl &amp; Postman for Every Grant</h2>
+
+    <h3>6.1 Client Credentials (curl)</h3>
+    <pre><code class="language-bash">curl --request POST \
+  --url https://YOUR_TENANT.us.auth0.com/oauth/token \
+  --header 'content-type: application/x-www-form-urlencoded' \
+  --data grant_type=client_credentials \
+  --data client_id=YOUR_M2M_CLIENT_ID \
+  --data client_secret=YOUR_M2M_CLIENT_SECRET \
+  --data audience=https://api.cinema.cloud
+
+# Response:
+# {
+#   "access_token": "eyJhbGciOiJSUzI1NiIs...",
+#   "token_type": "Bearer",
+#   "expires_in": 86400,
+#   "scope": "create:invoices read:reports"
+# }   <-- NOTE: no refresh_token, no id_token</code></pre>
+
+    <h3>6.2 Device Authorization (curl, two stages)</h3>
+    <pre><code class="language-bash"># STAGE 1 — device asks for codes
+curl --request POST \
+  --url https://YOUR_TENANT.us.auth0.com/oauth/device/code \
+  --header 'content-type: application/x-www-form-urlencoded' \
+  --data client_id=YOUR_NATIVE_CLIENT_ID \
+  --data scope='openid profile offline_access' \
+  --data audience=https://api.cinema.cloud
+# -> { "device_code":"...", "user_code":"WDJB-MJHT",
+#      "verification_uri":"https://YOUR_TENANT.us.auth0.com/activate",
+#      "verification_uri_complete":"https://.../activate?user_code=WDJB-MJHT",
+#      "expires_in":900, "interval":5 }
+
+# STAGE 2 — device polls the token endpoint every `interval` seconds
+curl --request POST \
+  --url https://YOUR_TENANT.us.auth0.com/oauth/token \
+  --header 'content-type: application/x-www-form-urlencoded' \
+  --data grant_type=urn:ietf:params:oauth:grant-type:device_code \
+  --data device_code=THE_DEVICE_CODE \
+  --data client_id=YOUR_NATIVE_CLIENT_ID
+# while user hasn't approved -> 400 {"error":"authorization_pending"}
+# polling too fast          -> 400 {"error":"slow_down"}
+# after approval            -> 200 { access_token, refresh_token, id_token, ... }</code></pre>
+
+    <h3>6.3 Refresh Token exchange (curl)</h3>
+    <pre><code class="language-bash">curl --request POST \
+  --url https://YOUR_TENANT.us.auth0.com/oauth/token \
+  --header 'content-type: application/x-www-form-urlencoded' \
+  --data grant_type=refresh_token \
+  --data client_id=YOUR_CLIENT_ID \
+  --data refresh_token=YOUR_REFRESH_TOKEN
+  # confidential clients also send: --data client_secret=YOUR_SECRET
+# -> { "access_token":"eyJ...", "expires_in":900,
+#      "refresh_token":"NEW_RT_IF_ROTATION_ON", "id_token":"eyJ...", "token_type":"Bearer" }</code></pre>
+
+    <h3>6.4 ROPC (curl) — for completeness, avoid in production</h3>
+    <pre><code class="language-bash">curl --request POST \
+  --url https://YOUR_TENANT.us.auth0.com/oauth/token \
+  --header 'content-type: application/x-www-form-urlencoded' \
+  --data grant_type=password \
+  --data username=priya@example.com \
+  --data password='S3cr3t!' \
+  --data client_id=YOUR_CLIENT_ID \
+  --data client_secret=YOUR_CLIENT_SECRET \
+  --data audience=https://api.cinema.cloud \
+  --data scope='openid profile offline_access' \
+  --data realm=Username-Password-Authentication   # password-realm extension grant
+# -> { access_token, refresh_token, id_token, ... }</code></pre>
+
+    <h3>6.5 Postman setup (applies to all grants)</h3>
+    <pre><code class="language-text">1. New Request -> POST  https://YOUR_TENANT.us.auth0.com/oauth/token
+2. Body tab -> x-www-form-urlencoded
+3. Add keys: grant_type, client_id, client_secret/audience/etc per grant above
+4. Send. Copy access_token.
+5. To call your API: new GET request -> Authorization tab ->
+   Type "Bearer Token" -> paste access_token.
+
+Pro tip: Postman's "Authorization -> OAuth 2.0" helper can run
+Authorization Code (w/ PKCE), Client Credentials, and Device Code
+flows for you and auto-attach the token to every request.</code></pre>
+  </section>
+
+  <!-- ===================== 7. PRACTICAL IMPLEMENTATION ===================== -->
+  <section id="practical">
+    <h2>7. Practical Implementation — Real Code in Real Stacks</h2>
+
+    <h3>7.1 Client Credentials in Spring Boot (WebClient)</h3>
+    <pre><code class="language-java">// build.gradle: spring-boot-starter-oauth2-client + webflux
+// application.yml registers the M2M client; Spring manages the token cache.
+spring:
+  security:
+    oauth2:
+      client:
+        registration:
+          cinema-m2m:
+            authorization-grant-type: client_credentials
+            client-id: ${AUTH0_M2M_CLIENT_ID}
+            client-secret: ${AUTH0_M2M_CLIENT_SECRET}
+            provider: auth0
+        provider:
+          auth0:
+            token-uri: https://YOUR_TENANT.us.auth0.com/oauth/token
+
+// --- config: attach the audience (Auth0 needs it) &amp; an authorized WebClient ---
+@Configuration
+class M2MConfig {
+  @Bean
+  WebClient cinemaApiClient(ReactiveClientRegistrationRepository regs,
+                            ReactiveOAuth2AuthorizedClientService svc) {
+    var manager = new AuthorizedClientServiceReactiveOAuth2AuthorizedClientManager(regs, svc);
+    // Auth0 requires the custom `audience` parameter on the token request:
+    manager.setContextAttributesMapper(req -> Mono.just(
+        Map.of("audience", "https://api.cinema.cloud")));
+    var oauth = new ServerOAuth2AuthorizedClientExchangeFilterFunction(manager);
+    oauth.setDefaultClientRegistrationId("cinema-m2m");
+    return WebClient.builder().filter(oauth).build();
+  }
+}
+
+// --- usage: token is fetched, cached, and refreshed automatically ---
+@Service
+class BillingClient {
+  private final WebClient client;
+  BillingClient(WebClient cinemaApiClient){ this.client = cinemaApiClient; }
+
+  public Mono&lt;String&gt; postInvoice(Invoice inv) {
+    return client.post().uri("https://api.cinema.cloud/invoices")
+        .bodyValue(inv)
+        .retrieve().bodyToMono(String.class);  // Authorization: Bearer ... added for you
+  }
+}</code></pre>
+
+    <h3>7.2 Device flow in Node.js (CLI polling)</h3>
+    <pre><code class="language-javascript">import fetch from 'node-fetch';
+const DOMAIN = 'YOUR_TENANT.us.auth0.com';
+const CLIENT_ID = 'YOUR_NATIVE_CLIENT_ID';
+const form = o =&gt; new URLSearchParams(o);
+
+async function deviceLogin() {
+  // 1. request device + user codes
+  const dc = await (await fetch(`https://${DOMAIN}/oauth/device/code`, {
+    method: 'POST',
+    body: form({ client_id: CLIENT_ID, scope: 'openid profile offline_access',
+                 audience: 'https://api.cinema.cloud' })
+  })).json();
+
+  console.log(`\n  Go to: ${dc.verification_uri_complete}`);
+  console.log(`  Or visit ${dc.verification_uri} and enter code: ${dc.user_code}\n`);
+
+  // 2. poll the token endpoint until the user approves
+  let interval = dc.interval;
+  while (true) {
+    await new Promise(r =&gt; setTimeout(r, interval * 1000));
+    const res = await fetch(`https://${DOMAIN}/oauth/token`, {
+      method: 'POST',
+      body: form({ grant_type: 'urn:ietf:params:oauth:grant-type:device_code',
+                   device_code: dc.device_code, client_id: CLIENT_ID })
+    });
+    const data = await res.json();
+    if (res.ok) return data;                        // { access_token, refresh_token, id_token }
+    if (data.error === 'authorization_pending') continue;
+    if (data.error === 'slow_down') { interval += 5; continue; }
+    throw new Error(data.error_description || data.error); // expired_token / access_denied
+  }
+}
+deviceLogin().then(t =&gt; console.log('Logged in! access_token:', t.access_token.slice(0,20) + '…'));</code></pre>
+
+    <h3>7.3 Refresh tokens in React (Auth0 SPA SDK does rotation for you)</h3>
+    <pre><code class="language-jsx">// main.jsx — enable refresh-token rotation in a SPA safely
+import { Auth0Provider } from '@auth0/auth0-react';
+
+&lt;Auth0Provider
+  domain="YOUR_TENANT.us.auth0.com"
+  clientId="YOUR_SPA_CLIENT_ID"
+  authorizationParams={{
+    redirect_uri: window.location.origin,
+    audience: 'https://api.cinema.cloud',
+    scope: 'openid profile offline_access'   // offline_access => refresh token
+  }}
+  useRefreshTokens={true}                     // use rotating refresh tokens...
+  useRefreshTokensFallback={false}            // ...not legacy silent-iframe auth
+  cacheLocation="memory"                      // safest; localStorage only if you must
+&gt;
+  &lt;App /&gt;
+&lt;/Auth0Provider&gt;
+
+// In a component: the SDK silently rotates the refresh token under the hood.
+import { useAuth0 } from '@auth0/auth0-react';
+function useApi() {
+  const { getAccessTokenSilently } = useAuth0();
+  return async (url) =&gt; {
+    const token = await getAccessTokenSilently(); // refreshes if expired
+    return fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+  };
+}</code></pre>
+
+    <h3>7.4 Refresh tokens in FastAPI (server-side confidential client)</h3>
+    <pre><code class="language-python">import time, httpx
+from fastapi import FastAPI
+
+DOMAIN = "YOUR_TENANT.us.auth0.com"
+CID, CSECRET = "YOUR_CLIENT_ID", "YOUR_CLIENT_SECRET"
+app = FastAPI()
+_store = {"access_token": None, "refresh_token": "SAVED_RT", "exp": 0}
+
+async def get_access_token() -&gt; str:
+    if _store["access_token"] and time.time() &lt; _store["exp"] - 30:
+        return _store["access_token"]                       # still valid
+    async with httpx.AsyncClient() as c:
+        r = await c.post(f"https://{DOMAIN}/oauth/token", data={
+            "grant_type": "refresh_token",
+            "client_id": CID, "client_secret": CSECRET,
+            "refresh_token": _store["refresh_token"],
+        })
+    r.raise_for_status()
+    tok = r.json()
+    _store["access_token"] = tok["access_token"]
+    _store["exp"] = time.time() + tok["expires_in"]
+    if "refresh_token" in tok:                               # ROTATION: persist new RT!
+        _store["refresh_token"] = tok["refresh_token"]
+    return _store["access_token"]</code></pre>
+
+    <div class="callout warn"><span class="tag">Warn</span><p>The single most common refresh-token bug: <strong>forgetting to persist the rotated refresh token</strong>. If rotation is on and you keep using the old one, the very next refresh triggers reuse detection and logs the user out. Always overwrite your stored token with the new <code>refresh_token</code> from the response.</p></div>
+  </section>
+
+  <!-- ===================== 8. PRODUCTION ARCHITECTURE ===================== -->
+  <section id="architecture">
+    <h2>8. Production Architecture — Where Each Grant Lives</h2>
+
+    <pre class="diagram">
+                         CinemaCloud — grant types in production
+  ┌────────────────────────────────────────────────────────────────────────┐
+  │  USERS                                          MACHINES                  │
+  │  ┌──────────┐  ┌──────────┐  ┌──────────┐       ┌──────────────────┐     │
+  │  │  React   │  │ Next.js  │  │ Smart TV │       │ Nightly billing  │     │
+  │  │  SPA     │  │  (SSR)   │  │  / CLI   │       │ cron / microsvc  │     │
+  │  └────┬─────┘  └────┬─────┘  └────┬─────┘       └────────┬─────────┘     │
+  │  AuthCode+PKCE  AuthCode+PKCE  Device flow      Client Credentials       │
+  │   + rotating     (BFF holds      + rotating       (M2M secret /          │
+  │   refresh        secret &amp; RT)    refresh          private-key JWT)       │
+  │       │             │             │                      │               │
+  │       └─────────────┴──────┬──────┴──────────────────────┘               │
+  │                            ▼                                              │
+  │                   ┌──────────────────┐                                   │
+  │                   │   Auth0 Tenant   │  issues scoped, signed JWTs        │
+  │                   │ /authorize /token│                                    │
+  │                   └────────┬─────────┘                                    │
+  │                            ▼  Bearer JWT (RS256, validated via JWKS)      │
+  │                   ┌──────────────────┐                                   │
+  │                   │  Resource APIs   │  (Spring / Node / FastAPI)        │
+  │                   └──────────────────┘                                   │
+  └────────────────────────────────────────────────────────────────────────┘
+    </pre>
+
+    <p><strong>Pattern: Backend-For-Frontend (BFF).</strong> The modern best practice for browser apps is to <em>not</em> store refresh tokens in JS at all. A small server (the BFF / Next.js route handlers) runs Authorization Code + PKCE, holds the refresh token in an <code>HttpOnly</code> cookie-backed session, and proxies API calls. The browser never touches a token. SPAs that cannot deploy a BFF fall back to <code>useRefreshTokens</code> with in-memory storage and rotation.</p>
+
+    <p><strong>M2M at scale.</strong> Cache the Client Credentials token (it has no refresh token — you just request a new one near expiry). For high-security M2M, replace the shared <code>client_secret</code> with <strong>Private Key JWT</strong> (client_assertion) or, between cloud workloads, <strong>mTLS / workload identity federation</strong> so there is no long-lived secret to leak.</p>
+
+    <div class="callout key"><span class="tag">Key</span><p>In production: humans + browser ⇒ Authorization Code + PKCE (refresh tokens for staying logged in); humans + no keyboard ⇒ Device flow; no human ⇒ Client Credentials. Refresh tokens are an <em>add-on</em> to user flows, never a standalone login method. Implicit and ROPC appear in production only as legacy you are migrating <em>off</em>.</p></div>
+  </section>
+
+  <!-- ===================== 9. SECURITY ANALYSIS ===================== -->
+  <section id="security">
+    <h2>9. Security Analysis — Threats Per Grant</h2>
+
+    <table>
+      <thead><tr><th>Grant</th><th>Primary threat</th><th>Mitigation</th></tr></thead>
+      <tbody>
+        <tr><td>Client Credentials</td><td>Leaked client secret = full M2M impersonation</td><td>Rotate secrets; prefer private-key JWT / mTLS; least-privilege scopes per M2M app; never embed secret in a frontend.</td></tr>
+        <tr><td>Device flow</td><td>Phishing the <code>user_code</code>; brute-forcing short codes</td><td>Rate-limit polling (<code>slow_down</code>); short <code>expires_in</code>; high-entropy user codes; show app name + scopes on the consent screen.</td></tr>
+        <tr><td>Refresh Token</td><td>Theft of a long-lived token = persistent access</td><td>Rotation + automatic reuse detection; short absolute &amp; idle lifetimes; bind to client; <code>HttpOnly</code> storage / BFF; revoke on logout.</td></tr>
+        <tr><td>Implicit</td><td>Token leaks via URL fragment (history, Referer, XSS); no client auth; no sender-binding</td><td>Don't use it. Migrate to Auth Code + PKCE, which keeps the token out of the URL and authenticates the exchange.</td></tr>
+        <tr><td>ROPC</td><td>App sees plaintext password; bypasses MFA, anomaly detection, SSO, consent</td><td>Don't use it for new apps. If unavoidable (trusted first-party only), pin to confidential clients, enable Brute-Force/anomaly tooling, and plan migration to redirect flows.</td></tr>
+      </tbody>
+    </table>
+
+    <div class="callout danger"><span class="tag">Danger</span><p><strong>Never put a client secret, an Implicit token, or an ROPC password collector in a browser or mobile binary.</strong> Frontend code is public. Anything you ship to it is readable by an attacker. Browser/native apps must use Authorization Code + PKCE (public client, no secret); Device flow for no-keyboard devices.</p></div>
+
+    <h4>Why OAuth 2.1 removes Implicit and ROPC</h4>
+    <p>OAuth 2.1 (the consolidation of OAuth 2.0 best practices) <strong>omits the Implicit grant and the Resource Owner Password Credentials grant entirely</strong> and mandates PKCE for all Authorization Code uses. Implicit is removed because PKCE made code flow safe even for public clients, eliminating Implicit's only reason to exist while removing its token-in-URL risk. ROPC is removed because it is fundamentally incompatible with the goal of OAuth (apps shouldn't see passwords) and with modern protections like MFA, passwordless, and federated login.</p>
+  </section>
+
+  <!-- ===================== 10. PERFORMANCE ===================== -->
+  <section id="performance">
+    <h2>10. Performance Considerations &amp; Token Lifetimes</h2>
+
+    <ul>
+      <li><strong>Cache Client Credentials tokens.</strong> A token endpoint round-trip is ~100–300 ms and counts against rate limits. Fetch once, reuse until ~30 s before <code>expires_in</code>, then refetch. Never request a fresh M2M token per API call.</li>
+      <li><strong>Pick lifetimes deliberately.</strong> Short access tokens (5–15 min) limit the blast radius of a leak but mean more refreshes. Long ones reduce traffic but linger if stolen. Standard balance below.</li>
+      <li><strong>Device polling.</strong> Respect <code>interval</code>. Polling faster only earns <code>slow_down</code> and wastes requests; it never speeds up approval.</li>
+      <li><strong>Refresh storms.</strong> If many clients share a token lifetime they may all refresh at once. Stagger by adding jitter, or refresh proactively at a random point in the token's life rather than exactly at expiry.</li>
+      <li><strong>JWT vs. opaque.</strong> JWT access tokens validate locally via cached JWKS (microseconds, no network) — far faster than introspecting an opaque token per request.</li>
+    </ul>
+
+    <table>
+      <thead><tr><th>Token</th><th>Typical lifetime</th><th>Rotation?</th></tr></thead>
+      <tbody>
+        <tr><td>Access token (user)</td><td>5–60 min (Auth0 default 24h for APIs; tighten it)</td><td>N/A — just re-mint</td></tr>
+        <tr><td>Access token (M2M)</td><td>15 min – 24 h</td><td>N/A</td></tr>
+        <tr><td>ID token</td><td>Match session need; often 10 h or less</td><td>N/A</td></tr>
+        <tr><td>Refresh token (SPA)</td><td>Idle ~3 days, absolute ~7 days (tune)</td><td>Yes — rotation required</td></tr>
+        <tr><td>Refresh token (native/mobile)</td><td>Idle days–weeks, absolute weeks–months</td><td>Yes — recommended</td></tr>
+        <tr><td>Device code</td><td>~5–15 min (the approval window)</td><td>N/A</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- ===================== 11. COMMON MISTAKES ===================== -->
+  <section id="mistakes">
+    <h2>11. Common Mistakes</h2>
+    <ul>
+      <li><strong>Using Client Credentials to "log in a user."</strong> It has no user — <code>sub</code> is the client. There is no <code>id_token</code>. If you need to know <em>who</em> the human is, you need a user flow.</li>
+      <li><strong>Embedding a client secret in a SPA or mobile app.</strong> Public clients have no secret. Use PKCE.</li>
+      <li><strong>Not persisting the rotated refresh token</strong> — guarantees reuse-detection logout on the next refresh.</li>
+      <li><strong>Requesting Client Credentials tokens on every request</strong> instead of caching — rate-limit pain and latency.</li>
+      <li><strong>Forgetting <code>audience</code> on the M2M request.</strong> Without it Auth0 issues an opaque token for the userinfo endpoint, not a JWT for your API — and validation fails confusingly.</li>
+      <li><strong>Forgetting <code>offline_access</code> scope</strong> — then wondering why no refresh token came back.</li>
+      <li><strong>Choosing Implicit because "it's simpler."</strong> It is deprecated and insecure; Auth Code + PKCE is now just as easy with the SDKs.</li>
+      <li><strong>Using ROPC against social/enterprise connections</strong> — impossible; ROPC only works with database connections.</li>
+      <li><strong>Ignoring <code>slow_down</code> in device polling</strong> — leads to throttling and a stuck device.</li>
+      <li><strong>Treating refresh tokens as a login method.</strong> You must first obtain one through a real user flow (Auth Code, Device, or ROPC).</li>
+    </ul>
+  </section>
+
+  <!-- ===================== 12. BEST PRACTICES ===================== -->
+  <section id="bestpractices">
+    <h2>12. Best Practices</h2>
+    <ul>
+      <li><strong>Default to Authorization Code + PKCE</strong> for anything with a user and a browser. Reach for other grants only when that one genuinely cannot apply.</li>
+      <li><strong>Always enable refresh-token rotation with reuse detection</strong> for public clients (SPA, mobile).</li>
+      <li><strong>Scope M2M apps minimally.</strong> One M2M client per consumer, each granted only the exact API permissions it needs.</li>
+      <li><strong>Prefer Private Key JWT / mTLS over shared secrets</strong> for high-value M2M.</li>
+      <li><strong>Keep access tokens short</strong> and let refresh tokens do the "stay logged in" work.</li>
+      <li><strong>Store refresh tokens server-side or in <code>HttpOnly</code> cookies</strong> (BFF). If you must store in a SPA, use in-memory + rotation, never <code>localStorage</code> if avoidable.</li>
+      <li><strong>Show the app name and requested scopes on device-flow consent</strong> so users can spot phishing.</li>
+      <li><strong>Revoke refresh tokens on logout and on suspected compromise</strong> (and rely on rotation to auto-revoke families).</li>
+      <li><strong>Plan to retire Implicit and ROPC.</strong> Inventory where they are used and migrate to redirect flows.</li>
+      <li><strong>Always set and validate <code>audience</code></strong> so tokens are bound to the intended API.</li>
+    </ul>
+  </section>
+
+  <!-- ===================== 13. INTERVIEW QUESTIONS ===================== -->
+  <section id="interview">
+    <h2>13. Interview Questions (With Model Answers)</h2>
+
+    <h4>Q1. When would you use the Client Credentials grant?</h4>
+    <p><strong>A.</strong> For machine-to-machine access where no user is involved — a backend service, daemon, or cron job calling an API as itself. The client authenticates with its own credentials (secret or private-key JWT) and receives an access token whose subject is the client. No <code>id_token</code> and no refresh token are issued.</p>
+
+    <h4>Q2. Why is the Implicit flow deprecated?</h4>
+    <p><strong>A.</strong> It returns the access token in the URL fragment, where it leaks via browser history, the <code>Referer</code> header, and JavaScript/XSS. It performs no client authentication and no code-for-token exchange, so whoever reads the fragment owns the token, and it cannot safely issue refresh tokens. PKCE made Authorization Code safe for public clients, removing Implicit's only advantage while eliminating its risks. OAuth 2.1 drops it.</p>
+
+    <h4>Q3. Explain refresh token rotation and reuse detection.</h4>
+    <p><strong>A.</strong> Each time a refresh token is used, the server invalidates it and issues a new one (RT1→RT2→…), all part of one token "family." If a previously-used token is presented again — a sign that both a legitimate client and a thief hold copies — the server revokes the entire family, forcing re-authentication. This turns a stolen refresh token from permanent access into a brief window.</p>
+
+    <h4>Q4. Why is ROPC discouraged even though it "works"?</h4>
+    <p><strong>A.</strong> The application collects and transmits the user's plaintext password, which violates OAuth's core goal (apps shouldn't see credentials) and bypasses MFA, anomaly/brute-force detection, bot protection, SSO, consent, and passwordless. It also only works against database connections. It is acceptable only for trusted first-party legacy apps and is removed in OAuth 2.1.</p>
+
+    <h4>Q5. A smart TV app needs login but has no keyboard. Which grant and why?</h4>
+    <p><strong>A.</strong> Device Authorization (RFC 8628). The TV shows a short user code and a verification URL; the user authenticates on a phone/PC; the TV polls the token endpoint until approval. It avoids painful on-device typing and keeps credentials off the constrained device.</p>
+
+    <h4>Q6. Does Client Credentials return an ID token?</h4>
+    <p><strong>A.</strong> No. ID tokens assert a <em>user's</em> identity; Client Credentials has no user. It returns only an access token (authorization), never authentication of a person.</p>
+
+    <h4>Q7. How do you stop a refresh token from being a permanent backdoor if stolen?</h4>
+    <p><strong>A.</strong> Rotation + reuse detection, short absolute and idle lifetimes, <code>HttpOnly</code>/server-side storage, binding to the client, and revocation on logout. Combined, a stolen token is either short-lived, useless after the next legitimate rotation, or triggers a family revocation.</p>
+
+    <h4>Q8. Why must M2M token requests include <code>audience</code> in Auth0?</h4>
+    <p><strong>A.</strong> The <code>audience</code> identifies the target API (Resource Server). It tells Auth0 which API's permissions to grant and to mint a JWT for that API. Omitting it yields an opaque token meant for <code>/userinfo</code>, which your API cannot validate as a JWT.</p>
+
+    <h4>Q9. PKCE vs. client secret — when each?</h4>
+    <p><strong>A.</strong> Client secret is for <em>confidential</em> clients that can keep it private (backend servers). PKCE is for <em>public</em> clients (SPAs, native/mobile) that cannot, replacing the secret with a per-request code verifier/challenge so an intercepted authorization code is useless.</p>
+
+    <h4>Q10. Is the Refresh Token flow a way to log a user in?</h4>
+    <p><strong>A.</strong> No. It only mints new tokens from an existing refresh token. The user must first authenticate via a real flow (Authorization Code, Device, or ROPC) that issued the refresh token in the first place.</p>
+  </section>
+
+  <!-- ===================== 14. CERTIFICATION TIPS ===================== -->
+  <section id="cert">
+    <h2>14. Certification Tips</h2>
+    <div class="callout tip"><span class="tag">Exam</span><p>The Auth0 / OIDC exams love "given this app type, pick the grant" questions. Burn the decision tree (next section) into memory.</p></div>
+    <ul>
+      <li>Map app type → grant cold: <em>Regular Web App</em> = Auth Code; <em>SPA</em> = Auth Code + PKCE; <em>Native/Mobile</em> = Auth Code + PKCE (or Device for no-keyboard); <em>M2M</em> = Client Credentials.</li>
+      <li>Know that <strong>Client Credentials issues no ID token and no refresh token</strong> — a frequent trap answer.</li>
+      <li>Remember the exact device <code>grant_type</code> URN: <code>urn:ietf:params:oauth:grant-type:device_code</code>.</li>
+      <li>Know that <code>offline_access</code> scope is what triggers a refresh token.</li>
+      <li>Implicit and ROPC are <strong>deprecated / not recommended / removed in OAuth 2.1</strong> — expect a question whose correct answer is "don't use it."</li>
+      <li>ROPC works <strong>only with database connections</strong>, not social/enterprise IdPs.</li>
+      <li>Recognise device-flow polling errors: <code>authorization_pending</code>, <code>slow_down</code>, <code>expired_token</code>, <code>access_denied</code>.</li>
+      <li>Refresh token rotation + automatic reuse detection is the recommended SPA pattern.</li>
+    </ul>
+  </section>
+
+  <!-- ===================== 15. HANDS-ON EXERCISES ===================== -->
+  <section id="exercises">
+    <h2>15. Hands-On Exercises</h2>
+    <ol>
+      <li><strong>M2M token.</strong> In Auth0, create an API (<code>https://api.cinema.cloud</code>) and an M2M application authorized for it with scope <code>read:reports</code>. Use the curl from §6.1 to get a token, then paste it into <a href="https://jwt.io">jwt.io</a> and confirm <code>sub</code> ends in <code>@clients</code> and <code>scope</code> contains <code>read:reports</code>.</li>
+      <li><strong>Device flow.</strong> Enable the Device Code grant on a Native app. Run the Node CLI from §7.2, approve on your phone, and print the decoded <code>id_token</code> claims.</li>
+      <li><strong>Rotation proof.</strong> Get a refresh token (SPA with <code>offline_access</code>). Refresh once to obtain RT2. Now deliberately replay RT1 via curl and observe the <code>invalid_grant</code> reuse-detection error and family revocation.</li>
+      <li><strong>Lifetime tuning.</strong> Set your API's access-token lifetime to 300 seconds and your refresh idle lifetime to 1 day. Confirm the access token expires and silently refreshes.</li>
+      <li><strong>ROPC observation (sandbox only).</strong> Enable the Password grant on a test app, run §6.4, and note that no MFA challenge appears — demonstrating why ROPC bypasses protections. Then disable it.</li>
+    </ol>
+  </section>
+
+  <!-- ===================== 16. ASSIGNMENT ===================== -->
+  <section id="assignment">
+    <h2>16. Assignment</h2>
+    <p>Write a one-page "Grant Selection Memo" for CinemaCloud's architecture review. For each of these six components, state the chosen grant, justify it against the three axes (secret? user? browser?), specify access- and refresh-token lifetimes, and name one security control:</p>
+    <ol>
+      <li>The public React SPA (web dashboard).</li>
+      <li>The Next.js marketing site with server-rendered authenticated pages.</li>
+      <li>The iOS/Android mobile app.</li>
+      <li>The living-room smart-TV app.</li>
+      <li>The nightly billing microservice.</li>
+      <li>A legacy internal admin tool currently using ROPC (recommend a migration target).</li>
+    </ol>
+    <p>Deliverable: a table plus 3–4 sentences of reasoning per row. Bonus: flag which lifetimes you'd shorten and why.</p>
+  </section>
+
+  <!-- ===================== 17. MINI PROJECT ===================== -->
+  <section id="miniproject">
+    <h2>17. Mini Project — A CLI That Logs In Two Ways</h2>
+    <p>Build a small Node.js CLI, <code>cinema-cli</code>, with two subcommands:</p>
+    <ul>
+      <li><code>cinema-cli login</code> — uses the <strong>Device flow</strong> (§7.2) to authenticate a human, stores the resulting refresh token in <code>~/.cinema/credentials</code>, and prints the user's name from the ID token.</li>
+      <li><code>cinema-cli report</code> — silently uses the stored <strong>refresh token</strong> (§6.3) to get a fresh access token, calls <code>GET https://api.cinema.cloud/reports/today</code>, prints the result, and <em>persists the rotated refresh token</em> back to disk.</li>
+    </ul>
+    <p>Acceptance criteria: (1) <code>login</code> shows a user code and verification URL; (2) <code>report</code> works for days without re-login; (3) rotation is handled — manually corrupt the stored token and confirm the CLI surfaces a clear "please run login again" message instead of crashing; (4) the access token is never written to disk, only the refresh token. Stretch goal: add <code>cinema-cli sync</code> that uses a <strong>Client Credentials</strong> M2M client (separate from the user flow) to push aggregate stats, proving you understand the human-vs-machine distinction.</p>
+  </section>
+
+  <!-- ===================== 18. QUIZ ===================== -->
+  <section id="quiz">
+    <h2>18. Quiz — 22 Questions</h2>
+    <ol>
+      <li>Which grant has no user and issues no ID token?</li>
+      <li>What <code>scope</code> value triggers issuance of a refresh token?</li>
+      <li>True/False: Client Credentials returns a refresh token.</li>
+      <li>What is the exact <code>grant_type</code> URN for the Device flow?</li>
+      <li>Where does the Implicit flow place the access token, and why is that dangerous?</li>
+      <li>Name the device-polling error that means "you're polling too fast."</li>
+      <li>Why does the M2M token request need an <code>audience</code> parameter?</li>
+      <li>What does refresh token "rotation" do on each use?</li>
+      <li>What happens when a previously-used refresh token is replayed?</li>
+      <li>Which two grants does OAuth 2.1 remove?</li>
+      <li>Which connection type is required for ROPC to work?</li>
+      <li>For a SPA, which grant + which add-ons are recommended in 2026?</li>
+      <li>True/False: A refresh token can be used to log a brand-new user in.</li>
+      <li>Why can't a SPA safely hold a client secret?</li>
+      <li>What is the <code>sub</code> of a Client Credentials access token?</li>
+      <li>Name two protections that ROPC bypasses.</li>
+      <li>What two codes does the device endpoint return, and who sees each?</li>
+      <li>Why prefer Private Key JWT over a shared client secret for M2M?</li>
+      <li>What is the recommended storage for refresh tokens in a browser-based architecture?</li>
+      <li>Roughly how short should a user access token be, and why?</li>
+      <li>What error indicates reuse detection fired during a refresh?</li>
+      <li>Which grant fits a TV/console with no convenient text input?</li>
+    </ol>
+
+    <details>
+      <summary>Show answer key</summary>
+      <ol>
+        <li>Client Credentials.</li>
+        <li><code>offline_access</code>.</li>
+        <li>False — machines just request a new access token.</li>
+        <li><code>urn:ietf:params:oauth:grant-type:device_code</code>.</li>
+        <li>In the URL fragment (<code>#access_token=…</code>); it leaks via history, <code>Referer</code>, and XSS, with no client auth.</li>
+        <li><code>slow_down</code>.</li>
+        <li>It identifies the target API so Auth0 grants that API's permissions and mints a JWT for it (not an opaque <code>/userinfo</code> token).</li>
+        <li>Invalidates the presented token and issues a brand-new refresh token (and access token).</li>
+        <li>Reuse detection fires and the entire token family is revoked, forcing re-authentication.</li>
+        <li>Implicit and Resource Owner Password Credentials (ROPC).</li>
+        <li>A database connection.</li>
+        <li>Authorization Code + PKCE, with rotating refresh tokens and reuse detection (in-memory storage or BFF).</li>
+        <li>False — it only re-mints tokens from an existing refresh token; the user must have logged in earlier via a real flow.</li>
+        <li>Its source code is public/downloadable, so any embedded secret is readable by an attacker.</li>
+        <li>The client's <code>client_id</code> (the machine itself; in Auth0 it appears as <code>…@clients</code>).</li>
+        <li>Any two of: MFA, anomaly/brute-force detection, bot protection, SSO, consent screen, passwordless.</li>
+        <li>A long secret <code>device_code</code> (seen only by the device) and a short <code>user_code</code> (shown to the human).</li>
+        <li>No long-lived shared secret to leak; the client proves identity with a private key it never transmits.</li>
+        <li>Server-side / <code>HttpOnly</code> cookie (BFF pattern); if unavoidable in-SPA, in-memory with rotation.</li>
+        <li>~5–15 minutes, to minimise the blast radius if it leaks; refresh tokens cover longevity.</li>
+        <li><code>invalid_grant</code>.</li>
+        <li>Device Authorization flow.</li>
+      </ol>
+    </details>
+  </section>
+
+  <!-- ===================== 19. CHEAT SHEET ===================== -->
+  <section id="cheatsheet">
+    <h2>19. Cheat Sheet</h2>
+    <pre class="diagram">
+ GRANT TYPE QUICK-PICK
+ ─────────────────────────────────────────────────────────────────────
+ No user (server/daemon/cron) ............ Client Credentials
+ User + browser (web/SPA/native) ......... Authorization Code + PKCE
+ User + NO keyboard (TV/CLI/console) ..... Device Authorization
+ Stay logged in (any user flow) .......... + Refresh Token (offline_access)
+ SPA token in URL, no client auth ........ Implicit ........ DEPRECATED
+ App collects raw username/password ...... ROPC (password) . DISCOURAGED
+
+ TOKEN ENDPOINT FORM PARAMS
+ ─────────────────────────────────────────────────────────────────────
+ client_credentials : grant_type, client_id, client_secret, audience
+ device_code        : grant_type=urn:...:device_code, device_code, client_id
+ refresh_token      : grant_type=refresh_token, client_id, refresh_token [,secret]
+ password (ROPC)    : grant_type=password, username, password, client_id,
+                      client_secret, audience, scope, realm
+
+ REMEMBER
+ ─────────────────────────────────────────────────────────────────────
+ • Client Credentials  -> NO id_token, NO refresh_token, sub = @clients
+ • offline_access       -> the scope that returns a refresh_token
+ • Rotation + reuse detection -> stolen refresh token self-destructs
+ • Device polling errors: authorization_pending | slow_down |
+                          expired_token | access_denied
+ • OAuth 2.1 removes: Implicit + ROPC ; PKCE mandatory everywhere
+ • Always send audience for API (JWT) access tokens
+
+ LIFETIME DEFAULTS (tune!)
+ ─────────────────────────────────────────────────────────────────────
+ access(user) 5-15m | access(M2M) 15m-24h | refresh(SPA) idle~3d/abs~7d
+ refresh(native) idle days-weeks | device_code ~5-15m approval window
+    </pre>
+  </section>
+
+  <!-- ===================== 20. KEY TAKEAWAYS ===================== -->
+  <section id="takeaways">
+    <h2>20. Key Takeaways</h2>
+    <div class="callout key"><span class="tag">Key</span><p><strong>1.</strong> A grant type is dictated by three questions: can the client hold a secret, is a user present, is a browser redirect available? Answer those and the grant is decided.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p><strong>2.</strong> <strong>Client Credentials</strong> = machine-to-machine. No user, no ID token, no refresh token; the client authenticates as itself. Always send <code>audience</code>; cache the token.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p><strong>3.</strong> <strong>Device flow</strong> = users on input-constrained devices (TVs, CLIs). Show a user code, defer login to a second device, poll the token endpoint respecting <code>interval</code>.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p><strong>4.</strong> <strong>Refresh tokens</strong> keep users logged in without re-prompting. Always enable <strong>rotation + reuse detection</strong>, persist the new token, and store it as securely as possible (BFF / <code>HttpOnly</code> / in-memory).</p></div>
+    <div class="callout key"><span class="tag">Key</span><p><strong>5.</strong> <strong>Implicit</strong> (token in URL, no client auth) and <strong>ROPC</strong> (app sees the password) are <em>deprecated/discouraged and removed in OAuth 2.1</em>. Treat them only as legacy to migrate off — to Authorization Code + PKCE.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p><strong>6.</strong> Default everywhere a human logs in through a browser: <strong>Authorization Code + PKCE</strong>, with short access tokens and rotating refresh tokens. Everything in this chapter is the exception you reach for when that default can't apply.</p></div>
+  </section>
+
+  <nav class="pager">
+    <a class="prev" href="chapter-05.html">← Previous</a>
+    <a class="next" href="chapter-07.html">Next →</a>
+  </nav>
+</main>
+<footer class="site-footer">Master Auth0 End-to-End · Chapter 6 of 32</footer>
+</body>
+</html>

@@ -1,0 +1,771 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 18 — Project 2 — Next.js + Auth0 | Master Auth0</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">🔐 Master Auth0</a>
+  <nav class="topnav">
+    <a href="chapter-17.html">← Prev</a>
+    <a href="index.html">Contents</a>
+    <a href="chapter-19.html">Next →</a>
+  </nav>
+</header>
+<main class="container">
+  <div class="chapter-head">
+    <span class="phase">Phase 8 · Integration Projects</span>
+    <h1>Chapter 18 — Project 2 — Next.js + Auth0</h1>
+    <p class="lead">In Chapter 17 you secured a single-page React app where <em>every</em> line of code ran in the browser. Next.js changes the game completely: now your code runs in <strong>two places at once</strong> — on a Node.js server <em>and</em> in the browser — and the boundary between them is exactly where authentication gets subtle, powerful, and occasionally dangerous. This chapter builds a production-grade Next.js 15 App Router application with <code>@auth0/nextjs-auth0</code> v4, from <code>npm install</code> to a deployed protected dashboard that calls an external API with a real access token. You will learn to wire login/logout, run auth in middleware, read sessions inside Server Components, protect Route Handlers, and reason about the SSR-vs-RSC distinction that trips up even experienced engineers in interviews.</p>
+  </div>
+
+  <!-- ============================================================ 1. THEORY -->
+  <section id="theory">
+    <h2>1. Theory — First Principles: Why Next.js Auth Is Different</h2>
+
+    <p>To understand Next.js authentication you must first internalise <em>one</em> idea: <strong>your code executes in two trust domains</strong>. In a classic React SPA (Chapter 17) the browser is the only runtime. The browser is <em>untrusted</em> — the user controls it, can read every byte of JavaScript, and can inspect every network request. That is why an SPA must use the <strong>Authorization Code flow with PKCE</strong> and store tokens in memory: there is no safe place to keep a secret.</p>
+
+    <p>Next.js introduces a <strong>server runtime you control</strong>. The server is <em>trusted</em>: only you can read its environment variables, only you can read files on its disk, and the user never sees the code that runs there. This single fact unlocks a fundamentally safer authentication model: the <strong>Backend-For-Frontend (BFF)</strong> pattern.</p>
+
+    <h3>The Backend-For-Frontend (BFF) pattern</h3>
+    <p>In the BFF model, the Next.js server — not the browser — talks to Auth0. The server performs the Authorization Code exchange using a <strong>confidential client</strong> (one that can keep a <code>client_secret</code>), receives the tokens, and stores them in an <strong>encrypted, HttpOnly session cookie</strong>. The browser never touches a raw access token or refresh token. JavaScript in the browser literally <em>cannot</em> read an HttpOnly cookie, so an XSS bug cannot exfiltrate the session.</p>
+
+    <div class="callout key"><span class="tag">Key</span><p>SPA auth (Ch.17) keeps tokens <em>in browser memory</em> because there is no trusted server. Next.js auth keeps tokens <em>in an encrypted HttpOnly cookie</em> managed by a trusted server. This is the single most important conceptual difference, and the reason Next.js auth is considered more secure by default.</p></div>
+
+    <h3>Why a dedicated SDK exists</h3>
+    <p>The <code>@auth0/nextjs-auth0</code> SDK exists to implement the BFF correctly. Doing it by hand means implementing: the PKCE-protected redirect, state and nonce validation (CSRF + replay protection), ID-token signature verification against Auth0's JWKS, cookie encryption with a rotating key, automatic refresh-token rotation, and a way to read that session from <em>both</em> Server Components and Route Handlers. The SDK gives you all of this behind a tiny surface area.</p>
+
+    <h3>The three runtimes you must keep straight</h3>
+    <table>
+      <thead><tr><th>Runtime</th><th>Where it runs</th><th>Trusted?</th><th>Auth role</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Middleware</strong></td><td>Edge / server, before the request reaches a route</td><td>Yes</td><td>Mounts auth routes, refreshes/attaches the session cookie, gatekeeps</td></tr>
+        <tr><td><strong>Server Components (RSC)</strong></td><td>Server only, render-time</td><td>Yes</td><td>Read session, fetch data with the access token, never send tokens to the client</td></tr>
+        <tr><td><strong>Client Components</strong></td><td>Browser</td><td>No</td><td>Read non-sensitive user profile via a provider/hook; never see raw tokens</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- ============================================================ 2. STORY -->
+  <section id="story">
+    <h2>2. Story-Based Explanation — The Hotel With a Concierge</h2>
+
+    <p>Picture two hotels.</p>
+
+    <p><strong>Hotel SPA</strong> (Chapter 17) has no front desk. When you arrive, the hotel hands <em>you</em> the master key card and says, "Hold onto this; show it whenever you want into a room." You carry the key everywhere. If a pickpocket bumps into you (an XSS attack), they can lift the key from your pocket. The hotel trusts you to guard it, because there is nobody else to hold it.</p>
+
+    <p><strong>Hotel Next.js</strong> has a <strong>concierge</strong> at a locked desk. When you arrive you authenticate with the concierge once. The concierge keeps your master key in a vault behind the desk and hands you only a <em>numbered coat-check ticket</em> (the encrypted session cookie). Whenever you want into a room, you give the concierge your ticket; the concierge fetches the master key from the vault, opens the door for you, and hands the key right back into the vault. A pickpocket who steals your ticket gets a useless stub — it is meaningless without the concierge, the vault, and the encryption key.</p>
+
+    <p>In this analogy:</p>
+    <ul>
+      <li>The <strong>concierge</strong> is the Next.js server (middleware + Server Components + Route Handlers).</li>
+      <li>The <strong>vault</strong> is the encrypted session cookie + the <code>AUTH0_SECRET</code> that decrypts it.</li>
+      <li>The <strong>coat-check ticket</strong> is the cookie the browser holds — opaque, HttpOnly, useless on its own.</li>
+      <li>The <strong>master key</strong> is the access token, which the browser never holds directly.</li>
+    </ul>
+
+    <div class="callout note"><span class="tag">Note</span><p>The whole point of the BFF "concierge" is that the dangerous object (the access token) stays server-side. The browser only ever holds a reference. This is why we say Next.js auth has a <em>smaller attack surface</em> than SPA auth.</p></div>
+  </section>
+
+  <!-- ============================================================ 3. ASCII DIAGRAMS -->
+  <section id="diagrams">
+    <h2>3. ASCII Diagrams — The Flows You Must Be Able to Draw</h2>
+
+    <h3>3.1 The login round-trip (Authorization Code + PKCE, server-side)</h3>
+    <pre class="diagram">
+  Browser                Next.js server (BFF)            Auth0
+     |                          |                           |
+     |  GET /auth/login         |                           |
+     |------------------------->|                           |
+     |                          |  build /authorize URL     |
+     |                          |  + PKCE + state + nonce   |
+     |   302 -> Auth0 /authorize|                           |
+     |&lt;-------------------------|                           |
+     |  GET /authorize?...       (browser follows redirect)  |
+     |----------------------------------------------------->|
+     |                          |        [ login / MFA ]    |
+     |   302 -> /auth/callback?code=AUTH_CODE&amp;state=...     |
+     |&lt;-----------------------------------------------------|
+     |  GET /auth/callback?code  |                           |
+     |------------------------->|                           |
+     |                          |  POST /oauth/token        |
+     |                          |  code + verifier + secret |
+     |                          |-------------------------->|
+     |                          |  { id_token, access_token,|
+     |                          |    refresh_token }        |
+     |                          |&lt;--------------------------|
+     |                          |  verify id_token sig+nonce|
+     |                          |  ENCRYPT -&gt; session cookie |
+     |  302 -> / + Set-Cookie    |                           |
+     |   (HttpOnly, Secure)     |                           |
+     |&lt;-------------------------|                           |
+</pre>
+
+    <h3>3.2 Where the session lives across runtimes</h3>
+    <pre class="diagram">
+   +---------------------------- BROWSER ----------------------------+
+   |   Cookie: appSession=&lt;AES-256-GCM encrypted blob&gt;  (HttpOnly)   |
+   |   JS cannot read it. Sent automatically on every request.      |
+   +--------------------------------|-------------------------------+
+                                    | every request carries cookie
+                                    v
+   +============================ NEXT.JS SERVER =====================+
+   |  middleware.ts  -> auth0.middleware(req)                        |
+   |     - mounts /auth/* routes                                     |
+   |     - decrypts cookie, refreshes token if near expiry          |
+   |     - re-encrypts + re-attaches cookie to the response         |
+   |        |                                                        |
+   |        v                                                        |
+   |  Server Component         Route Handler        Server Action    |
+   |  await auth0.getSession() auth0.getSession()  auth0.getSession()|
+   |        |                       |                                |
+   |        v                       v                                |
+   |  access token (in memory, server-side only)                    |
+   +================================|===============================+
+                                    | Authorization: Bearer ...
+                                    v
+                          +-------------------+
+                          |  External API     |
+                          +-------------------+
+</pre>
+
+    <h3>3.3 The SSR / RSC / Client component decision tree</h3>
+    <pre class="diagram">
+        Do you need the access token or refresh token?
+                       |
+            +----------+-----------+
+            | YES                  | NO
+            v                      v
+   Stay on the SERVER       Do you need interactivity
+   (Server Component,       (onClick, useState, hooks)?
+    Route Handler,                 |
+    Server Action)         +-------+--------+
+                           | YES            | NO
+                           v                v
+                  Client Component   Server Component
+                  + &lt;Auth0Provider&gt;   (default; read
+                  useUser() for the   session directly)
+                  display name only
+</pre>
+  </section>
+
+  <!-- ============================================================ 4. ANALOGY -->
+  <section id="analogy">
+    <h2>4. Real-World Analogy — The Embassy Visa Stamp</h2>
+
+    <p>Think of your Next.js server as a <strong>national embassy</strong> operating on foreign soil (the public internet). Auth0 is the <strong>home country's passport office</strong>.</p>
+
+    <ul>
+      <li>A citizen (the user) shows up at the embassy. The embassy doesn't issue passports itself — it phones the passport office (Auth0) to verify identity. That phone call is the <strong>Authorization Code exchange</strong>, done over a secure line using the embassy's confidential credentials (the <code>client_secret</code>).</li>
+      <li>Once verified, the embassy issues a <strong>day-pass with a tamper-proof stamp</strong> (the encrypted session cookie). The citizen carries the day-pass; the embassy keeps the citizen's real passport in its safe (the server-side session / access token).</li>
+      <li>When the citizen wants a service from a <em>partner ministry</em> (the external API), the embassy presents the citizen's passport (the <strong>access token</strong>) on their behalf. The citizen never carries the passport into the ministry themselves.</li>
+      <li><strong>Middleware</strong> is the security checkpoint at the embassy gate that checks the day-pass on every entry and quietly renews it before it expires (silent token refresh).</li>
+    </ul>
+
+    <div class="callout tip"><span class="tag">Tip</span><p>The reason embassies — and BFFs — exist is <em>delegation under control</em>. The user delegates the holding of credentials to a party that can guard them better than the user can. That is the BFF thesis in one sentence.</p></div>
+  </section>
+
+  <!-- ============================================================ 5. INTERNAL WORKING -->
+  <section id="internals">
+    <h2>5. Internal Working — What the SDK Actually Does</h2>
+
+    <p>Let's lift the hood on <code>@auth0/nextjs-auth0</code> v4. Understanding the mechanics is what separates "I followed a tutorial" from "I can debug this in production."</p>
+
+    <h3>5.1 The mounted auth routes</h3>
+    <p>The SDK's middleware automatically mounts these endpoints — you do <strong>not</strong> create files for them:</p>
+    <table>
+      <thead><tr><th>Route</th><th>Purpose</th></tr></thead>
+      <tbody>
+        <tr><td><code>/auth/login</code></td><td>Starts the Authorization Code + PKCE flow; redirects to Auth0 <code>/authorize</code>.</td></tr>
+        <tr><td><code>/auth/logout</code></td><td>Clears the session cookie and redirects to Auth0 logout (kills the SSO session).</td></tr>
+        <tr><td><code>/auth/callback</code></td><td>Receives the <code>code</code>, exchanges it for tokens, validates, sets the cookie.</td></tr>
+        <tr><td><code>/auth/profile</code></td><td>Returns the user profile JSON (used by client-side <code>useUser()</code>).</td></tr>
+        <tr><td><code>/auth/access-token</code></td><td>Returns a fresh access token to server-trusted callers; refreshes if needed.</td></tr>
+        <tr><td><code>/auth/backchannel-logout</code></td><td>Receives OIDC Back-Channel Logout tokens from Auth0 to terminate sessions.</td></tr>
+      </tbody>
+    </table>
+
+    <h3>5.2 The session cookie internals</h3>
+    <p>The session is a <strong>stateless, encrypted cookie</strong> by default (no database required). The SDK uses the <code>AUTH0_SECRET</code> to derive an encryption key, then seals the tokens and profile into a JWE (JSON Web Encryption) using authenticated encryption (AES-256-GCM). Because it's authenticated encryption, any tampering with the cookie invalidates it — the server detects modification and rejects it.</p>
+
+    <pre class="diagram">
+  AUTH0_SECRET  ----derive----&gt;  encryption key
+                                      |
+   { user, idToken, accessToken,      |  AES-256-GCM
+     refreshToken, expiresAt }  --encrypt--&gt;  appSession=eyJ...   (the cookie)
+                                      |
+   on each request: decrypt, check expiry, maybe refresh, re-encrypt
+</pre>
+
+    <div class="callout warn"><span class="tag">Warn</span><p>Because the session is stateless, large sessions produce large cookies. Browsers cap a single cookie near ~4&nbsp;KB; the SDK chunks if needed, but bloated sessions (huge custom claims, many scopes) hurt performance. Keep custom claims lean.</p></div>
+
+    <h3>5.3 Automatic token refresh</h3>
+    <p>When you request the access token (via <code>getAccessToken()</code> or <code>auth0.getSession()</code> with a near-expiry token), the SDK checks <code>expiresAt</code>. If the access token is expired or about to expire and a <strong>refresh token</strong> is present (you enabled <code>offline_access</code> scope and rotation in Auth0), the SDK silently calls Auth0's <code>/oauth/token</code> with <code>grant_type=refresh_token</code>, gets a new access token, rotates the refresh token, and re-seals the cookie — all server-side, invisible to the user.</p>
+  </section>
+
+  <!-- ============================================================ 6. CODE WALKTHROUGH -->
+  <section id="walkthrough">
+    <h2>6. Code Walkthrough — Building the App File by File</h2>
+
+    <p>We target <strong>Next.js 15 (App Router)</strong> with <strong><code>@auth0/nextjs-auth0</code> v4</strong> and TypeScript. v4 introduced a route prefix of <code>/auth</code> (not the v3 <code>/api/auth</code>) and a single <code>Auth0Client</code> instance — so make sure tutorials you copy from match v4.</p>
+
+    <h3>6.1 Install &amp; scaffold</h3>
+    <pre><code class="language-bash">npx create-next-app@latest nextjs-auth0-app --typescript --app --eslint
+cd nextjs-auth0-app
+npm install @auth0/nextjs-auth0</code></pre>
+
+    <h3>6.2 Environment variables — <code>.env.local</code></h3>
+    <pre><code class="language-bash"># A 32-byte random secret used to encrypt the session cookie.
+# Generate with:  openssl rand -hex 32
+AUTH0_SECRET=&#39;a_long_random_64_char_hex_string_change_me_in_production&#39;
+
+# The base URL of THIS Next.js app (no trailing slash).
+APP_BASE_URL=&#39;http://localhost:3000&#39;
+
+# Your Auth0 tenant domain (custom domain in production).
+AUTH0_DOMAIN=&#39;your-tenant.us.auth0.com&#39;
+
+# Credentials of a REGULAR WEB APPLICATION (confidential client) in Auth0.
+AUTH0_CLIENT_ID=&#39;your_client_id&#39;
+AUTH0_CLIENT_SECRET=&#39;your_client_secret&#39;
+
+# OPTIONAL: request an access token for a specific API + offline access (refresh tokens)
+AUTH0_SCOPE=&#39;openid profile email offline_access&#39;
+AUTH0_AUDIENCE=&#39;https://my-api.example.com&#39;</code></pre>
+
+    <div class="callout danger"><span class="tag">Danger</span><p>The application in Auth0 MUST be a <strong>Regular Web Application</strong>, not a Single Page Application. A SPA has no <code>client_secret</code> and cannot perform the confidential-client token exchange the SDK relies on. Choosing the wrong app type is the #1 setup error.</p></div>
+
+    <h3>6.3 The client instance — <code>lib/auth0.ts</code></h3>
+    <pre><code class="language-typescript">// lib/auth0.ts
+import { Auth0Client } from &quot;@auth0/nextjs-auth0/server&quot;;
+
+// One shared instance for the whole app. Reads env vars automatically.
+export const auth0 = new Auth0Client({
+  // You can override env here, e.g. force a specific audience/scope:
+  authorizationParameters: {
+    scope: process.env.AUTH0_SCOPE,
+    audience: process.env.AUTH0_AUDIENCE,
+  },
+});</code></pre>
+
+    <h3>6.4 Middleware — <code>middleware.ts</code> (project root)</h3>
+    <pre><code class="language-typescript">// middleware.ts  (must live at the project root, NOT in /app)
+import type { NextRequest } from &quot;next/server&quot;;
+import { auth0 } from &quot;./lib/auth0&quot;;
+
+export async function middleware(request: NextRequest) {
+  // This single call:
+  //  1. Mounts /auth/login, /auth/logout, /auth/callback, etc.
+  //  2. Decrypts the session cookie on every request.
+  //  3. Silently refreshes the access token if it is near expiry.
+  //  4. Re-attaches the (possibly rotated) session cookie to the response.
+  return await auth0.middleware(request);
+}
+
+export const config = {
+  matcher: [
+    /*
+     * Run on everything EXCEPT static assets &amp; images, so we don&#39;t
+     * waste cycles decrypting cookies for /favicon.ico etc.
+     * IMPORTANT: the /auth routes MUST be matched, so do not exclude them.
+     */
+    &quot;/((?!_next/static|_next/image|favicon.ico|.*\\.(?:svg|png|jpg|jpeg|gif|webp)$).*)&quot;,
+  ],
+};</code></pre>
+
+    <div class="callout warn"><span class="tag">Warn</span><p>If your <code>matcher</code> accidentally excludes <code>/auth/*</code>, login silently 404s. The matcher must <em>include</em> the auth routes. A common bug is copying a matcher that excludes <code>api</code> — that breaks the SDK's mounted routes.</p></div>
+
+    <h3>6.5 Wrapping the app for client-side user access — <code>app/layout.tsx</code></h3>
+    <pre><code class="language-tsx">// app/layout.tsx
+import { Auth0Provider } from &quot;@auth0/nextjs-auth0&quot;;
+
+export default function RootLayout({
+  children,
+}: { children: React.ReactNode }) {
+  return (
+    &lt;html lang=&quot;en&quot;&gt;
+      &lt;body&gt;
+        {/* Provides useUser() to Client Components. Note: this exposes
+            ONLY the user profile, never the access/refresh tokens. */}
+        &lt;Auth0Provider&gt;{children}&lt;/Auth0Provider&gt;
+      &lt;/body&gt;
+    &lt;/html&gt;
+  );
+}</code></pre>
+
+    <h3>6.6 Login / logout links — <code>app/page.tsx</code></h3>
+    <p>Login and logout are plain anchors to the SDK-mounted routes. No client JS, no button handler required.</p>
+    <pre><code class="language-tsx">// app/page.tsx  (a Server Component by default)
+import { auth0 } from &quot;@/lib/auth0&quot;;
+
+export default async function Home() {
+  const session = await auth0.getSession();
+
+  if (!session) {
+    return (
+      &lt;main&gt;
+        &lt;h1&gt;Welcome&lt;/h1&gt;
+        {/* These are the SDK&#39;s mounted routes. Plain links. */}
+        &lt;a href=&quot;/auth/login&quot;&gt;Log in&lt;/a&gt;
+      &lt;/main&gt;
+    );
+  }
+
+  return (
+    &lt;main&gt;
+      &lt;h1&gt;Hello, {session.user.name}&lt;/h1&gt;
+      &lt;a href=&quot;/auth/logout&quot;&gt;Log out&lt;/a&gt;
+    &lt;/main&gt;
+  );
+}</code></pre>
+  </section>
+
+  <!-- ============================================================ 7. PRACTICAL IMPLEMENTATION -->
+  <section id="practical">
+    <h2>7. Practical Implementation — Sessions, Protected Pages &amp; APIs</h2>
+
+    <h3>7.1 Reading the session in a Server Component (the protected dashboard)</h3>
+    <pre><code class="language-tsx">// app/dashboard/page.tsx  — a PROTECTED Server Component
+import { auth0 } from &quot;@/lib/auth0&quot;;
+import { redirect } from &quot;next/navigation&quot;;
+
+export default async function Dashboard() {
+  // Runs ON THE SERVER. The cookie was decrypted by middleware.
+  const session = await auth0.getSession();
+
+  // Defense-in-depth: even with middleware, re-check at the page level.
+  if (!session) {
+    redirect(&quot;/auth/login?returnTo=/dashboard&quot;);
+  }
+
+  return (
+    &lt;main&gt;
+      &lt;h1&gt;Dashboard&lt;/h1&gt;
+      &lt;p&gt;Signed in as &lt;strong&gt;{session.user.email}&lt;/strong&gt;&lt;/p&gt;
+      {/* session.user contains ID-token claims only — safe to render. */}
+      &lt;pre&gt;{JSON.stringify(session.user, null, 2)}&lt;/pre&gt;
+    &lt;/main&gt;
+  );
+}</code></pre>
+
+    <h3>7.2 Calling an external API with the access token (Server Component)</h3>
+    <pre><code class="language-tsx">// app/dashboard/orders/page.tsx
+import { auth0 } from &quot;@/lib/auth0&quot;;
+import { redirect } from &quot;next/navigation&quot;;
+
+export default async function Orders() {
+  const session = await auth0.getSession();
+  if (!session) redirect(&quot;/auth/login?returnTo=/dashboard/orders&quot;);
+
+  // getAccessToken() returns a VALID token, refreshing it if needed.
+  // It throws if no token is available (e.g. wrong audience/scope).
+  const { token } = await auth0.getAccessToken();
+
+  const res = await fetch(&quot;https://my-api.example.com/orders&quot;, {
+    headers: { Authorization: `Bearer ${token}` },
+    // RSC fetch is cached by default — opt out for per-user data:
+    cache: &quot;no-store&quot;,
+  });
+
+  if (!res.ok) {
+    // 401 here usually means audience/scope mismatch, not a Next.js bug.
+    throw new Error(`API responded ${res.status}`);
+  }
+
+  const orders: Array&lt;{ id: string; total: number }&gt; = await res.json();
+
+  return (
+    &lt;ul&gt;
+      {orders.map((o) =&gt; (
+        &lt;li key={o.id}&gt;{o.id} — ${o.total}&lt;/li&gt;
+      ))}
+    &lt;/ul&gt;
+  );
+}</code></pre>
+
+    <div class="callout key"><span class="tag">Key</span><p>The access token is fetched and used <strong>entirely on the server</strong>. It is never serialized into the HTML sent to the browser, never placed in a prop passed to a Client Component, and never logged. This is the whole security advantage of RSC over SPA — guard it jealously.</p></div>
+
+    <h3>7.3 Protecting a Route Handler (your own API endpoint)</h3>
+    <pre><code class="language-typescript">// app/api/profile/route.ts
+import { auth0 } from &quot;@/lib/auth0&quot;;
+import { NextResponse } from &quot;next/server&quot;;
+
+export async function GET() {
+  const session = await auth0.getSession();
+
+  if (!session) {
+    return NextResponse.json({ error: &quot;Unauthorized&quot; }, { status: 401 });
+  }
+
+  // Optional: call a downstream API on the user&#39;s behalf
+  const { token } = await auth0.getAccessToken();
+  const upstream = await fetch(&quot;https://my-api.example.com/me&quot;, {
+    headers: { Authorization: `Bearer ${token}` },
+    cache: &quot;no-store&quot;,
+  });
+
+  const data = await upstream.json();
+  return NextResponse.json({ user: session.user, data });
+}</code></pre>
+
+    <h3>7.4 A Server Action that mutates with the token</h3>
+    <pre><code class="language-typescript">// app/dashboard/actions.ts
+&quot;use server&quot;;
+import { auth0 } from &quot;@/lib/auth0&quot;;
+
+export async function createOrder(formData: FormData) {
+  const session = await auth0.getSession();
+  if (!session) throw new Error(&quot;Unauthorized&quot;);
+
+  const { token } = await auth0.getAccessToken();
+  await fetch(&quot;https://my-api.example.com/orders&quot;, {
+    method: &quot;POST&quot;,
+    headers: {
+      Authorization: `Bearer ${token}`,
+      &quot;Content-Type&quot;: &quot;application/json&quot;,
+    },
+    body: JSON.stringify({ item: formData.get(&quot;item&quot;) }),
+  });
+}</code></pre>
+
+    <h3>7.5 Reading the user in a Client Component</h3>
+    <pre><code class="language-tsx">// app/components/UserBadge.tsx
+&quot;use client&quot;;
+import { useUser } from &quot;@auth0/nextjs-auth0&quot;;
+
+export default function UserBadge() {
+  const { user, isLoading } = useUser();
+  if (isLoading) return &lt;span&gt;Loading…&lt;/span&gt;;
+  if (!user) return &lt;a href=&quot;/auth/login&quot;&gt;Log in&lt;/a&gt;;
+  // user has profile claims ONLY — no tokens are ever exposed here.
+  return &lt;span&gt;Hi {user.name} · &lt;a href=&quot;/auth/logout&quot;&gt;Log out&lt;/a&gt;&lt;/span&gt;;
+}</code></pre>
+  </section>
+
+  <!-- ============================================================ 8. PRODUCTION ARCHITECTURE -->
+  <section id="architecture">
+    <h2>8. Production Architecture</h2>
+
+    <pre class="diagram">
+                         +-------------------------------+
+   Users  ───────────▶   |        CDN / Edge (Vercel)    |
+   (HTTPS)               |  static assets, image opt.    |
+                         +---------------+---------------+
+                                         |
+                                         v
+                 +-----------------------------------------------+
+                 |   Next.js (Node / Edge runtime)               |
+                 |  ┌─────────────────────────────────────────┐ |
+                 |  │ middleware.ts  -> auth0.middleware()      │ |
+                 |  │   session decrypt / refresh / gatekeep    │ |
+                 |  └───────────────┬─────────────────────────┘ |
+                 |  RSC pages   Route Handlers   Server Actions  |
+                 |       │            │                │         |
+                 +-------│------------│----------------│---------+
+                         │            │  Bearer token  │
+            getSession() │            ▼                ▼
+                         │     +---------------------------+
+                         │     |  Protected External API   |
+                         │     |  (validates JWT via JWKS)  |
+                         │     +---------------------------+
+                         ▼
+                 +-------------------------+      +------------------+
+                 |  Auth0 (Custom Domain)  |◀────▶|  Refresh token   |
+                 |  /authorize /token JWKS |      |  rotation        |
+                 +-------------------------+      +------------------+
+</pre>
+
+    <h4>Production checklist</h4>
+    <ul>
+      <li><strong>Custom domain</strong> for Auth0 (<code>auth.yourapp.com</code>) so cookies and branding stay first-party and refresh tokens are not blocked by third-party-cookie restrictions.</li>
+      <li><strong>Rotate <code>AUTH0_SECRET</code></strong> via your secrets manager; never commit <code>.env.local</code>.</li>
+      <li><strong>Set <code>APP_BASE_URL</code></strong> to the real HTTPS origin in each environment; add matching <strong>Allowed Callback URLs</strong> (<code>https://yourapp.com/auth/callback</code>) and <strong>Allowed Logout URLs</strong> in the Auth0 dashboard.</li>
+      <li><strong>Enable refresh token rotation</strong> + absolute/inactivity expiry on the Auth0 application.</li>
+      <li><strong>Back-Channel Logout</strong> configured so a logout from Auth0 (or admin revoke) terminates the Next.js session server-side.</li>
+      <li><strong>Stateless vs stateful sessions:</strong> default stateless cookies scale horizontally with zero infra; switch to a stateful store (Redis) only if you need server-side revocation lists or sessions too big for a cookie.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================ 9. SECURITY ANALYSIS -->
+  <section id="security">
+    <h2>9. Security Analysis</h2>
+
+    <table>
+      <thead><tr><th>Threat</th><th>How Next.js + SDK mitigates it</th></tr></thead>
+      <tbody>
+        <tr><td><strong>XSS token theft</strong></td><td>Tokens live in an HttpOnly encrypted cookie + server memory. JS cannot read them, so an XSS payload cannot exfiltrate the access/refresh token.</td></tr>
+        <tr><td><strong>CSRF on login</strong></td><td>The <code>state</code> parameter is generated, cookied, and validated on callback. A forged callback without the matching state is rejected.</td></tr>
+        <tr><td><strong>ID-token replay / forgery</strong></td><td>The <code>nonce</code> is validated and the ID token's signature is verified against Auth0's JWKS before any session is created.</td></tr>
+        <tr><td><strong>Cookie tampering</strong></td><td>AES-256-GCM authenticated encryption — any modified byte invalidates the cookie; the server rejects it.</td></tr>
+        <tr><td><strong>Token leakage to client</strong></td><td>Never pass <code>session.accessToken</code> as a prop to a Client Component or into serialized JSON — it would ship to the browser. Keep token use server-side.</td></tr>
+        <tr><td><strong>Open redirect</strong></td><td>The SDK validates <code>returnTo</code> against your app's origin; do not bypass it with user-supplied absolute URLs.</td></tr>
+        <tr><td><strong>Stolen refresh token</strong></td><td>Rotation invalidates the old token on each use; reuse detection (automatic in Auth0) revokes the family.</td></tr>
+      </tbody>
+    </table>
+
+    <div class="callout danger"><span class="tag">Danger</span><p>The single most dangerous mistake in Next.js auth is <strong>leaking the access token across the server→client boundary</strong>. Anything you return from a Server Component as a prop to a <code>"use client"</code> component, or put in a Route Handler JSON response, is sent to the browser. Returning the access token there silently re-creates the SPA attack surface you were trying to avoid.</p></div>
+  </section>
+
+  <!-- ============================================================ 10. PERFORMANCE -->
+  <section id="performance">
+    <h2>10. Performance Considerations</h2>
+    <ul>
+      <li><strong>Cookie decryption cost:</strong> middleware decrypts the session on matched requests. Scope your <code>matcher</code> tightly so static assets don't pay the cost.</li>
+      <li><strong>Don't double-fetch the session:</strong> calling <code>getSession()</code> repeatedly in one render is cheap (it reads the already-decrypted request), but avoid redundant <code>getAccessToken()</code> calls — each may trigger a refresh network round-trip when near expiry.</li>
+      <li><strong>RSC fetch caching:</strong> Next.js caches <code>fetch</code> by default. For per-user authorized data, set <code>cache: "no-store"</code> (or <code>revalidate: 0</code>) so User A never sees User B's cached response.</li>
+      <li><strong>Edge vs Node runtime:</strong> the SDK's crypto runs in both, but heavy refresh logic and large sessions favour the Node runtime. Choose deliberately per route.</li>
+      <li><strong>Session size:</strong> bloated custom claims grow the cookie, increasing every request's payload. Keep the ID token lean; fetch heavy profile data from your own API instead.</li>
+      <li><strong>Streaming &amp; Suspense:</strong> wrap slow authorized fetches in <code>&lt;Suspense&gt;</code> so the shell streams immediately while the protected data resolves.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================ 11. COMMON MISTAKES -->
+  <section id="mistakes">
+    <h2>11. Common Mistakes</h2>
+    <ol>
+      <li><strong>Using a SPA application type in Auth0.</strong> The SDK needs a Regular Web App with a <code>client_secret</code>. SPA → callback fails or no token exchange.</li>
+      <li><strong>v3 routes in a v4 project.</strong> v4 mounts <code>/auth/*</code>, not <code>/api/auth/*</code>. Old links break login.</li>
+      <li><strong>Forgetting <code>middleware.ts</code> at the project root.</strong> Without it the <code>/auth/*</code> routes never mount and the session never refreshes.</li>
+      <li><strong>Matcher excludes the auth routes.</strong> Login 404s silently.</li>
+      <li><strong>Requesting an access token without an <code>audience</code>.</strong> You get an opaque token (or only an ID token) and your API returns 401. Set <code>AUTH0_AUDIENCE</code>.</li>
+      <li><strong>Missing <code>offline_access</code> scope</strong> but expecting refresh — there is no refresh token, so the session dies when the access token expires.</li>
+      <li><strong>Passing the access token to a Client Component</strong> — re-introduces the XSS attack surface.</li>
+      <li><strong>Relying on middleware alone for authorization.</strong> Middleware is a first gate, not the last; re-check <code>getSession()</code> in the page/handler (defense in depth).</li>
+      <li><strong>Caching per-user fetches.</strong> Forgetting <code>cache: "no-store"</code> can serve one user's data to another.</li>
+      <li><strong>Mismatched <code>APP_BASE_URL</code> / callback URLs</strong> across environments → <em>Callback URL mismatch</em> error.</li>
+    </ol>
+  </section>
+
+  <!-- ============================================================ 12. BEST PRACTICES -->
+  <section id="best-practices">
+    <h2>12. Best Practices</h2>
+    <ul>
+      <li>Centralise the <code>Auth0Client</code> in one <code>lib/auth0.ts</code> and import it everywhere — never instantiate twice.</li>
+      <li>Use middleware <em>plus</em> per-route <code>getSession()</code> checks (defense in depth), and <code>redirect("/auth/login?returnTo=...")</code> for protected pages.</li>
+      <li>Keep all token usage server-side; expose only the user profile to the client via <code>useUser()</code>.</li>
+      <li>Always set <code>cache: "no-store"</code> on authorized, per-user fetches.</li>
+      <li>Request the minimum scopes and a specific <code>audience</code>; enable <code>offline_access</code> only when you genuinely need refresh.</li>
+      <li>Use a custom Auth0 domain in production to keep auth first-party.</li>
+      <li>Validate API access on the API side too — the API must independently verify the JWT (audience, issuer, signature, scopes). Never trust that "Next.js already checked."</li>
+      <li>Centralise authorization rules (RBAC/scope checks) in a small helper rather than scattering <code>if</code> statements.</li>
+      <li>Log auth failures without logging tokens.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================ 13. INTERVIEW QUESTIONS -->
+  <section id="interview">
+    <h2>13. Interview Questions (with Model Answers)</h2>
+
+    <h3>Q1. Why is Next.js auth considered more secure than SPA auth?</h3>
+    <p><strong>Model answer:</strong> Next.js has a trusted server runtime, enabling the BFF pattern. Tokens are stored in an encrypted HttpOnly cookie and held in server memory; the browser never holds raw access/refresh tokens. JavaScript can't read HttpOnly cookies, so an XSS bug can't exfiltrate the session — unlike an SPA that must keep tokens in JS-readable memory.</p>
+
+    <h3>Q2. What's the difference between reading auth in a Server Component vs a Client Component?</h3>
+    <p><strong>Model answer:</strong> A Server Component calls <code>auth0.getSession()</code> / <code>getAccessToken()</code> directly on the server and may use the access token to call APIs — the token never reaches the browser. A Client Component uses <code>useUser()</code> via <code>&lt;Auth0Provider&gt;</code> and can only see the non-sensitive user profile, never tokens.</p>
+
+    <h3>Q3. What does the middleware actually do?</h3>
+    <p><strong>Model answer:</strong> <code>auth0.middleware()</code> mounts the <code>/auth/*</code> routes, decrypts the session cookie per request, silently refreshes the access token when near expiry (rotating the refresh token), and re-attaches the updated cookie to the response. It can also gatekeep protected paths.</p>
+
+    <h3>Q4. Why must the Auth0 application be a Regular Web App, not a SPA?</h3>
+    <p><strong>Model answer:</strong> The SDK performs a confidential-client Authorization Code exchange requiring a <code>client_secret</code>, which only a Regular Web App has. A SPA is a public client with no secret, so it can't do the server-side token exchange.</p>
+
+    <h3>Q5. How do you call a protected external API from Next.js?</h3>
+    <p><strong>Model answer:</strong> On the server, call <code>auth0.getAccessToken()</code> (configured with the API's <code>audience</code> and scopes), then <code>fetch</code> the API with an <code>Authorization: Bearer</code> header and <code>cache: "no-store"</code>. The token is acquired and used entirely server-side.</p>
+
+    <h3>Q6. What is the SSR vs RSC consideration for auth?</h3>
+    <p><strong>Model answer:</strong> Both run on the server, but RSC (Server Components) render to a serialized tree that's streamed to the client — so you must never include a token in that tree. SSR'd Client Components (those marked <code>"use client"</code> but server-rendered for the first paint) hydrate in the browser and must only receive profile data, never tokens. The rule: token logic stays in pure server contexts (RSC, Route Handlers, Server Actions).</p>
+
+    <h3>Q7. How does silent token refresh work and what enables it?</h3>
+    <p><strong>Model answer:</strong> Requesting <code>offline_access</code> yields a refresh token stored in the session. When the access token nears expiry, the SDK calls <code>/oauth/token</code> with <code>grant_type=refresh_token</code> server-side, rotates the refresh token, and re-seals the cookie — no user interaction. Rotation + reuse detection mitigates stolen refresh tokens.</p>
+
+    <h3>Q8. Where is the session stored and what are the trade-offs?</h3>
+    <p><strong>Model answer:</strong> By default it's a stateless encrypted cookie — no DB, scales horizontally for free, but can't be revoked server-side and is size-limited (~4&nbsp;KB, chunked). A stateful store (e.g. Redis) enables instant revocation and large sessions at the cost of infrastructure.</p>
+  </section>
+
+  <!-- ============================================================ 14. CERTIFICATION TIPS -->
+  <section id="cert">
+    <h2>14. Certification Tips</h2>
+    <ul>
+      <li>Know that <strong>web apps use the Authorization Code flow</strong> (with PKCE) and are <strong>confidential clients</strong>; SPAs are public clients. The exam tests this distinction repeatedly.</li>
+      <li>Memorise that the <strong>session cookie is HttpOnly + Secure + SameSite</strong> and what each flag prevents.</li>
+      <li>Be able to map OIDC params: <code>state</code> = CSRF, <code>nonce</code> = replay, <code>code_verifier/challenge</code> = PKCE.</li>
+      <li>Understand <strong>refresh token rotation</strong> and <strong>reuse detection</strong> — likely a scenario question.</li>
+      <li>Know <strong>Allowed Callback URLs</strong> and <strong>Allowed Logout URLs</strong> must exactly match (scheme + host + path).</li>
+      <li>Recognise that the <strong>API must validate the JWT independently</strong> (audience, issuer, signature) — auth at the app does not exempt the resource server.</li>
+      <li><strong>Back-Channel Logout</strong> and OIDC single logout concepts appear in advanced questions.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================ 15. HANDS-ON -->
+  <section id="hands-on">
+    <h2>15. Hands-On Exercises</h2>
+    <ol>
+      <li>Scaffold the app, set <code>.env.local</code>, and confirm <code>/auth/login</code> redirects to Auth0 and back.</li>
+      <li>Render the logged-in user's <code>name</code> and <code>email</code> from <code>getSession()</code> on the home page.</li>
+      <li>Create <code>/dashboard</code> as a protected Server Component that <code>redirect()</code>s anonymous users to login.</li>
+      <li>Build <code>/api/profile</code> as a Route Handler returning 401 when unauthenticated and the profile JSON when authenticated.</li>
+      <li>Add an <code>AUTH0_AUDIENCE</code>, request a token with <code>getAccessToken()</code>, and call a mock external API (e.g. an <code>httpbin</code> bearer endpoint).</li>
+      <li>Add a <code>UserBadge</code> Client Component using <code>useUser()</code> and confirm via DevTools that <strong>no token</strong> appears in the page source or network JSON.</li>
+    </ol>
+  </section>
+
+  <!-- ============================================================ 16. ASSIGNMENT -->
+  <section id="assignment">
+    <h2>16. Assignment</h2>
+    <div class="callout note"><span class="tag">Assignment</span>
+      <p>Build a <strong>"My Tickets"</strong> Next.js app:</p>
+      <ol>
+        <li>Public landing page with a Log in link.</li>
+        <li>Protected <code>/tickets</code> Server Component that fetches the current user's tickets from a protected external API using a Bearer access token (correct <code>audience</code>/scope).</li>
+        <li>A Route Handler <code>POST /api/tickets</code> (or a Server Action) that creates a ticket with the same token; reject unauthenticated requests with 401.</li>
+        <li>A Client Component header showing the user's avatar/name via <code>useUser()</code> and a Log out link.</li>
+        <li>Refresh tokens enabled (<code>offline_access</code>); demonstrate the session surviving past access-token expiry.</li>
+      </ol>
+      <p><strong>Deliverable:</strong> the repo plus a short writeup proving (via DevTools) that no access/refresh token ever reaches the browser.</p>
+    </div>
+  </section>
+
+  <!-- ============================================================ 17. MINI PROJECT -->
+  <section id="mini-project">
+    <h2>17. Mini Project — Role-Gated Admin Area</h2>
+    <p>Extend the assignment with authorization, not just authentication:</p>
+    <ol>
+      <li>In Auth0, add an <strong>Action</strong> on the login flow that adds a <code>roles</code> custom claim (namespaced, e.g. <code>https://yourapp.com/roles</code>) to the ID token.</li>
+      <li>Create <code>/admin</code> as a Server Component that reads <code>session.user["https://yourapp.com/roles"]</code> and renders 403 unless the user has the <code>admin</code> role.</li>
+      <li>Add a Route Handler <code>DELETE /api/tickets/[id]</code> that checks the role <strong>and</strong> verifies the action server-side before calling the external API.</li>
+      <li>Bonus: configure <strong>Back-Channel Logout</strong> so revoking the user in Auth0 immediately ends their Next.js session.</li>
+    </ol>
+    <div class="callout tip"><span class="tag">Tip</span><p>Roles belong in your <em>authorization</em> logic, not just UI hiding. Always enforce the role check on the server (RSC/handler) and again at the API — hiding a button is not security.</p></div>
+  </section>
+
+  <!-- ============================================================ 18. QUIZ -->
+  <section id="quiz">
+    <h2>18. Quiz — 24 Questions</h2>
+    <ol>
+      <li>What pattern does <code>@auth0/nextjs-auth0</code> implement, and why is it safer than SPA auth?</li>
+      <li>Which OAuth flow does a Next.js Regular Web App use?</li>
+      <li>Why must the Auth0 app be a Regular Web App, not a SPA?</li>
+      <li>What route prefix does v4 of the SDK mount (<code>/auth</code> or <code>/api/auth</code>)?</li>
+      <li>Name three routes the SDK mounts automatically.</li>
+      <li>Where must <code>middleware.ts</code> be located?</li>
+      <li>List four things <code>auth0.middleware()</code> does on each request.</li>
+      <li>How is the session cookie protected from tampering?</li>
+      <li>What env var encrypts the session cookie, and how long should it be?</li>
+      <li>Why must <code>AUTH0_AUDIENCE</code> be set to get a usable API access token?</li>
+      <li>What scope enables refresh tokens?</li>
+      <li>How do you read the session in a Server Component?</li>
+      <li>How do you read the user in a Client Component?</li>
+      <li>What does <code>useUser()</code> expose — and what does it never expose?</li>
+      <li>How do you call a protected external API from an RSC?</li>
+      <li>Why set <code>cache: "no-store"</code> on authorized fetches?</li>
+      <li>What's the SSR/RSC consideration that prevents token leaks?</li>
+      <li>Why re-check <code>getSession()</code> in a page even with middleware?</li>
+      <li>What does the <code>state</code> parameter protect against?</li>
+      <li>What does the <code>nonce</code> protect against?</li>
+      <li>How does silent token refresh work?</li>
+      <li>What is refresh token rotation + reuse detection?</li>
+      <li>Stateless vs stateful sessions — one trade-off of each.</li>
+      <li>What's the #1 security mistake unique to RSC/Next.js auth?</li>
+    </ol>
+
+    <details>
+      <summary>Show answer key</summary>
+      <ol>
+        <li><strong>BFF (Backend-For-Frontend).</strong> Tokens stay server-side in an encrypted HttpOnly cookie; the browser never holds raw tokens, so XSS can't steal them.</li>
+        <li><strong>Authorization Code flow</strong> (with PKCE).</li>
+        <li>It needs a <code>client_secret</code> for the confidential-client token exchange; SPAs are public clients with no secret.</li>
+        <li><code>/auth</code> (v3 used <code>/api/auth</code>).</li>
+        <li>Any of: <code>/auth/login</code>, <code>/auth/logout</code>, <code>/auth/callback</code>, <code>/auth/profile</code>, <code>/auth/access-token</code>, <code>/auth/backchannel-logout</code>.</li>
+        <li>At the <strong>project root</strong> (same level as <code>app/</code>), not inside <code>app/</code>.</li>
+        <li>Mounts <code>/auth/*</code> routes; decrypts the session cookie; silently refreshes the access token near expiry (rotating refresh token); re-attaches the updated cookie to the response (and can gatekeep).</li>
+        <li>AES-256-GCM <strong>authenticated encryption</strong> — any modification invalidates it.</li>
+        <li><code>AUTH0_SECRET</code>; a 32-byte (64-hex-char) random value.</li>
+        <li>Without an audience you get an ID token / opaque token unsuitable for the API, which returns 401.</li>
+        <li><code>offline_access</code>.</li>
+        <li><code>await auth0.getSession()</code>.</li>
+        <li><code>useUser()</code> from <code>@auth0/nextjs-auth0</code>, with <code>&lt;Auth0Provider&gt;</code> in the layout.</li>
+        <li>Exposes the <strong>user profile claims</strong>; never exposes access or refresh tokens.</li>
+        <li><code>const { token } = await auth0.getAccessToken();</code> then <code>fetch</code> with <code>Authorization: Bearer</code> + <code>cache:"no-store"</code>.</li>
+        <li>So one user's authorized response isn't cached and served to another user.</li>
+        <li>RSC output and SSR'd client components are serialized/sent to the browser — keep all token logic in pure server contexts (RSC/Route Handlers/Server Actions) and never pass tokens to client components.</li>
+        <li><strong>Defense in depth</strong> — middleware is a first gate, not the last; the page/handler must independently verify authorization.</li>
+        <li><strong>CSRF</strong> on the authorization request/callback.</li>
+        <li><strong>Replay</strong> of an ID token (binds the token to the request).</li>
+        <li>On near-expiry, the SDK calls <code>/oauth/token</code> with <code>grant_type=refresh_token</code> server-side, rotates the refresh token, re-seals the cookie — invisibly.</li>
+        <li>Each refresh issues a new refresh token and invalidates the old one; if an old (stolen) token is reused, Auth0 detects it and revokes the whole token family.</li>
+        <li>Stateless cookie: no infra, scales free, but no server-side revocation + size-limited. Stateful store: instant revocation + large sessions, but needs infrastructure.</li>
+        <li><strong>Leaking the access/refresh token across the server→client boundary</strong> (as a prop to a client component or in a Route Handler JSON body).</li>
+      </ol>
+    </details>
+  </section>
+
+  <!-- ============================================================ 19. CHEAT SHEET -->
+  <section id="cheat-sheet">
+    <h2>19. Cheat Sheet</h2>
+    <pre><code class="language-text">INSTALL
+  npm install @auth0/nextjs-auth0
+  openssl rand -hex 32            # AUTH0_SECRET
+
+.env.local
+  AUTH0_SECRET, APP_BASE_URL, AUTH0_DOMAIN,
+  AUTH0_CLIENT_ID, AUTH0_CLIENT_SECRET,
+  AUTH0_SCOPE=&#39;openid profile email offline_access&#39;
+  AUTH0_AUDIENCE=&#39;https://my-api...&#39;
+
+CLIENT (lib/auth0.ts)
+  export const auth0 = new Auth0Client({ ... });
+
+MIDDLEWARE (middleware.ts @ root)
+  export async function middleware(req){ return auth0.middleware(req); }
+  matcher must INCLUDE /auth/*, exclude static assets
+
+ROUTES (auto-mounted, v4)
+  /auth/login   /auth/logout   /auth/callback
+  /auth/profile /auth/access-token /auth/backchannel-logout
+
+SERVER (RSC / Route Handler / Server Action)
+  const session = await auth0.getSession();      // null if anon
+  const { token } = await auth0.getAccessToken();// refreshes
+  fetch(api, { headers:{Authorization:`Bearer ${token}`}, cache:&#39;no-store&#39; })
+
+CLIENT (&quot;use client&quot;)
+  &lt;Auth0Provider&gt; in layout; const { user, isLoading } = useUser();
+  user = profile ONLY, never tokens
+
+LINKS
+  &lt;a href=&quot;/auth/login&quot;&gt;  &lt;a href=&quot;/auth/logout&quot;&gt;
+  protect page: if(!session) redirect(&quot;/auth/login?returnTo=...&quot;)
+
+GOLDEN RULES
+  Regular Web App (not SPA) · tokens stay server-side ·
+  audience for API tokens · offline_access for refresh ·
+  no-store for per-user fetches · API re-validates the JWT</code></pre>
+  </section>
+
+  <!-- ============================================================ 20. KEY TAKEAWAYS -->
+  <section id="takeaways">
+    <h2>20. Key Takeaways</h2>
+    <div class="callout key"><span class="tag">Key</span>
+      <ul>
+        <li>Next.js runs in two trust domains; the trusted server enables the <strong>BFF pattern</strong> — the defining security advantage over SPAs.</li>
+        <li>Tokens live in an <strong>encrypted HttpOnly cookie</strong> and server memory; the browser holds only an opaque reference. XSS can't steal what JS can't read.</li>
+        <li>Use a <strong>Regular Web Application</strong> (confidential client) in Auth0 — never a SPA — for the v4 SDK.</li>
+        <li><code>middleware.ts</code> at the root mounts <code>/auth/*</code>, decrypts the session, and silently refreshes tokens. It's a first gate, not the last — re-check in pages/handlers.</li>
+        <li>Read the session with <code>auth0.getSession()</code> on the server; use <code>useUser()</code> for profile-only data on the client.</li>
+        <li>Acquire access tokens with <code>getAccessToken()</code> (correct <code>audience</code>/scope) and call external APIs <strong>entirely server-side</strong> with <code>cache:"no-store"</code>.</li>
+        <li>The cardinal sin is <strong>leaking a token across the server→client boundary</strong> — that silently rebuilds the SPA attack surface.</li>
+        <li>In production: custom Auth0 domain, rotating refresh tokens, exact callback/logout URLs, and an API that independently validates every JWT.</li>
+      </ul>
+    </div>
+  </section>
+
+  <nav class="pager">
+    <a class="prev" href="chapter-17.html">← Previous</a>
+    <a class="next" href="chapter-19.html">Next →</a>
+  </nav>
+</main>
+<footer class="site-footer">Master Auth0 End-to-End · Chapter 18 of 32</footer>
+</body>
+</html>

@@ -1,0 +1,856 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 17 — Project 1 — React + Auth0 | Master Auth0</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">🔐 Master Auth0</a>
+  <nav class="topnav">
+    <a href="chapter-16.html">← Prev</a>
+    <a href="index.html">Contents</a>
+    <a href="chapter-18.html">Next →</a>
+  </nav>
+</header>
+<main class="container">
+  <div class="chapter-head">
+    <span class="phase">Phase 8 · Integration Projects</span>
+    <h1>Chapter 17 — Project 1 — React + Auth0</h1>
+    <p class="lead">Everything you have learned about OAuth 2.0, OpenID Connect, PKCE, tokens, and scopes now becomes a real, working application. In this chapter you build a complete React + TypeScript single-page app (SPA) that logs users in through Auth0, protects routes, reads ID-token claims, calls a protected API with an access token, refreshes tokens silently in the background, and renders different UI for different roles. We do it from first principles: every line of configuration has a reason rooted in browser security, and we never wave our hands and say "just trust the SDK."</p>
+  </div>
+
+  <!-- ============================================================ 1 -->
+  <section id="theory">
+    <h2>1. Theory — First Principles of an Auth0 SPA</h2>
+    <p>A <strong>Single-Page Application</strong> is JavaScript that runs <em>entirely in the user's browser</em>. There is no trusted server-side session you can hide a secret in — every byte of your React bundle is downloadable and readable by anyone. This single fact drives <em>every</em> design decision in this chapter.</p>
+
+    <p>Because the browser is a <strong>public client</strong> (it cannot keep a secret), the SPA must authenticate using the <strong>OAuth 2.0 Authorization Code flow with PKCE</strong> (Proof Key for Code Exchange). Let us re-derive why from the ground up:</p>
+    <ul>
+      <li><strong>Why not put a password field in React?</strong> Then your app touches the raw credentials, becomes a phishing target, and must implement MFA, breached-password detection, brute-force protection, and social login itself. Auth0's <em>Universal Login</em> page handles all of that on its own domain.</li>
+      <li><strong>Why not the old Implicit flow?</strong> Implicit returned tokens in the URL fragment (<code>#access_token=...</code>), exposing them to browser history, referrer headers, and any script on the page. It is deprecated. PKCE returns a one-time <em>authorization code</em> instead, which is useless without the code verifier your app generated.</li>
+      <li><strong>Why PKCE specifically?</strong> A confidential client (a backend) proves its identity with a client secret. A SPA has no secret. PKCE substitutes a dynamically generated secret per login: the app sends a hashed <code>code_challenge</code> up front, then the raw <code>code_verifier</code> when redeeming the code. An attacker who steals the code from the redirect cannot redeem it without the verifier, which never left the browser tab.</li>
+    </ul>
+
+    <p>Three artifacts come out of a successful login, and you must keep their <em>purposes</em> distinct:</p>
+    <table>
+      <thead><tr><th>Token</th><th>Audience</th><th>Purpose</th><th>Your app should…</th></tr></thead>
+      <tbody>
+        <tr><td><strong>ID token</strong> (JWT)</td><td>Your SPA (<code>client_id</code>)</td><td>Tells the app <em>who the user is</em> (claims: <code>sub</code>, <code>name</code>, <code>email</code>).</td><td>Read claims for UI. <strong>Never</strong> send it to an API.</td></tr>
+        <tr><td><strong>Access token</strong></td><td>Your API (<code>audience</code>)</td><td>Authorizes calls to <em>your</em> backend. Opaque or JWT.</td><td>Attach in <code>Authorization: Bearer</code>. Never inspect it for auth decisions in the SPA.</td></tr>
+        <tr><td><strong>Refresh token</strong></td><td>Auth0 token endpoint</td><td>Obtains new access tokens without a full redirect.</td><td>Let the SDK store/rotate it. Never log it.</td></tr>
+      </tbody>
+    </table>
+
+    <div class="callout key"><span class="tag">Key</span><p>The ID token answers "who is logged in?" and is for <em>your front end</em>. The access token answers "what may this request do?" and is for <em>your back end</em>. Confusing the two is the single most common Auth0 mistake — and a guaranteed interview red flag.</p></div>
+
+    <p>The <code>@auth0/auth0-react</code> SDK wraps <code>@auth0/auth0-spa-js</code>, which implements the PKCE dance, token caching, and silent renewal. React only adds an idiomatic layer: a context <strong>Provider</strong> and a <code>useAuth0()</code> <strong>hook</strong> so any component can read auth state.</p>
+  </section>
+
+  <!-- ============================================================ 2 -->
+  <section id="story">
+    <h2>2. Story-Based Explanation</h2>
+    <p>Imagine Maya, a frontend engineer, building "Dashly," an analytics dashboard. On day one she hard-codes a login form and stores the password in <code>localStorage</code>. Two weeks later, security review flags it: an XSS bug would leak every user's password, and there's no MFA. Maya rips it out.</p>
+
+    <p>She signs up for Auth0 and registers Dashly as a <strong>Single Page Application</strong>. Auth0 hands her a <code>domain</code> and a <code>client_id</code> — no secret, because it knows SPAs can't keep one. She installs <code>@auth0/auth0-react</code>, wraps her <code>&lt;App/&gt;</code> in an <code>&lt;Auth0Provider&gt;</code>, and adds a "Log in" button that calls <code>loginWithRedirect()</code>.</p>
+
+    <p>The first time she clicks it, the browser sails away to <code>dashly.us.auth0.com</code>. She types her credentials on Auth0's page — Dashly never sees them. Auth0 redirects back to <code>http://localhost:3000</code> with <code>?code=...&amp;state=...</code> in the URL. The SDK silently swaps that code (plus its secret verifier) for tokens, scrubs the URL clean, and now <code>useAuth0()</code> reports <code>isAuthenticated: true</code> with Maya's profile.</p>
+
+    <p>Next, Dashly needs to call its own <code>/api/metrics</code> endpoint. Maya adds an <code>audience</code> to the provider so Auth0 issues an <em>access token</em> for that API. Her data hook calls <code>getAccessTokenSilently()</code>, attaches the token as a Bearer header, and the Express API validates it. When the token expires an hour later, the SDK quietly fetches a new one using the rotating refresh token — Maya never sees a flicker. Finally, she gives admins an extra "Settings" tab by reading a <code>roles</code> claim she added via an Auth0 Action. Same app, two experiences. That is the whole arc of this chapter.</p>
+  </section>
+
+  <!-- ============================================================ 3 -->
+  <section id="diagrams">
+    <h2>3. ASCII Diagrams</h2>
+
+    <h3>3.1 The Authorization Code + PKCE login flow</h3>
+<pre class="diagram">
+  Browser (React SPA)            Auth0 (/authorize, /oauth/token)        Your API
+  ===================            ================================        ========
+       |                                    |                              |
+  (1)  | user clicks "Log in"               |                              |
+       | generate code_verifier (random)    |                              |
+       | code_challenge = SHA256(verifier)  |                              |
+       |----------- redirect ------------->  |                              |
+       |   /authorize?response_type=code     |                              |
+       |     &amp;client_id&amp;redirect_uri          |                              |
+       |     &amp;scope=openid profile email      |                              |
+       |     &amp;audience=API &amp;state &amp;nonce       |                              |
+       |     &amp;code_challenge &amp;method=S256     |                              |
+       |                                    |  (2) Universal Login UI       |
+       |  &lt;----------- login form ---------  |      user authenticates       |
+       |                                    |                              |
+       |  &lt;----- redirect w/ ?code&amp;state --  |  (3) issues one-time code     |
+       |                                    |                              |
+  (4)  | POST /oauth/token                  |                              |
+       |   grant_type=authorization_code    |                              |
+       |   code + code_verifier + client_id |                              |
+       |----------------------------------->|  (5) verify SHA256(verifier) |
+       |                                    |      == code_challenge ?      |
+       |  &lt;-- id_token + access_token ------ |      yes -> issue tokens      |
+       |       (+ refresh_token)            |                              |
+       |                                    |                              |
+  (6)  | store tokens in memory/cache       |                              |
+       | isAuthenticated = true             |                              |
+       |                                    |                              |
+  (7)  | GET /api/metrics                   |                              |
+       |   Authorization: Bearer &lt;access&gt;   |---------------------------->  |
+       |                                    |   (8) validate JWT signature  |
+       |  &lt;------------- 200 JSON ----------------------------------------  |
+</pre>
+
+    <h3>3.2 React component / provider topology</h3>
+<pre class="diagram">
+   main.tsx
+      |
+      v
+  +-----------------------------------------------------+
+  |  &lt;Auth0Provider domain clientId authorizationParams&gt;|
+  |     onRedirectCallback ->  react-router navigate     |
+  |  +-----------------------------------------------+  |
+  |  |  &lt;BrowserRouter&gt;                               |  |
+  |  |    &lt;NavBar/&gt;  (Login/Logout, role-based links) |  |
+  |  |    &lt;Routes&gt;                                    |  |
+  |  |      "/"          -> &lt;Home/&gt;       (public)    |  |
+  |  |      "/profile"   -> Protected(&lt;Profile/&gt;)     |  |
+  |  |      "/dashboard" -> Protected(&lt;Dashboard/&gt;)   |  |
+  |  |      "/admin"     -> RoleGuard(&lt;Admin/&gt;,admin) |  |
+  |  +-----------------------------------------------+  |
+  +-----------------------------------------------------+
+        ^                         ^
+        | useAuth0()              | useApi() -> getAccessTokenSilently()
+        |                         |
+   any component reads        data hooks attach Bearer token
+   isAuthenticated, user
+</pre>
+
+    <h3>3.3 Silent token renewal</h3>
+<pre class="diagram">
+   t=0      login -> access_token (exp = t+3600s) cached in memory
+            refresh_token cached (rotating)
+   ...
+   t=3500   component calls getAccessTokenSilently()
+            SDK: cached token still valid? -> return it (0 network)
+   ...
+   t=3600   access_token EXPIRED
+   t=3650   component calls getAccessTokenSilently()
+            SDK: expired -> POST /oauth/token
+                 grant_type=refresh_token (rotation: old RT invalidated)
+            &lt;- new access_token + new refresh_token
+            return fresh token transparently to caller
+</pre>
+  </section>
+
+  <!-- ============================================================ 4 -->
+  <section id="analogy">
+    <h2>4. Real-World Analogy</h2>
+    <p>Think of a large conference at a hotel.</p>
+    <ul>
+      <li><strong>Universal Login</strong> = the <em>registration desk in the lobby</em>. You don't prove your identity to each individual session room; you do it once, at a single trusted counter, run by professionals (Auth0).</li>
+      <li><strong>ID token</strong> = your <em>name badge</em>. It says who you are — "Maya, Acme Corp." The session rooms (your React components) glance at it to greet you. You would never hand your badge to a bank teller as payment; likewise you never send an ID token to an API.</li>
+      <li><strong>Access token</strong> = a <em>drink ticket</em> for the bar (your API). It's scoped ("one beer"), time-limited (expires tonight), and the bartender only checks the ticket — not your whole life story.</li>
+      <li><strong>Refresh token</strong> = the <em>wristband</em> that lets you go back to the desk for more drink tickets without re-registering. Rotation means each time you trade it, you get a fresh wristband and the old one is cut off — so a stolen wristband from yesterday is worthless.</li>
+      <li><strong>PKCE code_verifier</strong> = a <em>secret handshake</em> you invent at the door. The bouncer (Auth0) only completes your entry if your handshake matches the hash you whispered earlier. An eavesdropper who overheard your entry code still can't get in.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================ 5 -->
+  <section id="internal">
+    <h2>5. Internal Working — What the SDK Actually Does</h2>
+    <p>When you render <code>&lt;Auth0Provider&gt;</code>, the SDK creates an <code>Auth0Client</code> instance and, on mount, runs <code>checkSession()</code>. Here is the machinery underneath the friendly hook:</p>
+    <ol>
+      <li><strong>Bootstrapping on page load.</strong> The provider checks the URL for <code>code</code> and <code>state</code>. If present (we just came back from Auth0), it calls <code>handleRedirectCallback()</code>: validates <code>state</code> against what it stored (CSRF protection), POSTs the code + verifier to <code>/oauth/token</code>, validates the ID token's signature and <code>nonce</code>, and caches the tokens.</li>
+      <li><strong>Token cache.</strong> By default tokens live in an <em>in-memory</em> cache, scoped by <code>audience + scope</code>. This is the safest store because a closed tab wipes it and JavaScript on other origins can't read it. Optionally you set <code>cacheLocation="localstorage"</code> to survive refreshes — at the cost of XSS exposure (covered in §9).</li>
+      <li><strong>Silent authentication.</strong> To restore a session after a hard refresh (in-memory cache lost), the SDK can call <code>checkSession()</code>, which opens a hidden iframe to <code>/authorize?prompt=none</code>. If the Auth0 session cookie is still valid, Auth0 returns a code without UI. <em>However</em>, third-party-cookie blocking (Safari ITP, Chrome) breaks iframe silent auth — which is exactly why <strong>refresh token rotation</strong> is the modern default for SPAs.</li>
+      <li><strong>Refresh token rotation.</strong> When you enable <code>useRefreshTokens</code> and request the <code>offline_access</code> scope, Auth0 issues a refresh token. Each use returns a <em>new</em> refresh token and invalidates the old one. If a stolen token is replayed, Auth0 detects "automatic reuse" and revokes the whole token family — breach containment by design.</li>
+      <li><strong>React state propagation.</strong> The provider holds <code>{isLoading, isAuthenticated, user, error}</code> in React context. Every state change triggers a re-render of consumers via <code>useAuth0()</code>. <code>isLoading</code> is <code>true</code> until the bootstrap finishes — your UI must wait for it before deciding "logged out."</li>
+    </ol>
+    <div class="callout note"><span class="tag">Note</span><p>The ID token's <code>nonce</code> ties the token to <em>this</em> login attempt (replay protection), while <code>state</code> ties the redirect to <em>this</em> browser tab (CSRF protection). The SDK generates and verifies both for you — but knowing they exist is a certification favorite.</p></div>
+  </section>
+
+  <!-- ============================================================ 6 -->
+  <section id="walkthrough">
+    <h2>6. Code Walkthrough</h2>
+
+    <h3>6.1 Project bootstrap &amp; environment</h3>
+    <p>We use Vite + React + TypeScript. Vite exposes env vars prefixed with <code>VITE_</code> via <code>import.meta.env</code>.</p>
+<pre><code class="language-bash">npm create vite@latest dashly -- --template react-ts
+cd dashly
+npm install @auth0/auth0-react react-router-dom
+</code></pre>
+
+<pre><code class="language-bash"># .env.local  (NEVER commit; these are public-ish but env-specific)
+VITE_AUTH0_DOMAIN=dashly.us.auth0.com
+VITE_AUTH0_CLIENT_ID=AbC123xyzClientId
+VITE_AUTH0_AUDIENCE=https://api.dashly.app
+VITE_API_BASE_URL=http://localhost:8080
+</code></pre>
+    <div class="callout warn"><span class="tag">Warn</span><p>A SPA's <code>client_id</code> and <code>domain</code> are <em>not</em> secrets — they ship in the bundle. The security boundary is the <strong>Allowed Callback URLs</strong> list in the Auth0 dashboard, not hiding the client id. Still keep env vars out of git so you don't mix up dev/prod tenants.</p></div>
+
+    <h3>6.2 Strongly-typed config helper</h3>
+<pre><code class="language-typescript">// src/auth/authConfig.ts
+export interface AuthConfig {
+  domain: string;
+  clientId: string;
+  audience: string;
+  apiBaseUrl: string;
+}
+
+function required(name: string, value: string | undefined): string {
+  if (!value) throw new Error(`Missing env var: ${name}`);
+  return value;
+}
+
+export const authConfig: AuthConfig = {
+  domain:    required("VITE_AUTH0_DOMAIN",    import.meta.env.VITE_AUTH0_DOMAIN),
+  clientId:  required("VITE_AUTH0_CLIENT_ID", import.meta.env.VITE_AUTH0_CLIENT_ID),
+  audience:  required("VITE_AUTH0_AUDIENCE",  import.meta.env.VITE_AUTH0_AUDIENCE),
+  apiBaseUrl: required("VITE_API_BASE_URL",   import.meta.env.VITE_API_BASE_URL),
+};
+</code></pre>
+    <p><strong>Why fail loudly?</strong> A missing audience silently downgrades your access token to an opaque, non-JWT token your API can't validate. Throwing at startup turns a baffling 401 into an obvious config error.</p>
+
+    <h3>6.3 The Auth0Provider wrapper</h3>
+<pre><code class="language-tsx">// src/auth/Auth0ProviderWithNavigate.tsx
+import { Auth0Provider, AppState } from "@auth0/auth0-react";
+import { PropsWithChildren } from "react";
+import { useNavigate } from "react-router-dom";
+import { authConfig } from "./authConfig";
+
+export function Auth0ProviderWithNavigate({ children }: PropsWithChildren) {
+  const navigate = useNavigate();
+
+  // After Auth0 redirects back, restore the route the user was on.
+  const onRedirectCallback = (appState?: AppState) => {
+    navigate(appState?.returnTo ?? window.location.pathname, { replace: true });
+  };
+
+  return (
+    &lt;Auth0Provider
+      domain={authConfig.domain}
+      clientId={authConfig.clientId}
+      authorizationParams={{
+        redirect_uri: window.location.origin,
+        audience: authConfig.audience,
+        scope: "openid profile email offline_access",
+      }}
+      useRefreshTokens={true}
+      useRefreshTokensFallback={true}
+      cacheLocation="memory"
+      onRedirectCallback={onRedirectCallback}
+    &gt;
+      {children}
+    &lt;/Auth0Provider&gt;
+  );
+}
+</code></pre>
+    <p>Line by line:</p>
+    <ul>
+      <li><code>redirect_uri: window.location.origin</code> — where Auth0 sends the code back. Must exactly match an entry in <em>Allowed Callback URLs</em>.</li>
+      <li><code>audience</code> — REQUIRED to get an access token <em>for your API</em>. Omit it and you only get an ID token + a Management-API-shaped token you shouldn't use.</li>
+      <li><code>scope: "openid profile email"</code> — OIDC scopes that populate ID-token claims. <code>offline_access</code> requests a refresh token.</li>
+      <li><code>useRefreshTokens</code> — opt into rotating refresh tokens instead of iframe silent auth (resilient to third-party-cookie blocking).</li>
+      <li><code>useRefreshTokensFallback</code> — if a refresh fails, fall back to a one-time iframe attempt.</li>
+      <li><code>cacheLocation="memory"</code> — the secure default; tokens never touch <code>localStorage</code>.</li>
+      <li><code>onRedirectCallback</code> — co-locates Auth0's redirect with React Router so you land back on the page you started from, not always <code>/</code>.</li>
+    </ul>
+
+    <p>The Provider must sit <em>inside</em> the Router (so <code>useNavigate</code> works) but <em>outside</em> your routes:</p>
+<pre><code class="language-tsx">// src/main.tsx
+import React from "react";
+import ReactDOM from "react-dom/client";
+import { BrowserRouter } from "react-router-dom";
+import { Auth0ProviderWithNavigate } from "./auth/Auth0ProviderWithNavigate";
+import App from "./App";
+
+ReactDOM.createRoot(document.getElementById("root")!).render(
+  &lt;React.StrictMode&gt;
+    &lt;BrowserRouter&gt;
+      &lt;Auth0ProviderWithNavigate&gt;
+        &lt;App /&gt;
+      &lt;/Auth0ProviderWithNavigate&gt;
+    &lt;/BrowserRouter&gt;
+  &lt;/React.StrictMode&gt;
+);
+</code></pre>
+  </section>
+
+  <!-- ============================================================ 7 -->
+  <section id="implementation">
+    <h2>7. Practical Implementation</h2>
+
+    <h3>7.1 Login &amp; logout buttons</h3>
+<pre><code class="language-tsx">// src/components/AuthButtons.tsx
+import { useAuth0 } from "@auth0/auth0-react";
+
+export function LoginButton() {
+  const { loginWithRedirect } = useAuth0();
+  return (
+    &lt;button
+      onClick={() =&gt;
+        loginWithRedirect({
+          appState: { returnTo: window.location.pathname },
+        })
+      }
+    &gt;
+      Log In
+    &lt;/button&gt;
+  );
+}
+
+export function LogoutButton() {
+  const { logout } = useAuth0();
+  return (
+    &lt;button
+      onClick={() =&gt;
+        logout({ logoutParams: { returnTo: window.location.origin } })
+      }
+    &gt;
+      Log Out
+    &lt;/button&gt;
+  );
+}
+</code></pre>
+    <p><code>loginWithRedirect</code> sends the browser to Universal Login. <code>logout</code> clears the local token cache <em>and</em> hits Auth0's <code>/v2/logout</code> to end the SSO session, then returns to <code>returnTo</code> (must be in <em>Allowed Logout URLs</em>). Without the round-trip to Auth0, clicking "Log in" again would silently re-authenticate from the lingering session cookie — surprising users who thought they logged out.</p>
+
+    <h3>7.2 A loading-aware navbar</h3>
+<pre><code class="language-tsx">// src/components/NavBar.tsx
+import { useAuth0 } from "@auth0/auth0-react";
+import { Link } from "react-router-dom";
+import { LoginButton, LogoutButton } from "./AuthButtons";
+import { useRoles } from "../auth/useRoles";
+
+export function NavBar() {
+  const { isAuthenticated, isLoading } = useAuth0();
+  const { hasRole } = useRoles();
+
+  if (isLoading) return &lt;nav&gt;Loading…&lt;/nav&gt;;
+
+  return (
+    &lt;nav&gt;
+      &lt;Link to="/"&gt;Home&lt;/Link&gt;
+      {isAuthenticated &amp;&amp; &lt;Link to="/profile"&gt;Profile&lt;/Link&gt;}
+      {isAuthenticated &amp;&amp; &lt;Link to="/dashboard"&gt;Dashboard&lt;/Link&gt;}
+      {hasRole("admin") &amp;&amp; &lt;Link to="/admin"&gt;Admin&lt;/Link&gt;}
+      {isAuthenticated ? &lt;LogoutButton /&gt; : &lt;LoginButton /&gt;}
+    &lt;/nav&gt;
+  );
+}
+</code></pre>
+
+    <h3>7.3 Protected routes</h3>
+    <p>The SDK ships <code>withAuthenticationRequired</code>, an HOC that redirects to login if the user isn't authenticated. We wrap it so the user returns to the intended page after login:</p>
+<pre><code class="language-tsx">// src/auth/AuthGuard.tsx
+import { withAuthenticationRequired } from "@auth0/auth0-react";
+import { ComponentType } from "react";
+
+const Loading = () =&gt; &lt;div&gt;Redirecting to login…&lt;/div&gt;;
+
+export function protectComponent(Component: ComponentType): ComponentType {
+  return withAuthenticationRequired(Component, {
+    onRedirecting: () =&gt; &lt;Loading /&gt;,
+    // Preserve the deep link so we come back here post-login.
+    returnTo: () =&gt; window.location.pathname + window.location.search,
+  });
+}
+</code></pre>
+<pre><code class="language-tsx">// src/App.tsx
+import { Routes, Route } from "react-router-dom";
+import { NavBar } from "./components/NavBar";
+import { Home } from "./pages/Home";
+import { Profile } from "./pages/Profile";
+import { Dashboard } from "./pages/Dashboard";
+import { Admin } from "./pages/Admin";
+import { protectComponent } from "./auth/AuthGuard";
+import { RoleGuard } from "./auth/RoleGuard";
+
+const ProtectedProfile   = protectComponent(Profile);
+const ProtectedDashboard = protectComponent(Dashboard);
+
+export default function App() {
+  return (
+    &lt;&gt;
+      &lt;NavBar /&gt;
+      &lt;Routes&gt;
+        &lt;Route path="/" element={&lt;Home /&gt;} /&gt;
+        &lt;Route path="/profile"   element={&lt;ProtectedProfile /&gt;} /&gt;
+        &lt;Route path="/dashboard" element={&lt;ProtectedDashboard /&gt;} /&gt;
+        &lt;Route path="/admin"
+               element={&lt;RoleGuard role="admin"&gt;&lt;Admin /&gt;&lt;/RoleGuard&gt;} /&gt;
+      &lt;/Routes&gt;
+    &lt;/&gt;
+  );
+}
+</code></pre>
+    <div class="callout danger"><span class="tag">Danger</span><p>A protected <em>route</em> is UX, not security. Hiding the <code>/admin</code> link or redirecting unauthenticated users does NOT protect data — the bundle and any embedded logic are fully visible. <strong>Real authorization happens at the API</strong>, which validates the access token and its scopes/permissions on every request. The front-end guard just avoids showing broken pages.</p></div>
+
+    <h3>7.4 Reading the user profile / ID-token claims</h3>
+<pre><code class="language-tsx">// src/pages/Profile.tsx
+import { useAuth0 } from "@auth0/auth0-react";
+
+export function Profile() {
+  const { user, isLoading } = useAuth0();
+  if (isLoading) return &lt;p&gt;Loading…&lt;/p&gt;;
+  if (!user) return null;
+
+  return (
+    &lt;section&gt;
+      &lt;img src={user.picture} alt={user.name} width={72} /&gt;
+      &lt;h2&gt;{user.name}&lt;/h2&gt;
+      &lt;p&gt;Email: {user.email} {user.email_verified ? "✓" : "(unverified)"}&lt;/p&gt;
+      &lt;p&gt;Subject (sub): &lt;code&gt;{user.sub}&lt;/code&gt;&lt;/p&gt;
+      &lt;pre&gt;{JSON.stringify(user, null, 2)}&lt;/pre&gt;
+    &lt;/section&gt;
+  );
+}
+</code></pre>
+    <p>The <code>user</code> object is the <strong>decoded ID-token claim set</strong>. <code>user.sub</code> (e.g. <code>auth0|abc123</code>) is the stable, unique user identifier — use it as the primary key, never the email (emails change). Custom claims must be <em>namespaced</em> (a full URI) to survive OIDC's reserved-claim rules; we add them with an Action next.</p>
+
+    <h3>7.5 Adding roles via an Auth0 Action</h3>
+    <p>Roles assigned in Auth0's RBAC aren't in tokens by default. Add a <strong>Login / Post-Login Action</strong> in the dashboard:</p>
+<pre><code class="language-javascript">// Auth0 Post-Login Action
+exports.onExecutePostLogin = async (event, api) => {
+  const namespace = "https://dashly.app";
+  const roles = event.authorization?.roles ?? [];
+  // Put roles in BOTH tokens: ID token for UI, access token for the API.
+  api.idToken.setCustomClaim(`${namespace}/roles`, roles);
+  api.accessToken.setCustomClaim(`${namespace}/roles`, roles);
+};
+</code></pre>
+
+    <h3>7.6 A typed roles hook</h3>
+<pre><code class="language-typescript">// src/auth/useRoles.ts
+import { useAuth0, User } from "@auth0/auth0-react";
+
+const ROLES_CLAIM = "https://dashly.app/roles";
+
+interface UserWithRoles extends User {
+  [ROLES_CLAIM]?: string[];
+}
+
+export function useRoles() {
+  const { user } = useAuth0&lt;UserWithRoles&gt;();
+  const roles: string[] = user?.[ROLES_CLAIM] ?? [];
+  const hasRole = (role: string) =&gt; roles.includes(role);
+  return { roles, hasRole };
+}
+</code></pre>
+
+    <h3>7.7 The role guard component</h3>
+<pre><code class="language-tsx">// src/auth/RoleGuard.tsx
+import { PropsWithChildren } from "react";
+import { useRoles } from "./useRoles";
+import { protectComponent } from "./AuthGuard";
+
+function RoleGuardInner({ role, children }: PropsWithChildren&lt;{ role: string }&gt;) {
+  const { hasRole } = useRoles();
+  if (!hasRole(role)) return &lt;p&gt;403 — You do not have access to this page.&lt;/p&gt;;
+  return &lt;&gt;{children}&lt;/&gt;;
+}
+
+// First require authentication, THEN check the role.
+export const RoleGuard = protectComponent(RoleGuardInner) as typeof RoleGuardInner;
+</code></pre>
+
+    <h3>7.8 Calling a protected API (the access-token hook)</h3>
+<pre><code class="language-typescript">// src/api/useApi.ts
+import { useAuth0 } from "@auth0/auth0-react";
+import { useCallback } from "react";
+import { authConfig } from "../auth/authConfig";
+
+export function useApi() {
+  const { getAccessTokenSilently } = useAuth0();
+
+  const callApi = useCallback(
+    async &lt;T,&gt;(path: string, init: RequestInit = {}): Promise&lt;T&gt; =&gt; {
+      // SDK returns cached token if valid, else refreshes silently.
+      const token = await getAccessTokenSilently({
+        authorizationParams: { audience: authConfig.audience },
+      });
+
+      const res = await fetch(`${authConfig.apiBaseUrl}${path}`, {
+        ...init,
+        headers: {
+          ...(init.headers ?? {}),
+          Authorization: `Bearer ${token}`,
+          "Content-Type": "application/json",
+        },
+      });
+
+      if (res.status === 401) throw new Error("Unauthorized — token rejected by API");
+      if (res.status === 403) throw new Error("Forbidden — missing required scope/permission");
+      if (!res.ok) throw new Error(`API error ${res.status}`);
+      return (await res.json()) as T;
+    },
+    [getAccessTokenSilently]
+  );
+
+  return { callApi };
+}
+</code></pre>
+
+<pre><code class="language-tsx">// src/pages/Dashboard.tsx
+import { useEffect, useState } from "react";
+import { useApi } from "../api/useApi";
+
+interface Metrics { activeUsers: number; revenue: number; }
+
+export function Dashboard() {
+  const { callApi } = useApi();
+  const [data, setData]   = useState&lt;Metrics | null&gt;(null);
+  const [error, setError] = useState&lt;string | null&gt;(null);
+
+  useEffect(() =&gt; {
+    let cancelled = false;
+    callApi&lt;Metrics&gt;("/api/metrics")
+      .then((d) =&gt; { if (!cancelled) setData(d); })
+      .catch((e) =&gt; { if (!cancelled) setError(e.message); });
+    return () =&gt; { cancelled = true; };
+  }, [callApi]);
+
+  if (error) return &lt;p&gt;Error: {error}&lt;/p&gt;;
+  if (!data) return &lt;p&gt;Loading metrics…&lt;/p&gt;;
+  return (
+    &lt;section&gt;
+      &lt;h2&gt;Active users: {data.activeUsers}&lt;/h2&gt;
+      &lt;h2&gt;Revenue: ${data.revenue.toLocaleString()}&lt;/h2&gt;
+    &lt;/section&gt;
+  );
+}
+</code></pre>
+    <div class="callout tip"><span class="tag">Tip</span><p>Wrap <code>callApi</code> in <code>useCallback</code> with <code>getAccessTokenSilently</code> as a dependency. Without it, a new function identity each render makes your <code>useEffect</code> fire in a loop — a classic React + data-fetching bug.</p></div>
+  </section>
+
+  <!-- ============================================================ 8 -->
+  <section id="architecture">
+    <h2>8. Production Architecture</h2>
+<pre class="diagram">
+                         INTERNET
+                            |
+        +-------------------+--------------------+
+        |                                        |
+        v                                        v
+   +---------------------+              +----------------------+
+   |  CDN / Static Host  |              |   Auth0 Tenant       |
+   |  (S3+CloudFront,    |              |  prod: app.auth0.com |
+   |   Vercel, Netlify)  |  redirect    |  - Universal Login   |
+   |  serves React SPA   |&lt;------------&gt;|  - /authorize /token |
+   |  (immutable bundle) |   PKCE       |  - Actions (roles)   |
+   +----------+----------+              |  - RBAC, MFA, attack |
+              |  Bearer token            |    protection        |
+              v                          +----------------------+
+   +---------------------+                         ^
+   |   Your API (BFF or  |  validate JWT           |
+   |   resource server)  |--- fetch JWKS ----------+
+   |   - verify signature|   (cache public keys)
+   |   - check aud/iss   |
+   |   - enforce scopes  |
+   +---------------------+
+</pre>
+    <ul>
+      <li><strong>One tenant per environment.</strong> Separate <code>dev</code>, <code>staging</code>, and <code>prod</code> Auth0 tenants. Manage them as code with the Auth0 Deploy CLI or Terraform so callback URLs, Actions, and APIs are reproducible.</li>
+      <li><strong>SPA app per origin.</strong> Each deploy origin must be listed in Allowed Callback / Logout / Web Origins. Use a custom domain (<code>auth.dashly.app</code>) so Universal Login is first-party — this dodges third-party-cookie issues and looks trustworthy.</li>
+      <li><strong>Immutable, cache-busted bundles.</strong> Vite emits hashed filenames; serve <code>index.html</code> with <code>no-cache</code> and assets with long-lived caching.</li>
+      <li><strong>BFF option.</strong> For higher security you can adopt a Backend-For-Frontend: a thin server holds tokens in an HttpOnly cookie session and proxies API calls, so no token ever reaches JavaScript. Heavier to operate, but immune to token theft via XSS.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================ 9 -->
+  <section id="security">
+    <h2>9. Security Analysis</h2>
+    <h3>9.1 The threat model of a public client</h3>
+    <table>
+      <thead><tr><th>Threat</th><th>Mitigation in this app</th></tr></thead>
+      <tbody>
+        <tr><td>Authorization code interception</td><td>PKCE (S256) — code is useless without the in-memory verifier.</td></tr>
+        <tr><td>CSRF on the redirect</td><td><code>state</code> parameter generated &amp; verified by the SDK.</td></tr>
+        <tr><td>ID-token replay</td><td><code>nonce</code> bound to the login attempt; signature + <code>iss</code>/<code>aud</code>/<code>exp</code> checks.</td></tr>
+        <tr><td>Token theft via XSS</td><td><code>cacheLocation="memory"</code> (no localStorage); strict CSP; sanitize all rendered HTML.</td></tr>
+        <tr><td>Stolen refresh token replayed</td><td>Refresh token <strong>rotation</strong> + automatic reuse detection revokes the family.</td></tr>
+        <tr><td>Open redirect / token leak</td><td>Strict Allowed Callback/Logout/Web Origins allowlists.</td></tr>
+        <tr><td>Privilege escalation</td><td>Roles enforced at the API via access-token permissions, not just hidden UI.</td></tr>
+      </tbody>
+    </table>
+
+    <div class="callout danger"><span class="tag">Danger</span><p><strong>XSS is the apex predator of SPAs.</strong> If an attacker can run JS in your origin, they can read in-memory tokens, call <code>getAccessTokenSilently()</code>, and impersonate the user. Memory caching narrows the window (no persistent token to scrape) but does not eliminate it. Defense in depth: a strict Content-Security-Policy, no <code>dangerouslySetInnerHTML</code> with untrusted input, dependency auditing, and short token lifetimes.</p></div>
+
+    <h3>9.2 localStorage vs memory caching</h3>
+    <table>
+      <thead><tr><th>Aspect</th><th><code>memory</code> (default)</th><th><code>localstorage</code></th></tr></thead>
+      <tbody>
+        <tr><td>XSS exposure</td><td>Lower (token gone on tab close)</td><td>Higher (persistent, readable by any script)</td></tr>
+        <tr><td>Survives hard refresh</td><td>No (needs silent re-auth)</td><td>Yes</td></tr>
+        <tr><td>Recommended for</td><td>Default — use with refresh-token rotation</td><td>Only if refresh fails &amp; you accept the risk</td></tr>
+      </tbody>
+    </table>
+    <p>The modern, recommended combo is <code>cacheLocation="memory"</code> + <code>useRefreshTokens</code>. On refresh, the rotating refresh token (held in memory and, internally, a fallback) silently re-establishes the session without persisting an access token to disk.</p>
+  </section>
+
+  <!-- ============================================================ 10 -->
+  <section id="performance">
+    <h2>10. Performance Considerations</h2>
+    <ul>
+      <li><strong>Token caching is your friend.</strong> <code>getAccessTokenSilently()</code> returns the cached token with zero network cost until it expires. Do <em>not</em> pre-fetch a token on every keystroke; call it lazily in your API layer.</li>
+      <li><strong>Avoid the render-loop trap.</strong> Memoize API functions (<code>useCallback</code>) and effect dependencies; an unmemoized token getter triggers infinite refetches.</li>
+      <li><strong>De-duplicate concurrent refreshes.</strong> The SDK coalesces simultaneous <code>getAccessTokenSilently()</code> calls into a single token request, so firing five API calls at once won't trigger five refreshes.</li>
+      <li><strong>Lazy-load protected pages.</strong> Use <code>React.lazy</code> + <code>Suspense</code> for <code>/admin</code> and <code>/dashboard</code> so unauthenticated visitors never download admin code.</li>
+      <li><strong>First-paint cost of bootstrap.</strong> The provider's <code>isLoading</code> phase includes a possible silent-auth round trip. Render a lightweight skeleton, not a blank screen, while <code>isLoading</code> is true.</li>
+      <li><strong>JWKS caching is server-side.</strong> Your API caches Auth0's signing keys; it does not refetch them per request. (Mentioned because interviewers probe the full path.)</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================ 11 -->
+  <section id="mistakes">
+    <h2>11. Common Mistakes</h2>
+    <ol>
+      <li><strong>Sending the ID token to the API.</strong> APIs must reject ID tokens — wrong audience. Always use the access token from <code>getAccessTokenSilently()</code>.</li>
+      <li><strong>Forgetting <code>audience</code>.</strong> No audience → no API access token. Symptom: 401 from your API even though login "works."</li>
+      <li><strong>Treating route guards as security.</strong> Hiding UI is not authorization. Enforce on the server.</li>
+      <li><strong>Ignoring <code>isLoading</code>.</strong> Rendering "Please log in" during the loading phase flashes the wrong UI and may trigger redundant redirects.</li>
+      <li><strong>Putting the Provider outside the Router</strong> (or the Router outside the Provider when you need <code>useNavigate</code> in the callback) — breaks <code>onRedirectCallback</code> navigation.</li>
+      <li><strong>Non-namespaced custom claims.</strong> <code>roles</code> is silently dropped; <code>https://dashly.app/roles</code> survives.</li>
+      <li><strong>Mismatched callback URLs.</strong> <code>http://localhost:3000</code> vs <code>http://localhost:3000/</code> (trailing slash) → "Callback URL mismatch."</li>
+      <li><strong>Storing tokens in <code>localStorage</code> by reflex.</strong> Prefer memory + refresh rotation.</li>
+      <li><strong>Calling <code>getAccessTokenSilently</code> in render</strong> instead of in an effect/handler — causes loops and unhandled promise warnings.</li>
+      <li><strong>Logging tokens to the console</strong> "to debug." They are bearer credentials; treat them like passwords.</li>
+    </ol>
+  </section>
+
+  <!-- ============================================================ 12 -->
+  <section id="best-practices">
+    <h2>12. Best Practices</h2>
+    <ul>
+      <li>Use <strong>memory cache + refresh-token rotation</strong> as the default token strategy.</li>
+      <li>Always set an <strong>audience</strong> and request only the <strong>scopes you need</strong> (least privilege).</li>
+      <li>Centralize API calls in a <strong>single hook</strong> (<code>useApi</code>) so token handling and error mapping live in one place.</li>
+      <li>Use a <strong>custom domain</strong> for Auth0 to keep login first-party.</li>
+      <li>Manage tenants <strong>as code</strong> (Deploy CLI / Terraform); never click-configure prod by hand.</li>
+      <li>Add a <strong>strict CSP</strong> and never render untrusted HTML.</li>
+      <li>Use <code>user.sub</code> as the canonical user key; <strong>namespace</strong> all custom claims.</li>
+      <li>Show a <strong>loading state</strong> while <code>isLoading</code>; never assume "logged out" prematurely.</li>
+      <li>Type your claims (<code>useAuth0&lt;UserWithRoles&gt;()</code>) so role checks are compile-checked.</li>
+      <li>Re-verify roles/permissions <strong>on the server</strong> — the SPA's checks are cosmetic.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================ 13 -->
+  <section id="interview">
+    <h2>13. Interview Questions (with Model Answers)</h2>
+
+    <h3>Q1. Why must a React SPA use Authorization Code + PKCE instead of the Implicit flow?</h3>
+    <p><strong>Model answer:</strong> A SPA is a public client with no place to store a secret. Implicit returned tokens directly in the URL fragment, exposing them to history, referrers, and scripts, with no client authentication. Authorization Code + PKCE returns a one-time code that is exchanged for tokens via a back-channel-style POST; the code is bound to a per-request <code>code_verifier</code> that never leaves the browser, so an intercepted code can't be redeemed. Implicit is deprecated; PKCE is the OAuth 2.1 standard for public clients.</p>
+
+    <h3>Q2. What is the difference between the ID token and the access token, and where does each go?</h3>
+    <p><strong>Model answer:</strong> The ID token (audience = your client) authenticates the <em>user to the app</em>; it's for reading profile claims in the front end and must never be sent to an API. The access token (audience = your API) authorizes <em>requests to the API</em> and goes in the <code>Authorization: Bearer</code> header. Conflating them causes either insecure APIs (accepting ID tokens) or broken calls (sending the wrong audience).</p>
+
+    <h3>Q3. How does silent token renewal work, and why prefer refresh-token rotation over iframe silent auth?</h3>
+    <p><strong>Model answer:</strong> <code>getAccessTokenSilently()</code> returns a cached token until expiry, then renews. Historically renewal used a hidden iframe to <code>/authorize?prompt=none</code>, relying on the Auth0 session cookie — but browsers block third-party cookies, breaking it. Refresh-token rotation (with <code>offline_access</code>) instead exchanges a refresh token for a new access token <em>and</em> a new refresh token, invalidating the old one. Reuse detection revokes the whole family if a stolen token is replayed, making it both resilient and breach-resistant.</p>
+
+    <h3>Q4. Is hiding the admin route in React enough to secure admin features?</h3>
+    <p><strong>Model answer:</strong> No. The bundle is public; anyone can read it, forge requests, or bypass the router. Front-end guards are UX only. The API must validate the access token and enforce roles/permissions (scopes) on every request. Defense lives on the server.</p>
+
+    <h3>Q5. How do roles end up in the token, and where do you enforce them?</h3>
+    <p><strong>Model answer:</strong> Assign roles via Auth0 RBAC, then a Post-Login Action sets a <em>namespaced</em> custom claim on the access (and optionally ID) token. The SPA reads the ID-token claim to toggle UI; the API reads the access-token permissions/claim to authorize the actual operation. Enforcement is on the API.</p>
+
+    <h3>Q6. Where should tokens be stored in a SPA, and why?</h3>
+    <p><strong>Model answer:</strong> In memory (the SDK default), combined with refresh-token rotation. Memory avoids persistent XSS-readable storage; rotation lets the session survive refresh without writing an access token to <code>localStorage</code>. For maximum security, a BFF holds tokens in an HttpOnly cookie so JS never sees them at all.</p>
+  </section>
+
+  <!-- ============================================================ 14 -->
+  <section id="certification">
+    <h2>14. Certification Tips</h2>
+    <ul>
+      <li><strong>Know the flow name:</strong> SPAs use <em>Authorization Code Flow with PKCE</em>. Implicit is deprecated — expect a "which flow?" question.</li>
+      <li><strong>Application type matters:</strong> register the app as <em>Single Page Application</em> (no secret). Choosing "Regular Web App" is a trap answer.</li>
+      <li><strong>Audience vs scope:</strong> audience selects the API; scopes request permissions. Missing audience → no API token.</li>
+      <li><strong>Custom claims must be namespaced</strong> with a non-Auth0 URL; otherwise they're stripped.</li>
+      <li><strong>Allowed URLs:</strong> Callback (login return), Logout (post-logout return), Web Origins (silent auth / CORS). Map each to its purpose.</li>
+      <li><strong>refresh token rotation + reuse detection</strong> is the recommended SPA token strategy — memorize the terms.</li>
+      <li><strong>Universal Login</strong> over Embedded Login: better security, MFA, attack protection, and SSO out of the box.</li>
+      <li>The <code>user</code> object from <code>useAuth0()</code> equals the <strong>decoded ID token</strong> claims, not API data.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================ 15 -->
+  <section id="hands-on">
+    <h2>15. Hands-On Exercises</h2>
+    <ol>
+      <li><strong>Tenant setup.</strong> Create a free Auth0 tenant, register a SPA, and an API (Identifier = <code>https://api.dashly.app</code>). Record domain, client id, and audience.</li>
+      <li><strong>Allowed URLs.</strong> Set Callback, Logout, and Web Origins to <code>http://localhost:5173</code>. Trigger a login and confirm the redirect succeeds.</li>
+      <li><strong>Inspect the tokens.</strong> Temporarily log the decoded ID token (<code>user</code>) and paste the access token into <code>jwt.io</code>. Identify <code>iss</code>, <code>aud</code>, <code>exp</code>, <code>scope</code>. Then remove the logging.</li>
+      <li><strong>Protect a route.</strong> Wrap <code>/dashboard</code> with <code>withAuthenticationRequired</code> and verify that visiting it while logged out redirects to Universal Login and returns you afterward.</li>
+      <li><strong>Add a role.</strong> Create an <code>admin</code> role, assign it to your user, write the Post-Login Action, and confirm the namespaced claim appears in the ID token.</li>
+      <li><strong>Break it on purpose.</strong> Remove <code>audience</code>, call the API, observe the 401, then restore it. Internalize the symptom.</li>
+    </ol>
+  </section>
+
+  <!-- ============================================================ 16 -->
+  <section id="assignment">
+    <h2>16. Assignment</h2>
+    <p>Extend Dashly into a small multi-feature app and submit the repo:</p>
+    <ul>
+      <li>Implement <code>Home</code> (public), <code>Profile</code> (protected, shows claims), <code>Dashboard</code> (protected, calls <code>/api/metrics</code>), and <code>Admin</code> (admin-only).</li>
+      <li>Build the <code>useApi</code> hook with proper 401/403 handling and surface user-friendly errors.</li>
+      <li>Add a <strong>"Re-authenticate for sensitive action"</strong> button on Admin that calls <code>loginWithRedirect</code> / <code>getAccessTokenWithPopup</code> with <code>max_age: 0</code> to force a fresh login (step-up auth).</li>
+      <li>Write a <code>README</code> documenting the env vars and the Auth0 dashboard settings required to run it.</li>
+      <li><strong>Stretch:</strong> add an Express resource server (preview of Chapter 18) that validates the JWT and enforces an <code>admin</code> permission on a <code>/api/admin/*</code> route.</li>
+    </ul>
+    <p><strong>Acceptance criteria:</strong> no token ever touches <code>localStorage</code>; the admin link is hidden for non-admins AND the admin API route returns 403 for them; a hard refresh keeps the user logged in via silent renewal.</p>
+  </section>
+
+  <!-- ============================================================ 17 -->
+  <section id="mini-project">
+    <h2>17. Mini Project — "TaskVault"</h2>
+    <p>Build a personal task manager that demonstrates the full token lifecycle.</p>
+<pre class="diagram">
+   TaskVault
+   =========
+   Public:     "/"           marketing page + Login
+   Protected:  "/tasks"      list/create tasks  -> GET/POST /api/tasks
+   Protected:  "/account"    profile + token expiry countdown
+   Admin:      "/admin/users" list all users    -> GET /api/users (admin)
+
+   Token lifecycle to showcase:
+   login -> access token (1h) -> create tasks (Bearer) ->
+   leave tab 65 min -> return -> silent refresh -> create again (no re-login)
+</pre>
+    <p><strong>Requirements:</strong></p>
+    <ul>
+      <li>Use the <code>useApi</code> hook for all task CRUD; tasks are scoped to <code>user.sub</code> on the server.</li>
+      <li>On <code>/account</code>, decode the access token's <code>exp</code> and render a live countdown; when it nears zero, prove silent refresh resets it.</li>
+      <li>Gate <code>/admin/users</code> with <code>RoleGuard role="admin"</code> AND an admin-only API permission.</li>
+      <li>Add request scopes <code>read:tasks write:tasks</code> and have the API enforce them.</li>
+    </ul>
+    <p><strong>Deliverable:</strong> a working SPA + minimal API, plus a short write-up of which token guards which boundary.</p>
+  </section>
+
+  <!-- ============================================================ 18 -->
+  <section id="quiz">
+    <h2>18. Quiz — 22 Questions</h2>
+    <ol>
+      <li>Which OAuth flow does a React SPA use, and why?</li>
+      <li>What problem does PKCE's <code>code_verifier</code>/<code>code_challenge</code> pair solve?</li>
+      <li>What does the <code>state</code> parameter protect against?</li>
+      <li>What does the <code>nonce</code> protect against?</li>
+      <li>Which token do you put in <code>Authorization: Bearer</code> when calling your API?</li>
+      <li>Why must you never send the ID token to your API?</li>
+      <li>What happens if you omit <code>audience</code> from <code>authorizationParams</code>?</li>
+      <li>What is the relationship between the <code>user</code> object and the ID token?</li>
+      <li>Why must custom claims be namespaced with a URL?</li>
+      <li>Where does the Auth0Provider belong relative to the Router, and why?</li>
+      <li>What does <code>withAuthenticationRequired</code> do, and why is it not security?</li>
+      <li>Why prefer <code>cacheLocation="memory"</code> over <code>localstorage</code>?</li>
+      <li>What two things does refresh-token <em>rotation</em> give you over plain refresh tokens?</li>
+      <li>What is "automatic reuse detection"?</li>
+      <li>Why did iframe-based silent auth become unreliable?</li>
+      <li>What scope must you request to receive a refresh token?</li>
+      <li>What does <code>getAccessTokenSilently()</code> return when the cached token is still valid?</li>
+      <li>Name two symptoms of a missing/incorrect Allowed Callback URL.</li>
+      <li>How do roles get into a token, and where are they <em>enforced</em>?</li>
+      <li>Why wrap <code>callApi</code> in <code>useCallback</code>?</li>
+      <li>What does <code>logout</code> do beyond clearing the local cache?</li>
+      <li>What is a BFF and what attack does it neutralize?</li>
+    </ol>
+
+    <details>
+      <summary>Show answer key</summary>
+      <ol>
+        <li>Authorization Code Flow with PKCE — a SPA is a public client with no secret; PKCE secures the code exchange.</li>
+        <li>It binds the authorization code to a per-login secret so an intercepted code can't be redeemed without the in-memory verifier.</li>
+        <li>CSRF on the redirect — it ties the callback to the originating browser session.</li>
+        <li>ID-token replay — it binds the token to a single login attempt.</li>
+        <li>The access token (audience = your API).</li>
+        <li>Its audience is your client, not the API; APIs must reject it, and it carries no API authorization.</li>
+        <li>You don't get an API access token — calls to your API fail with 401.</li>
+        <li><code>user</code> is the decoded set of ID-token claims (sub, name, email, custom claims).</li>
+        <li>OIDC reserves non-namespaced names; un-namespaced custom claims are stripped from the token.</li>
+        <li>The Provider goes inside the Router so <code>onRedirectCallback</code> can use <code>useNavigate</code> to restore the route.</li>
+        <li>It redirects unauthenticated users to login; it's UX only because the bundle/logic are public — real auth is server-side.</li>
+        <li>Memory isn't readable by other scripts/persistent, reducing XSS token-theft exposure.</li>
+        <li>(1) A new refresh token each use, and (2) reuse detection that revokes the family if an old token is replayed.</li>
+        <li>Detection that an already-used (rotated-out) refresh token was presented again, signaling theft → revoke the token family.</li>
+        <li>Browsers block third-party cookies, so the hidden iframe to <code>/authorize?prompt=none</code> can't read the Auth0 session.</li>
+        <li><code>offline_access</code>.</li>
+        <li>The cached token, with no network request.</li>
+        <li>"Callback URL mismatch" error on login; or login succeeds but the redirect back is rejected.</li>
+        <li>Assigned via RBAC, injected as a namespaced claim by a Post-Login Action; enforced on the API (front-end checks are cosmetic).</li>
+        <li>To keep a stable function identity so effects depending on it don't loop.</li>
+        <li>It also ends the Auth0 SSO session via <code>/v2/logout</code> and returns to an Allowed Logout URL.</li>
+        <li>Backend-For-Frontend: a server holding tokens in HttpOnly cookies, neutralizing token theft via XSS since JS never sees tokens.</li>
+      </ol>
+      <p><em>(22 questions; answer 13 lists the two benefits, matching the question.)</em></p>
+    </details>
+  </section>
+
+  <!-- ============================================================ 19 -->
+  <section id="cheatsheet">
+    <h2>19. Cheat Sheet</h2>
+<pre><code class="language-tsx">// Install
+npm i @auth0/auth0-react react-router-dom
+
+// Provider (inside Router)
+&lt;Auth0Provider
+  domain={DOMAIN} clientId={CLIENT_ID}
+  authorizationParams={{
+    redirect_uri: window.location.origin,
+    audience: API_AUDIENCE,
+    scope: "openid profile email offline_access",
+  }}
+  useRefreshTokens cacheLocation="memory"
+  onRedirectCallback={cb}
+/&gt;
+
+// The hook
+const {
+  isLoading, isAuthenticated, user, error,
+  loginWithRedirect, logout, getAccessTokenSilently,
+} = useAuth0();
+
+// Login / Logout
+loginWithRedirect({ appState: { returnTo: path } });
+logout({ logoutParams: { returnTo: window.location.origin } });
+
+// Protect a component
+const Protected = withAuthenticationRequired(Page);
+
+// Call an API
+const token = await getAccessTokenSilently({
+  authorizationParams: { audience: API_AUDIENCE },
+});
+fetch(url, { headers: { Authorization: `Bearer ${token}` } });
+
+// Read roles (namespaced claim)
+const roles = user?.["https://dashly.app/roles"] ?? [];
+</code></pre>
+    <table>
+      <thead><tr><th>Dashboard setting</th><th>Purpose</th></tr></thead>
+      <tbody>
+        <tr><td>Allowed Callback URLs</td><td>Where Auth0 returns after login</td></tr>
+        <tr><td>Allowed Logout URLs</td><td>Where Auth0 returns after logout</td></tr>
+        <tr><td>Allowed Web Origins</td><td>CORS / silent-auth origins</td></tr>
+        <tr><td>API → Identifier</td><td>The <code>audience</code> value</td></tr>
+        <tr><td>Action → Post-Login</td><td>Inject namespaced role claims</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- ============================================================ 20 -->
+  <section id="takeaways">
+    <h2>20. Key Takeaways</h2>
+    <div class="callout key"><span class="tag">Key</span><p>A React SPA is a <strong>public client</strong>: it authenticates with <strong>Authorization Code + PKCE</strong> through Auth0's Universal Login and never handles raw credentials or secrets.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p>The <strong>ID token</strong> identifies the user to your front end (read claims via <code>useAuth0().user</code>); the <strong>access token</strong> authorizes calls to your API (<code>Bearer</code> header). Never mix them up.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p>Wrap your app in <code>&lt;Auth0Provider&gt;</code> (inside the Router), use <code>loginWithRedirect</code>/<code>logout</code>, and protect routes with <code>withAuthenticationRequired</code> — but remember route guards are <strong>UX, not security</strong>.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p>Get API tokens via <code>getAccessTokenSilently()</code>, which caches and silently renews using <strong>refresh-token rotation</strong>. Use <code>cacheLocation="memory"</code> for the best XSS posture.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p>Roles arrive as <strong>namespaced custom claims</strong> via a Post-Login Action; render role-based UI in React, but <strong>enforce authorization on the API</strong> every time.</p></div>
+  </section>
+
+  <nav class="pager">
+    <a class="prev" href="chapter-16.html">← Previous</a>
+    <a class="next" href="chapter-18.html">Next →</a>
+  </nav>
+</main>
+<footer class="site-footer">Master Auth0 End-to-End · Chapter 17 of 32</footer>
+</body>
+</html>

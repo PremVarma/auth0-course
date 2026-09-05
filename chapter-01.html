@@ -1,0 +1,615 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 1 — What is Identity? | Master Auth0</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">🔐 Master Auth0</a>
+  <nav class="topnav">
+    <a href="index.html">← Prev</a>
+    <a href="index.html">Contents</a>
+    <a href="chapter-02.html">Next →</a>
+  </nav>
+</header>
+<main class="container">
+  <div class="chapter-head">
+    <span class="phase">Phase 1 · Identity Fundamentals</span>
+    <h1>Chapter 1 — What is Identity?</h1>
+    <p class="lead">Before you can secure a system, you must answer one deceptively simple question: <em>who is this?</em> Auth0, OAuth, OpenID Connect, JWTs, MFA, RBAC — every advanced topic in this course is built on one foundation: a precise understanding of what <strong>identity</strong> means. In this chapter we build that foundation from absolute first principles. We will separate the <em>entity</em> (the real person or machine) from its <em>identity</em> (a context-bound representation), nail down the difference between authentication and authorization, define the vocabulary the rest of the industry uses loosely but you will use precisely, and end with how cryptographic trust lets two strangers on the internet believe each other. By the end you will think about identity the way a senior architect does — and that mindset is what passes certifications and interviews.</p>
+  </div>
+
+  <!-- 1 -->
+  <section id="theory">
+    <h2>1. Theory — Identity from First Principles</h2>
+    <p>Start with the most fundamental distinction in this entire field: the difference between an <strong>entity</strong> and an <strong>identity</strong>.</p>
+    <p>An <strong>entity</strong> is the real thing that exists in the world — a flesh-and-blood human, a running server, an IoT sensor, a background job. It has continuous existence whether or not any computer knows about it. You, reading this, are an entity.</p>
+    <p>An <strong>identity</strong> is a <em>representation</em> of an entity inside a particular system, for a particular purpose, in a particular context. It is data: a collection of attributes and identifiers that a system stores and uses to recognize an entity again. Crucially, identity is <strong>not</strong> the entity — it is a model of it, and like all models it is a simplification.</p>
+    <div class="callout key"><span class="tag">Key</span><p>One entity has <strong>many</strong> identities. You are a single person (one entity), but you have a tax identity to the government, a patient identity to your hospital, a customer identity to your bank, a username to GitHub, and a "row in the users table" to every app you sign up for. None of these <em>is</em> you. Each is a context-specific shadow of you.</p></div>
+    <h3>Why "context-dependent" is the whole game</h3>
+    <p>Identity only has meaning <em>relative to a context</em> (sometimes called a <em>domain</em> or <em>security realm</em>). The same identifier means different things in different contexts, and the same entity is described by completely different attributes depending on who is asking and why.</p>
+    <ul>
+      <li>To your <strong>airline</strong>, your identity is a frequent-flyer number, a passport number, and a seat preference.</li>
+      <li>To your <strong>doctor</strong>, your identity is a medical record number, blood type, and allergy list.</li>
+      <li>To <strong>Netflix</strong>, your identity is an email, a billing token, and a watch history.</li>
+    </ul>
+    <p>The airline does not know your blood type; Netflix does not know your seat preference. Each system stores exactly the attributes it needs and no more. This is not an accident — it is the principle of <strong>data minimization</strong>, and it is both good security and (under regulations like GDPR) the law.</p>
+    <p>So our working definition, which we will refine all course long:</p>
+    <blockquote><strong>Identity</strong> = a set of attributes (<em>claims</em>) about an entity, scoped to a context, that lets a system <em>recognize</em> that entity and <em>decide what it may do</em>.</blockquote>
+    <p>"Recognize" is authentication. "Decide what it may do" is authorization. Those two verbs are the spine of this chapter and of all of Auth0.</p>
+  </section>
+
+  <!-- 2 -->
+  <section id="story">
+    <h2>2. Story-Based Explanation — Maya's Tuesday</h2>
+    <p>Follow Maya through one ordinary morning and watch identity shape-shift around her.</p>
+    <p><strong>7:00 a.m.</strong> Maya unlocks her phone with her face. The phone does not know "Maya the person" — it stored a mathematical map of her face once (enrollment) and now compares the live face to that map. It <em>authenticates</em> her: "this is the enrolled owner." It does not need her name, her job, or her passport. Context: <em>this device</em>.</p>
+    <p><strong>8:30 a.m.</strong> She badges into her office. The reader checks her badge ID against a list. The door does not care who Maya is as a human; it cares whether badge #4471 is allowed through door 3 at 8:30. Here authentication (valid badge) and authorization (this door, this time) happen in one swipe. Context: <em>this building</em>.</p>
+    <p><strong>10:00 a.m.</strong> She logs into the company dashboard. She types a password — a <em>secret only she should know</em>. The system authenticates her, then looks up her <em>role</em> ("Manager") to decide she may approve expenses but not edit payroll. Context: <em>this application</em>.</p>
+    <p><strong>1:00 p.m.</strong> She pays for lunch by tapping her bank card. The terminal never learns her name; it gets a cryptographically signed token from the card proving "an account exists and authorizes this much money." The merchant <em>trusts the bank's signature</em> without ever talking to Maya's bank directly in that instant. Context: <em>the payment network</em>.</p>
+    <div class="callout note"><span class="tag">Note</span><p>One Maya. Four systems. Four totally different identities, four different things being proven, and — in the lunch case — <strong>trust between strangers</strong> made possible by a signature. Hold onto that last idea; it becomes federation and JWTs later.</p></div>
+  </section>
+
+  <!-- 3 -->
+  <section id="diagrams">
+    <h2>3. ASCII Diagrams — The Mental Models</h2>
+    <h3>One entity, many identities</h3>
+    <pre class="diagram">
+                       +---------------------+
+                       |   ENTITY: a human   |
+                       |     "Maya Rao"      |
+                       +----------+----------+
+                                  |
+        +-------------------+-----+------+-------------------+
+        |                   |            |                   |
+        v                   v            v                   v
+  +-----------+      +-----------+  +-----------+      +-----------+
+  | Govt ID   |      |  Bank     |  |  GitHub   |      | Hospital  |
+  | tax no.,  |      | acct no., |  | username, |      | MRN,      |
+  | Aadhaar   |      | KYC docs  |  | email,SSH |      | blood grp |
+  +-----------+      +-----------+  +-----------+      +-----------+
+   context A          context B      context C          context D
+
+  Same entity. Four identities. No single one "is" Maya.
+    </pre>
+    <h3>The two questions every secure request must answer</h3>
+    <pre class="diagram">
+   Incoming request
+        |
+        v
+  +------------------------+      NO    +-----------------+
+  | AUTHENTICATION         |----------->|  401            |
+  | "Who are you?"         |            |  Unauthorized   |
+  | (prove your identity)  |            |  (not proven)   |
+  +-----------+------------+            +-----------------+
+              | YES (identity established)
+              v
+  +------------------------+      NO    +-----------------+
+  | AUTHORIZATION          |----------->|  403            |
+  | "Are you ALLOWED to    |            |  Forbidden      |
+  |  do THIS?"             |            |  (known, denied)|
+  +-----------+------------+            +-----------------+
+              | YES
+              v
+        +-----------+
+        |  200 OK   |   do the action
+        +-----------+
+    </pre>
+    <h3>The vocabulary, layered</h3>
+    <pre class="diagram">
+  ENTITY  ──represented by──►  IDENTITY
+                                  |
+                       (in an auth flow it becomes a)
+                                  v
+                              PRINCIPAL ──identified by──► SUBJECT (sub)
+                                  |
+                          carries a bag of
+                                  v
+                               CLAIMS  (name, email, role, dept ...)
+                                  |
+                  some claims grant      and map to
+                                  v
+                          ROLES ──bundle──► PERMISSIONS
+                                              ^
+                                              |  evaluated against
+                                           POLICIES (the rules)
+    </pre>
+  </section>
+
+  <!-- 4 -->
+  <section id="analogy">
+    <h2>4. Real-World Analogy — The Airport, the Bank, the Hotel</h2>
+    <p>Identity is abstract, so anchor it in places you already understand. Each analogy isolates one idea.</p>
+    <h3>Airport — authentication then authorization, in sequence</h3>
+    <p>At check-in you show your <strong>passport</strong>: the agent verifies <em>who you are</em> (authentication). Then they check your <strong>boarding pass</strong>: it says which flight, which seat, which cabin — <em>what you are allowed to do</em> (authorization). Security checks the passport again (re-authentication at a boundary). The lounge checks your ticket class, not your passport (authorization without re-proving identity). You cannot board on a passport alone, and a boarding pass with no passport is worthless. <strong>Both, in order.</strong></p>
+    <h3>Bank — identity is context-scoped and least-privilege</h3>
+    <p>The bank verifies you strongly (ID + signature + PIN) because the stakes are money. But even verified, you can only touch <em>your</em> accounts — not the next customer's. Your proven identity grants a narrow, specific authorization. That is <strong>least privilege</strong> made concrete.</p>
+    <h3>Hotel — credentials are revocable and time-bound</h3>
+    <p>Reception authenticates you (booking + ID) and issues a <strong>key card</strong>. The card opens your room and the gym, between check-in and check-out, and stops working the instant you leave. The card is a <em>token</em>: a short-lived, scoped, revocable credential — exactly like the access tokens Auth0 issues. Lose the card and reception simply deactivates it; your identity is unharmed.</p>
+    <h3>Office building, cinema, government IDs</h3>
+    <table>
+      <thead><tr><th>Analogy</th><th>Authentication (who)</th><th>Authorization (what)</th><th>Identity concept it teaches</th></tr></thead>
+      <tbody>
+        <tr><td>Office building</td><td>Badge proves you're an employee</td><td>Badge opens only your floor</td><td>Roles &amp; scoped permissions</td></tr>
+        <tr><td>Cinema</td><td>(none — anonymous)</td><td>Ticket lets you into Screen 4, 7&nbsp;p.m.</td><td>Authorization without identity (a bearer token)</td></tr>
+        <tr><td>Passport</td><td>Photo + chip prove it's you</td><td>Visa stamp says which countries</td><td>Federation: country B trusts country A's issuer</td></tr>
+        <tr><td>Aadhaar (India)</td><td>Biometric proves the holder</td><td>Used by many services to verify you</td><td>Centralized identity provider</td></tr>
+        <tr><td>Driving licence</td><td>Photo proves it's you</td><td>Class says car vs. truck vs. motorcycle</td><td>One credential carrying permissions (claims)</td></tr>
+      </tbody>
+    </table>
+    <div class="callout tip"><span class="tag">Tip</span><p>The <strong>cinema ticket</strong> is the most underrated analogy. The usher never asks your name — possession of a valid ticket is enough. That is a <em>bearer token</em>: whoever holds it can use it. This is why bearer tokens must be protected like cash, and why they expire.</p></div>
+  </section>
+
+  <!-- 5 -->
+  <section id="internal">
+    <h2>5. Internal Working — How a System Actually "Knows" You</h2>
+    <p>Strip away the marketing and an identity system does three mechanical things: <strong>enroll</strong>, <strong>store</strong>, and <strong>match</strong>.</p>
+    <ol>
+      <li><strong>Enrollment / provisioning.</strong> The entity is first registered. A record is created with a unique, stable internal identifier (a <em>subject</em>, often a UUID) plus credentials (a password hash, a public key, a biometric template). This identifier — not the email or username — is the entity's true handle inside the system, because emails and names change.</li>
+      <li><strong>Storage.</strong> Credentials are stored in a form that cannot be reversed. Passwords are never stored as text; the system stores a <em>salted hash</em> (e.g. bcrypt/argon2). At login it hashes the input and compares hashes. Even the system never learns your actual password.</li>
+      <li><strong>Matching (the login).</strong> The entity presents a credential. The system recomputes/verifies and, on success, concludes "this request belongs to subject <code>abc-123</code>." It then issues a <em>session</em> or a <em>token</em> so you don't re-prove yourself on every click.</li>
+    </ol>
+    <h3>Three factors — the categories of proof</h3>
+    <p>How can a system trust a claim of identity? By demanding evidence from one or more of three categories:</p>
+    <table>
+      <thead><tr><th>Factor</th><th>Meaning</th><th>Examples</th><th>Weakness</th></tr></thead>
+      <tbody>
+        <tr><td>Knowledge</td><td>Something you <strong>know</strong></td><td>password, PIN, security answer</td><td>can be guessed, phished, leaked, reused</td></tr>
+        <tr><td>Possession</td><td>Something you <strong>have</strong></td><td>phone (OTP), security key, key card</td><td>can be stolen or lost</td></tr>
+        <tr><td>Inherence</td><td>Something you <strong>are</strong></td><td>fingerprint, face, voice</td><td>can't be changed if compromised</td></tr>
+      </tbody>
+    </table>
+    <p>Combining two <em>different</em> categories is <strong>Multi-Factor Authentication (MFA)</strong>. Two passwords are not MFA — both are "knowledge." A password + a phone code is MFA, because an attacker now needs to both know <em>and</em> physically have something.</p>
+    <div class="callout note"><span class="tag">Note</span><p>The stable internal subject ID is why you should <em>never</em> use email as a primary key for identity. People change emails; the underlying entity stays the same. Auth0 reflects this: every user has an immutable <code>user_id</code> like <code>auth0|6543...</code>, separate from their (mutable) email.</p></div>
+  </section>
+
+  <!-- 6 -->
+  <section id="walkthrough">
+    <h2>6. Code Walkthrough — Modeling Identity in Code</h2>
+    <p>Let's make the entity/identity/claims distinction concrete. Here is the same <em>person</em> represented as different identities, and the shape of the claims a token carries.</p>
+    <h4>Node.js — entity vs. identities</h4>
+    <pre><code class="language-javascript">// One ENTITY (the real person) — abstract, not tied to any system.
+const entity = { realName: "Maya Rao", born: "1995-04-02" };
+
+// Many IDENTITIES — each scoped to a context, storing only what it needs.
+const bankIdentity = {
+  context: "acme-bank",
+  subject: "cust_8842",        // stable internal id (NOT the email)
+  claims: { kycVerified: true, accountTier: "gold" }
+};
+
+const githubIdentity = {
+  context: "github.com",
+  subject: "user_193027",
+  claims: { username: "mayar", email: "maya@dev.io", plan: "pro" }
+};
+
+// The bank cannot see GitHub claims and vice-versa: context isolation.
+console.log(bankIdentity.subject !== githubIdentity.subject); // true
+</code></pre>
+    <h4>What an identity token (claims) actually looks like</h4>
+    <p>When an identity provider authenticates you it returns claims, typically inside a JSON Web Token (JWT). The middle part decodes to plain JSON. We dissect JWTs fully in a later chapter; for now, <em>read the claims</em>:</p>
+    <pre><code class="language-json">{
+  "iss": "https://your-tenant.auth0.com/",   // issuer: WHO vouches for this
+  "sub": "auth0|6543ab12cd",                  // subject: the stable user id
+  "aud": "https://api.expenses.acme.com",     // audience: WHO this is for
+  "name": "Maya Rao",                          // identity claim
+  "email": "maya@acme.com",                    // identity claim
+  "roles": ["manager"],                        // authorization claim
+  "iat": 1718790000,                           // issued-at  (unix time)
+  "exp": 1718793600                            // expiry  -> tokens are short-lived
+}
+</code></pre>
+    <h4>Authentication vs. authorization in one Express handler</h4>
+    <pre><code class="language-javascript">function authenticate(req, res, next) {
+  const token = req.headers.authorization?.replace("Bearer ", "");
+  if (!verifySignature(token)) {
+    return res.status(401).json({ error: "not authenticated" }); // WHO failed
+  }
+  req.user = decodeClaims(token);   // identity established for this request
+  next();
+}
+
+function requireRole(role) {
+  return (req, res, next) => {
+    if (!req.user.roles?.includes(role)) {
+      return res.status(403).json({ error: "forbidden" });       // WHAT failed
+    }
+    next();
+  };
+}
+
+// Order matters: authenticate FIRST, then authorize.
+app.post("/expenses/approve", authenticate, requireRole("manager"), approve);
+</code></pre>
+    <div class="callout key"><span class="tag">Key</span><p>Read the status codes like a sentence. <strong>401 = "I don't know who you are."</strong> <strong>403 = "I know exactly who you are, and you may not do this."</strong> Mixing these up is one of the most common API bugs and a frequent interview trap.</p></div>
+  </section>
+
+  <!-- 7 -->
+  <section id="practical">
+    <h2>7. Practical Implementation — Try It Yourself</h2>
+    <p>Let's <em>feel</em> the two questions with real tools. First, decode a token to see its claims; then watch 401 vs. 403 happen.</p>
+    <h4>curl — observe 401 vs. 403</h4>
+    <pre><code class="language-bash"># 1) No credential at all -> 401 (authentication failed: who are you?)
+curl -i https://api.expenses.acme.com/expenses/approve -X POST
+#   HTTP/1.1 401 Unauthorized
+
+# 2) Valid token, but you're only an "employee", not a "manager" -> 403
+curl -i https://api.expenses.acme.com/expenses/approve -X POST \
+     -H "Authorization: Bearer eyJhbGciOi...employee-token..."
+#   HTTP/1.1 403 Forbidden
+
+# 3) Valid manager token -> 200 OK
+curl -i https://api.expenses.acme.com/expenses/approve -X POST \
+     -H "Authorization: Bearer eyJhbGciOi...manager-token..."
+#   HTTP/1.1 200 OK
+</code></pre>
+    <h4>Decode the claims yourself (no library)</h4>
+    <pre><code class="language-bash"># A JWT is header.payload.signature, each base64url-encoded.
+# Grab the payload (2nd segment) and decode it:
+TOKEN="eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhdXRoMHw2NTQzIiwicm9sZXMiOlsibWFuYWdlciJdfQ.x"
+echo "$TOKEN" | cut -d '.' -f2 | base64 -d 2>/dev/null
+# -> {"sub":"auth0|6543","roles":["manager"]}
+</code></pre>
+    <div class="callout warn"><span class="tag">Warn</span><p>Decoding is <strong>not</strong> verifying. Anyone can read a JWT's claims — they are only base64-encoded, not encrypted. Trusting claims without verifying the signature is a critical vulnerability (we cover signature verification next chapter and again under Security). <em>Never make an authorization decision on an unverified token.</em></p></div>
+    <h4>Postman — see it visually</h4>
+    <ol>
+      <li>Create a request <code>POST https://api.expenses.acme.com/expenses/approve</code>.</li>
+      <li>Under the <strong>Authorization</strong> tab, choose type <em>Bearer Token</em> and paste a token.</li>
+      <li>Send with no token, an employee token, and a manager token. Watch the status flip <strong>401 → 403 → 200</strong>.</li>
+      <li>Paste the token into <a href="https://jwt.io">jwt.io</a> and read the <code>sub</code>, <code>roles</code>, and <code>exp</code> claims.</li>
+    </ol>
+  </section>
+
+  <!-- 8 -->
+  <section id="architecture">
+    <h2>8. Production Architecture — Why Identity Becomes the Perimeter</h2>
+    <p>The classic security model was a <strong>castle and moat</strong>: a hard network boundary (firewall/VPN) with a soft, trusting interior. "Inside the network = trusted." That model is dead. Employees work from cafés, services run in five clouds, APIs call APIs across the public internet. There is no longer an "inside."</p>
+    <p>The modern model is <strong>Zero Trust</strong>: never trust based on network location; verify identity on <em>every</em> request. The new perimeter is <strong>identity itself</strong>. This is the single most important architectural shift to articulate in a senior interview.</p>
+    <pre class="diagram">
+  OLD: castle &amp; moat                 NEW: identity is the perimeter
+
+   [ Firewall / VPN ]               every request carries a verified token
+   +-----------------+              +--------+   token   +-------------+
+   |  TRUSTED inside |              | Client |---------->|  API / svc  |
+   |  (apps trust    |              +--------+           |  verifies   |
+   |   each other    |                                   |  identity   |
+   |   freely)       |              +--------+   token   |  + scopes   |
+   +-----------------+              | Svc B  |---------->|  EVERY time |
+   one breach = total              +--------+           +-------------+
+   compromise                      lateral movement is blocked by default
+    </pre>
+    <h3>Centralized identity — the Identity Provider (IdP)</h3>
+    <p>Rather than every app implementing its own login (and its own bugs), one trusted service — the <strong>Identity Provider</strong> — owns authentication for many apps. This is exactly the <strong>Aadhaar</strong> model: a central authority verifies you once, and dozens of services rely on that verification instead of each re-verifying. Auth0 <em>is</em> a hosted IdP.</p>
+    <pre class="diagram">
+                         +----------------------+
+        App 1  --------> |                      |
+        App 2  --------> |   Identity Provider  |  one place that
+        App 3  --------> |   (Auth0 / Aadhaar)  |  authenticates users,
+        Mobile --------> |                      |  issues tokens,
+        Partner ------>  |   users, MFA, logs   |  enforces MFA & policy
+                         +----------------------+
+   Benefits: single sign-on, one MFA policy, one audit log,
+             instant org-wide revocation, no app stores passwords.
+    </pre>
+    <div class="callout tip"><span class="tag">Tip</span><p>"Don't build auth, buy/delegate it" is the architectural punchline of this whole course. Centralizing identity in an IdP means a security fix or policy change happens once, everywhere — instead of being re-implemented (and re-bugged) in every app.</p></div>
+  </section>
+
+  <!-- 9 -->
+  <section id="security">
+    <h2>9. Security Analysis — Why Passwords Alone Fail, and Cryptographic Trust</h2>
+    <h3>Why passwords alone are not enough</h3>
+    <p>A password is a <em>shared secret</em>: both you and the server know it. That sharing is the flaw. Every weakness flows from it:</p>
+    <ul>
+      <li><strong>Reuse.</strong> People reuse passwords across sites. One breached site leaks credentials that unlock dozens of others — <em>credential stuffing</em>.</li>
+      <li><strong>Phishing.</strong> A fake login page captures the secret directly; the user hands it over willingly.</li>
+      <li><strong>Database breaches.</strong> If a server stores passwords (or weak hashes), one breach exposes millions.</li>
+      <li><strong>Guessing &amp; spraying.</strong> Weak or common passwords fall to automated guessing.</li>
+      <li><strong>No proof of presence.</strong> A leaked password works from anywhere; the system can't tell the real user from the attacker.</li>
+    </ul>
+    <p>The fix is layered: add MFA (a second factor an attacker is unlikely to also have), and move toward <strong>passwordless</strong> and <strong>passkeys</strong>, which replace the shared secret with public-key cryptography — nothing secret is ever transmitted or stored on the server.</p>
+    <h3>Cryptographic trust — sign with private, verify with public</h3>
+    <p>This is the engine under JWTs, passports, TLS, passkeys, and federation. Asymmetric cryptography gives every party a <strong>key pair</strong>:</p>
+    <ul>
+      <li>a <strong>private key</strong>, kept absolutely secret, used to <em>sign</em>;</li>
+      <li>a <strong>public key</strong>, shared freely, used by anyone to <em>verify</em> that signature.</li>
+    </ul>
+    <p>A signature proves two things at once: <strong>authenticity</strong> (it came from the holder of the private key) and <strong>integrity</strong> (the data wasn't altered, because any change breaks the signature). Critically, the verifier never needs the secret — so trust scales to strangers.</p>
+    <pre class="diagram">
+  ISSUER (e.g. Auth0)                          VERIFIER (your API)
+  ------------------                           -------------------
+  claims = {sub, roles, exp}
+        |
+        | sign(claims, PRIVATE_KEY)
+        v
+   +----------------+      token (claims + signature)     +-----------------+
+   |  signed token  | ----------------------------------> |  verify(token,  |
+   +----------------+                                      |  PUBLIC_KEY)    |
+                                                           +--------+--------+
+   PRIVATE_KEY never leaves issuer.                                 |
+   PUBLIC_KEY is published (JWKS).                  valid? --> trust claims
+   Anyone can verify; only issuer can sign.        invalid? -> reject (forged
+                                                                or tampered)
+    </pre>
+    <div class="callout danger"><span class="tag">Danger</span><p><strong>Possession of a private key IS identity.</strong> If an attacker steals the issuer's private key, they can mint tokens that impersonate <em>anyone</em>. This is why private keys live in HSMs / key vaults, are rotated, and are never logged or committed to git. The entire trust chain collapses if one private key leaks.</p></div>
+  </section>
+
+  <!-- 10 -->
+  <section id="performance">
+    <h2>10. Performance Considerations — Stateful vs. Stateless Identity</h2>
+    <p>How a system remembers "who you are" between requests is an architectural fork with real performance consequences.</p>
+    <table>
+      <thead><tr><th></th><th>Server-side sessions (stateful)</th><th>Self-contained tokens / JWT (stateless)</th></tr></thead>
+      <tbody>
+        <tr><td>Where identity lives</td><td>In a store (Redis/DB); client holds an opaque id</td><td>In the token itself, carried by the client</td></tr>
+        <tr><td>Per-request cost</td><td>A lookup (network/DB round trip)</td><td>A signature verification (CPU, in-memory)</td></tr>
+        <tr><td>Scales across services</td><td>Needs shared/sticky session store</td><td>Any service can verify with the public key — no shared store</td></tr>
+        <tr><td>Instant revocation</td><td>Easy: delete the session</td><td>Hard: token is valid until <code>exp</code> (mitigate with short expiry)</td></tr>
+      </tbody>
+    </table>
+    <p>The classic trade-off: stateful gives <strong>instant revocation</strong> but adds a lookup and a shared store; stateless gives <strong>scale and zero-coordination verification</strong> but you must accept a token until it expires. The standard production answer is a hybrid: <strong>short-lived access tokens</strong> (minutes) plus a <strong>long-lived refresh token</strong> that <em>can</em> be revoked centrally.</p>
+    <h4>Performance levers that matter</h4>
+    <ul>
+      <li><strong>Cache the JWKS (public keys).</strong> Fetching the issuer's public keys on every request would be catastrophic; cache them and refresh on key rotation. This is the single biggest token-verification perf win.</li>
+      <li><strong>Prefer RS256/ES256 done right.</strong> Asymmetric verification is cheap enough to do per-request in-process; the win is no DB call.</li>
+      <li><strong>Keep tokens small.</strong> Every claim ships on every request. Don't stuff large objects into tokens; reference them.</li>
+    </ul>
+  </section>
+
+  <!-- 11 -->
+  <section id="mistakes">
+    <h2>11. Common Mistakes</h2>
+    <div class="callout danger"><span class="tag">Mistake 1</span><p><strong>Confusing authentication with authorization.</strong> Returning 403 when you mean 401 (or vice-versa), or assuming a logged-in user is automatically allowed to do everything. They are two separate questions; answer both, in order.</p></div>
+    <div class="callout danger"><span class="tag">Mistake 2</span><p><strong>Trusting a token without verifying its signature.</strong> Claims are readable by anyone. Decoding ≠ verifying. Always verify the signature, issuer (<code>iss</code>), and audience (<code>aud</code>) before trusting a single claim.</p></div>
+    <div class="callout danger"><span class="tag">Mistake 3</span><p><strong>Using email/username as the identity primary key.</strong> These change. Always anchor identity to a stable, immutable subject id.</p></div>
+    <div class="callout warn"><span class="tag">Mistake 4</span><p><strong>Calling two passwords "MFA."</strong> Both are the <em>knowledge</em> factor. Real MFA combines <em>different</em> categories (know + have, or have + are).</p></div>
+    <div class="callout warn"><span class="tag">Mistake 5</span><p><strong>Building your own identity system from scratch.</strong> Storing passwords, rolling your own crypto, hand-coding session logic — each is a footgun. Delegate to a battle-tested IdP.</p></div>
+    <div class="callout warn"><span class="tag">Mistake 6</span><p><strong>Over-collecting attributes.</strong> Storing data a context doesn't need is liability, not value. Practice data minimization.</p></div>
+  </section>
+
+  <!-- 12 -->
+  <section id="best-practices">
+    <h2>12. Best Practices</h2>
+    <ul>
+      <li><strong>Separate the two questions explicitly</strong> in code: an <code>authenticate</code> layer and an <code>authorize</code> layer, in that order. Return 401 then 403 correctly.</li>
+      <li><strong>Centralize authentication</strong> in an IdP. Don't reinvent login, MFA, or password storage.</li>
+      <li><strong>Always verify</strong> signature + <code>iss</code> + <code>aud</code> + <code>exp</code> before trusting claims.</li>
+      <li><strong>Anchor identity to an immutable subject id</strong>; treat email/name as mutable attributes.</li>
+      <li><strong>Enforce MFA</strong> for anything that matters, combining different factor categories. Prefer passkeys where possible.</li>
+      <li><strong>Least privilege by default.</strong> Grant the narrowest roles/scopes; widen only as needed.</li>
+      <li><strong>Short-lived access tokens + revocable refresh tokens.</strong> Keep tokens small and cache public keys.</li>
+      <li><strong>Practice data minimization</strong> and treat the identity lifecycle (especially <em>de-provisioning</em>) as a first-class process.</li>
+    </ul>
+    <div class="callout tip"><span class="tag">Tip</span><p>Adopt a one-line mantra you can repeat in interviews: <em>"Authenticate the principal, scope it to least privilege, verify on every request, and centralize it in an IdP."</em> That sentence signals senior thinking.</p></div>
+  </section>
+
+  <!-- 13 -->
+  <section id="interview">
+    <h2>13. Interview Questions (with Model Answers)</h2>
+    <h4>Q1. What is the difference between authentication and authorization?</h4>
+    <p><strong>Model answer:</strong> Authentication answers "who are you?" — it establishes and verifies identity (e.g., via password, token, biometric). Authorization answers "what are you allowed to do?" — it decides whether the now-known principal may perform a specific action on a specific resource. Authentication always comes first; you cannot authorize an unknown party. In HTTP, failed authentication is <code>401 Unauthorized</code>; failed authorization (authenticated but not permitted) is <code>403 Forbidden</code>.</p>
+    <h4>Q2. A user is logged in but gets a 403. What does that tell you?</h4>
+    <p><strong>Model answer:</strong> Authentication succeeded — the system knows who they are — but authorization failed: their identity lacks the required role/permission/scope for that resource. The fix is on the policy/role side, not the login side. (If it were 401, I'd suspect a missing/expired/invalid token instead.)</p>
+    <h4>Q3. Why is "identity is the new perimeter" and what replaced the old model?</h4>
+    <p><strong>Model answer:</strong> The old castle-and-moat model trusted anything inside the network boundary, but with cloud, remote work, and service-to-service calls there is no meaningful "inside." Zero Trust replaces it: trust nothing by network location and verify identity on every request. So the control point — the perimeter — becomes identity itself, enforced via verified tokens per request.</p>
+    <h4>Q4. What is MFA, and why aren't two passwords MFA?</h4>
+    <p><strong>Model answer:</strong> MFA requires proof from two or more <em>different</em> factor categories — knowledge (know), possession (have), inherence (are). Two passwords are both knowledge, so a single phish or leak defeats both. Password + device OTP combines know + have, so an attacker needs both to succeed.</p>
+    <h4>Q5. Explain how cryptographic signing lets two strangers trust a token.</h4>
+    <p><strong>Model answer:</strong> The issuer signs claims with a private key it never shares. Anyone can verify the signature with the issuer's public key. A valid signature proves authenticity (only the issuer could have produced it) and integrity (the data wasn't altered). The verifier needs no secret and no live call to the issuer, so trust scales to parties that have never met — this underpins JWTs, TLS, and passports.</p>
+    <h4>Q6. Why shouldn't you use a user's email as the primary identity key?</h4>
+    <p><strong>Model answer:</strong> Emails change, can be reassigned, and may be shared. Identity must anchor to a stable, immutable subject id (a UUID / <code>sub</code> claim). Email is a mutable attribute/claim, useful for contact and display, not for identity.</p>
+    <h4>Q7. Define principal, subject, and claim.</h4>
+    <p><strong>Model answer:</strong> A <em>principal</em> is the authenticated identity acting in a request (the security actor). The <em>subject</em> is the unique identifier of that principal (the <code>sub</code> claim). A <em>claim</em> is a single asserted statement about the subject (e.g., <code>email=...</code>, <code>role=manager</code>). The principal carries a set of claims; authorization policies evaluate those claims.</p>
+  </section>
+
+  <!-- 14 -->
+  <section id="cert-tips">
+    <h2>14. Certification Tips</h2>
+    <div class="callout note"><span class="tag">Exam focus</span><p>The Auth0/Okta certification leans heavily on precise vocabulary and the AuthN/AuthZ distinction. Lock these in:</p></div>
+    <ul>
+      <li><strong>AuthN = authentication = identity</strong>; <strong>AuthZ = authorization = permissions.</strong> Memorize which is which — questions deliberately swap them.</li>
+      <li><strong>401 vs 403</strong> is a guaranteed-flavor question. 401 = not authenticated; 403 = authenticated but forbidden.</li>
+      <li>Know the <strong>three factor categories</strong> and that MFA = two <em>different</em> categories.</li>
+      <li>Auth0 terms: an <strong>Identity Provider (IdP)</strong> authenticates; a <strong>Service/Relying Party</strong> relies on it. Auth0 can be the IdP <em>and</em> broker external IdPs (federation).</li>
+      <li>Every Auth0 user has an immutable <code>user_id</code> / <code>sub</code>; profile attributes are mutable.</li>
+      <li><strong>Federation</strong> = trust delegated across identity domains (e.g., "Login with Google"). Be ready to name it from a scenario.</li>
+      <li>Signing keys: tokens are signed with the tenant's <strong>private key</strong>; APIs verify via the published <strong>JWKS public keys</strong>.</li>
+    </ul>
+  </section>
+
+  <!-- 15 -->
+  <section id="exercises">
+    <h2>15. Hands-On Exercises</h2>
+    <ol>
+      <li><strong>Map your own identities.</strong> List five services you use and, for each, write the context, the likely subject id type, and three attributes/claims that context stores. Note which attribute appears in multiple contexts and which are unique.</li>
+      <li><strong>401 vs 403 by hand.</strong> Using the curl examples in §7, reproduce all three responses against any public test API (or a tiny local Express app). Capture the headers proving the status codes.</li>
+      <li><strong>Decode a token.</strong> Generate a JWT at <a href="https://jwt.io">jwt.io</a>, then decode its payload with the base64 command from §7 <em>without</em> any library. Confirm you can read the claims — and reflect on why that means claims are not secret.</li>
+      <li><strong>Classify factors.</strong> For each: password, fingerprint, hardware key, SMS code, PIN, face scan — label the factor category. Then build three valid MFA combinations and one <em>invalid</em> one (and explain why it's invalid).</li>
+      <li><strong>Spot the perimeter.</strong> Sketch a service you know as castle-and-moat, then redraw it Zero-Trust with identity verified per request. Note where lateral movement is blocked.</li>
+    </ol>
+  </section>
+
+  <!-- 16 -->
+  <section id="assignment">
+    <h2>16. Assignment</h2>
+    <div class="callout key"><span class="tag">Deliverable</span><p>Write a 1–2 page "Identity Design Brief" for a fictional app <strong>"SplitWise-lite"</strong> (friends split expenses) that demonstrates first-principles thinking.</p></div>
+    <p>Your brief must explicitly:</p>
+    <ol>
+      <li>Identify the <strong>entities</strong> (humans, services) and the <strong>identities</strong> each needs.</li>
+      <li>Choose the <strong>stable subject id</strong> strategy and justify why not email.</li>
+      <li>List the <strong>claims</strong> a token should carry — and defend each against data minimization (could you drop it?).</li>
+      <li>Define <strong>two roles</strong> and the <strong>permissions</strong> each grants; show one action that returns 403 for the wrong role.</li>
+      <li>State your <strong>MFA policy</strong> using correct factor categories.</li>
+      <li>Decide <strong>stateful vs. stateless</strong> session handling and justify the trade-off for this app.</li>
+    </ol>
+    <p>Grade yourself: every claim minimized, every term used precisely, AuthN and AuthZ never conflated.</p>
+  </section>
+
+  <!-- 17 -->
+  <section id="mini-project">
+    <h2>17. Mini Project — A Tiny Identity Server</h2>
+    <p>Build a minimal but correct identity flow that demonstrates sign → verify → authorize. Keep it small; correctness over features.</p>
+    <h4>FastAPI — issue a signed token, then gate an endpoint</h4>
+    <pre><code class="language-python">from fastapi import FastAPI, Depends, HTTPException, Header
+import jwt, time   # pip install pyjwt fastapi uvicorn
+
+SECRET = "dev-only-secret"   # in prod: asymmetric keys + a vault, never a literal
+app = FastAPI()
+
+# --- ENROLLMENT (toy user store; passwords would be HASHED in reality) ---
+USERS = {
+    "maya":  {"sub": "u_001", "pw": "pw1", "roles": ["manager"]},
+    "ravi":  {"sub": "u_002", "pw": "pw2", "roles": ["employee"]},
+}
+
+# --- AUTHENTICATION: prove who you are, get a signed token ---
+@app.post("/login")
+def login(username: str, password: str):
+    u = USERS.get(username)
+    if not u or u["pw"] != password:
+        raise HTTPException(401, "not authenticated")          # WHO failed
+    claims = {"sub": u["sub"], "roles": u["roles"], "exp": int(time.time()) + 300}
+    return {"token": jwt.encode(claims, SECRET, algorithm="HS256")}
+
+# --- TOKEN VERIFICATION: establish identity for a request ---
+def current_principal(authorization: str = Header(None)):
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(401, "missing token")
+    try:
+        return jwt.decode(authorization[7:], SECRET, algorithms=["HS256"])  # VERIFY
+    except jwt.PyJWTError:
+        raise HTTPException(401, "invalid or expired token")
+
+# --- AUTHORIZATION: is this principal allowed to do THIS? ---
+@app.post("/expenses/approve")
+def approve(principal: dict = Depends(current_principal)):
+    if "manager" not in principal.get("roles", []):
+        raise HTTPException(403, "forbidden")                  # WHAT failed
+    return {"ok": True, "approved_by": principal["sub"]}
+</code></pre>
+    <h4>Drive it</h4>
+    <pre><code class="language-bash"># Get a manager token
+TOKEN=$(curl -s -X POST "http://localhost:8000/login?username=maya&amp;password=pw1" | python -c "import sys,json;print(json.load(sys.stdin)['token'])")
+
+curl -i -X POST http://localhost:8000/expenses/approve -H "Authorization: Bearer $TOKEN"   # 200
+curl -i -X POST http://localhost:8000/expenses/approve                                       # 401
+# Log in as ravi (employee) and retry -> 403
+</code></pre>
+    <div class="callout warn"><span class="tag">Production note</span><p>This uses a symmetric secret and plaintext passwords for teaching. In production: hash passwords (argon2/bcrypt), sign with an asymmetric key pair, store the private key in a vault/HSM, verify <code>iss</code>/<code>aud</code>, and — better still — let Auth0 do all of this for you. The point here is only to see the three mechanics with your own eyes.</p></div>
+  </section>
+
+  <!-- 18 -->
+  <section id="quiz">
+    <h2>18. Quiz — 22 Questions</h2>
+    <ol>
+      <li>Define the difference between an <em>entity</em> and an <em>identity</em>.</li>
+      <li>Why is identity called "context-dependent"? Give an example.</li>
+      <li>Which comes first, authentication or authorization, and why?</li>
+      <li>What HTTP status means "I don't know who you are"?</li>
+      <li>What HTTP status means "I know you, but you may not do this"?</li>
+      <li>Name the three authentication factor categories.</li>
+      <li>Why are two passwords <em>not</em> MFA?</li>
+      <li>Define <em>principal</em> and <em>subject</em>, and how they relate.</li>
+      <li>What is a <em>claim</em>? Give two examples of identity claims and one authorization claim.</li>
+      <li>What is the difference between a <em>role</em> and a <em>permission</em>?</li>
+      <li>What is a <em>policy</em> in authorization terms?</li>
+      <li>Why should email never be the primary identity key?</li>
+      <li>List three reasons passwords alone are insufficient.</li>
+      <li>In asymmetric crypto, which key signs and which key verifies?</li>
+      <li>What two properties does a valid signature prove?</li>
+      <li>What does "identity is the new perimeter" mean?</li>
+      <li>Contrast castle-and-moat with Zero Trust in one sentence each.</li>
+      <li>What is an Identity Provider (IdP)? Name a real-world analogy.</li>
+      <li>Define <em>federation</em> in identity.</li>
+      <li>State one advantage and one disadvantage of stateless (JWT) sessions vs. stateful sessions.</li>
+      <li>What are the stages of the digital identity lifecycle, and which stage is most often neglected?</li>
+      <li>Why is decoding a JWT not the same as verifying it, and why does that matter?</li>
+    </ol>
+    <details>
+      <summary>Show answer key</summary>
+      <ol>
+        <li><strong>Entity</strong> = the real thing that exists (a person, server). <strong>Identity</strong> = a context-scoped data representation of that entity inside a system. One entity has many identities.</li>
+        <li>An identity's attributes and meaning depend on the context/domain asking. To an airline you're a frequent-flyer number; to a hospital you're a medical record number — same entity, different identities.</li>
+        <li>Authentication first. You cannot decide what an actor may do until you know <em>who</em> the actor is.</li>
+        <li><code>401 Unauthorized</code> (authentication failed).</li>
+        <li><code>403 Forbidden</code> (authenticated but not permitted).</li>
+        <li>Knowledge (something you know), Possession (something you have), Inherence (something you are).</li>
+        <li>Both belong to the <em>knowledge</em> category; MFA requires two <em>different</em> categories so one type of compromise can't defeat both.</li>
+        <li><strong>Principal</strong> = the authenticated actor in a request; <strong>subject</strong> = the unique id (<code>sub</code>) of that principal. The subject identifies the principal.</li>
+        <li>A claim is a single asserted statement about the subject. Identity claims: <code>name</code>, <code>email</code>. Authorization claim: <code>role=manager</code> (or a <code>scope</code>/permission).</li>
+        <li>A <strong>permission</strong> is a single allowed action (e.g., <code>expenses:approve</code>). A <strong>role</strong> is a named bundle of permissions assigned to principals (e.g., "manager").</li>
+        <li>A <strong>policy</strong> is the rule set that, given a principal's claims and the requested resource/action, decides allow or deny.</li>
+        <li>Emails change, can be reassigned/shared; identity must anchor to a stable immutable subject id. Email is a mutable attribute.</li>
+        <li>Any three of: reuse/credential-stuffing, phishing, database breach, guessing/spraying, no proof of presence (works from anywhere).</li>
+        <li>The <strong>private</strong> key signs; the <strong>public</strong> key verifies.</li>
+        <li>Authenticity (came from the private-key holder) and integrity (data was not altered).</li>
+        <li>Because there's no trusted network "inside" anymore, the control point shifts to verifying identity on every request — identity becomes the boundary that's enforced.</li>
+        <li>Castle-and-moat: trust everything inside the network boundary. Zero Trust: trust nothing by location; verify identity on every request.</li>
+        <li>A trusted service that authenticates entities and issues identity assertions/tokens for many relying apps. Analogy: Aadhaar (or a passport-issuing authority).</li>
+        <li>Federation is delegated trust across identity domains: one domain accepts identities authenticated by another (e.g., "Login with Google," or country B trusting country A's passport).</li>
+        <li>Advantage: stateless verification scales without a shared session store. Disadvantage: hard to revoke before expiry (token stays valid until <code>exp</code>).</li>
+        <li>Provisioning → authentication/usage → updates/role changes → <strong>de-provisioning</strong>. De-provisioning (timely removal of access) is the most neglected and a major breach source.</li>
+        <li>Decoding only base64-reads the claims (anyone can); verifying checks the signature proving the token is authentic and untampered. Authorizing on an unverified token lets attackers forge claims — a critical vulnerability.</li>
+      </ol>
+    </details>
+  </section>
+
+  <!-- 19 -->
+  <section id="cheatsheet">
+    <h2>19. Cheat Sheet</h2>
+    <pre class="diagram">
+  IDENTITY QUICK REFERENCE
+  ------------------------------------------------------------------
+  Entity      the real thing (person/machine)
+  Identity    context-scoped representation of an entity (data)
+  Principal   the authenticated actor in a request
+  Subject     unique immutable id of the principal  (JWT: sub)
+  Claim       one statement about the subject (name, email, role)
+  Role        named bundle of permissions
+  Permission  a single allowed action  (resource:action)
+  Policy      rules mapping claims -> allow/deny
+
+  AuthN (authentication) = WHO are you?      fail -> 401
+  AuthZ (authorization)  = WHAT may you do?  fail -> 403
+  Order: AuthN first, then AuthZ. Always.
+
+  Factors:  Knowledge (know) | Possession (have) | Inherence (are)
+  MFA = 2+ DIFFERENT categories
+
+  Crypto trust:  sign with PRIVATE key  ->  verify with PUBLIC key
+                 proves authenticity + integrity; verifier needs no secret
+
+  Sessions:  stateful = easy revoke, needs store
+             stateless(JWT) = scales, hard to revoke before exp
+  Rule of thumb: short-lived access token + revocable refresh token
+
+  Perimeter:  OLD castle-and-moat (trust inside)
+              NEW Zero Trust (verify identity every request)
+  IdP = central authenticator (Auth0 / Aadhaar). Federation = trust across domains.
+  Lifecycle: provision -> use -> update -> DE-PROVISION (don't forget!)
+  ------------------------------------------------------------------
+    </pre>
+  </section>
+
+  <!-- 20 -->
+  <section id="takeaways">
+    <h2>20. Key Takeaways</h2>
+    <div class="callout key"><span class="tag">Key</span><p><strong>Entity ≠ identity.</strong> The entity is real; the identity is a context-scoped data representation. One entity has many identities, each storing only what its context needs.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p><strong>Two questions, in order:</strong> authentication ("who are you?", fails with 401) then authorization ("what may you do?", fails with 403). Never conflate them.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p><strong>The vocabulary is exact:</strong> principal acts, subject identifies it, claims describe it, roles bundle permissions, policies decide. Use these words precisely and you'll sound senior.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p><strong>Passwords alone fail</strong> because they're shared secrets. Add MFA (different factor categories), prefer passkeys, and let asymmetric crypto — sign private, verify public — establish trust between strangers.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p><strong>Identity is the new perimeter.</strong> Zero Trust verifies identity on every request; a centralized IdP (Auth0) provides that verification, federation, MFA, and the full lifecycle from provisioning to de-provisioning — so you never build auth from scratch.</p></div>
+    <div class="callout tip"><span class="tag">Next</span><p>In Chapter 2 we go deeper into authentication mechanics and start turning these concepts into real Auth0 flows. When you're ready, say "next."</p></div>
+  </section>
+
+  <nav class="pager">
+    <a class="prev" href="index.html">← Previous</a>
+    <a class="next" href="chapter-02.html">Next →</a>
+  </nav>
+</main>
+<footer class="site-footer">Master Auth0 End-to-End · Chapter 1 of 32</footer>
+</body>
+</html>

@@ -1,0 +1,716 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 24 — Project 8 — Microservices Authentication | Master Auth0</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">🔐 Master Auth0</a>
+  <nav class="topnav">
+    <a href="chapter-23.html">← Prev</a>
+    <a href="index.html">Contents</a>
+    <a href="chapter-25.html">Next →</a>
+  </nav>
+</header>
+<main class="container">
+  <div class="chapter-head">
+    <span class="phase">Phase 8 · Integration Projects</span>
+    <h1>Chapter 24 — Project 8 — Microservices Authentication</h1>
+    <p class="lead">A monolith has one front door. A microservices system has dozens — every service is a separate process, on a separate host, often written in a separate language, reachable over the network. The naive instinct is to put a login at the edge and let everything behind it trust everything else. That instinct is exactly how a single compromised pod becomes a full breach. In this project chapter we build a <strong>zero-trust</strong> microservices platform end to end: an API gateway that does edge authentication, services that re-validate tokens locally, machine-to-machine (M2M) authentication for service-to-service calls using OAuth 2.0 client credentials, user-identity propagation via token relay, identity-aware Kafka events, and Redis as a high-speed cache and token-revocation backbone. We use a polyglot stack on purpose — a Spring Boot service, a Node service, a gateway config, plus Kafka and Redis snippets — because real platforms are never one language, and the security model has to hold across all of them.</p>
+  </div>
+
+  <!-- ============================================================= 1 -->
+  <section id="theory">
+    <h2>1. Theory — First Principles of Microservices Authentication</h2>
+
+    <p>Before a single line of config, fix the vocabulary, because microservices authentication confuses three distinct questions that beginners merge into one:</p>
+    <ul>
+      <li><strong>Authentication (AuthN):</strong> <em>Who is calling?</em> A human user, or another service? Proven by a token.</li>
+      <li><strong>Authorization (AuthZ):</strong> <em>May this caller do this action on this resource?</em> Checked against scopes/permissions and business rules.</li>
+      <li><strong>Trust boundary:</strong> <em>Where does verification happen, and what does each component assume about the caller?</em> This is the question microservices add that monoliths never had.</li>
+    </ul>
+
+    <p>In a monolith the trust boundary is a single process. Once a request is authenticated at the controller, every internal method call is in-process — there is no network, no impersonation, no lateral movement. Microservices shatter that. Now there are many processes talking over a network you do not fully control, and the central security question becomes: <strong>what is each service allowed to assume about a request that reached it?</strong></p>
+
+    <h3>The two kinds of callers</h3>
+    <p>Every request inside a microservices platform is one of exactly two things, and confusing them is the root of most design errors:</p>
+    <table>
+      <thead><tr><th>Caller type</th><th>Token type</th><th>OAuth grant</th><th>Has a user?</th><th>Identity in token</th></tr></thead>
+      <tbody>
+        <tr><td>End user (via browser/app)</td><td>User access token</td><td>Authorization Code + PKCE</td><td>Yes</td><td><code>sub</code> = user id</td></tr>
+        <tr><td>Service calling another service</td><td>M2M access token</td><td>Client Credentials</td><td>No</td><td><code>sub</code> = client id, <code>gty=client-credentials</code></td></tr>
+      </tbody>
+    </table>
+
+    <h3>Zero trust in one sentence</h3>
+    <p><strong>Never trust the network; always verify the token.</strong> "Zero trust" means a service grants nothing on the basis of <em>where</em> a request came from (same VPC, same cluster, behind the gateway) and everything on the basis of a <em>cryptographically verifiable token</em>. The opposite — "perimeter security," where you authenticate once at the edge and let the soft interior trust itself — is the model that turns one foothold into a catastrophe. The classic name for the failure is the <em>"crunchy outside, chewy center."</em></p>
+
+    <h3>Why JWTs make this tractable</h3>
+    <p>The reason this whole architecture is even practical is the self-contained, signed token (a JWT issued by Auth0). Because it carries its claims and is signed with the tenant's private key, <em>any</em> service can verify it offline using Auth0's public JWKS — no network round-trip to a central session store on every call. Stateless verification is what lets authentication scale horizontally across hundreds of services.</p>
+
+    <div class="callout key"><span class="tag">Key</span><p>The edge (gateway) does coarse authentication so bad traffic dies early. Each service still re-verifies the token, because in zero trust no component trusts that the request was already checked by someone upstream. Edge auth is for <em>efficiency</em>; per-service auth is for <em>security</em>. You need both.</p></div>
+  </section>
+
+  <!-- ============================================================= 2 -->
+  <section id="story">
+    <h2>2. Story-Based Explanation — The Day the Gateway Wasn't Enough</h2>
+    <p>You are the platform lead at <strong>Helios Logistics</strong>, a shipment-tracking SaaS. The system has six services: <code>gateway</code>, <code>orders</code>, <code>inventory</code>, <code>billing</code>, <code>notifications</code>, and <code>analytics</code>. Early on, a smart engineer set it up the easy way: the API gateway validates the Auth0 access token, and once a request is past the gateway, services simply <em>trust each other</em> on the internal network. It worked, it was fast, everyone was happy.</p>
+    <p>Then a dependency in the <code>notifications</code> service had a vulnerability and an attacker got code execution inside that one pod. Notifications is the least important service — it just sends emails. But because the interior was a trust-everyone zone, the attacker's code inside <code>notifications</code> could call <code>billing</code>'s internal endpoint <code>POST /internal/refunds</code> directly, bypassing the gateway entirely, and drain refunds to a stolen card. One compromised email-sender became a financial breach, because <strong>the network was the trust boundary.</strong></p>
+    <p>The fix is the spine of this chapter:</p>
+    <ol>
+      <li><strong>Every service re-validates the JWT itself</strong> — so even an internal caller must present a valid token.</li>
+      <li><strong>Service-to-service calls require an M2M token</strong> with explicit scopes — <code>notifications</code> was never granted <code>create:refunds</code>, so even with a valid M2M token its calls to billing's refund endpoint are denied.</li>
+      <li><strong>The user's identity is propagated</strong> explicitly (token relay), so billing can log "refund initiated on behalf of user X" and apply that user's permissions, not the service's.</li>
+      <li><strong>Async events carry identity context</strong>, so when <code>orders</code> publishes <code>order.created</code> to Kafka, the consumer can still answer "who triggered this?"</li>
+      <li><strong>Redis holds a revocation list</strong>, so the moment a token is known-bad it is rejected platform-wide within seconds, not minutes.</li>
+    </ol>
+    <div class="callout note"><span class="tag">Note</span><p>The lesson Helios learned the hard way: <em>the gateway protects you from the outside world; it does nothing to protect services from each other.</em> Lateral movement is the whole game for an attacker once they are inside. Zero trust assumes the attacker is already inside.</p></div>
+  </section>
+
+  <!-- ============================================================= 3 -->
+  <section id="diagrams">
+    <h2>3. ASCII Diagrams — The Microservices Auth Landscape</h2>
+
+    <h3>3.1 Edge authentication + per-service verification (the core topology)</h3>
+    <pre class="diagram">
+                         ┌──────────────────────────────────────────────┐
+                         │                  Auth0 Tenant                  │
+                         │  /authorize  /oauth/token   /.well-known/jwks  │
+                         └───────┬───────────────┬───────────────────────┘
+        login (Auth Code+PKCE)   │               │  M2M (client_credentials)
+                                 ▼               ▼
+   ┌────────┐   user JWT   ┌───────────┐    public keys (JWKS, cached)
+   │ Browser│ ───────────▶ │  GATEWAY  │ ◀───────────────────────┐
+   └────────┘   Bearer     │  (edge)   │                          │
+                           │ verify JWT│  coarse authN + routing  │
+                           └─────┬─────┘                          │
+              relay user JWT     │                                │
+            (+ trace headers)    ▼                                │
+        ┌──────────────┬─────────┴────────┬──────────────┐       │
+        ▼              ▼                   ▼              ▼        │
+   ┌─────────┐   ┌───────────┐      ┌──────────┐   ┌──────────┐   │
+   │ orders  │   │ inventory │      │ billing  │   │analytics │   │ each service
+   │(Node)   │   │(Spring)   │      │(Spring)  │   │(Node)    │   │ re-verifies
+   └────┬────┘   └───────────┘      └──────────┘   └──────────┘   │ JWT locally
+        │  M2M token (client_credentials, scope=read:inventory)   │ via JWKS ───┘
+        └─────────────────────────────────────────────▶ inventory
+</pre>
+
+    <h3>3.2 Gateway vs per-service validation — the trust boundary</h3>
+    <pre class="diagram">
+   PERIMETER MODEL (insecure)            ZERO-TRUST MODEL (this chapter)
+   ──────────────────────────            ───────────────────────────────
+   [edge verifies] ── trust ──▶          [edge verifies]  ─ still send token ─▶
+        │                                     │
+        ▼  soft chewy center                  ▼  every hop verifies again
+   svcA ─ trust ─ svcB ─ trust ─ svcC    svcA ─verify─ svcB ─verify─ svcC
+        ▲                                     ▲
+   one breach = total breach            one breach = blast radius of 1 token
+</pre>
+
+    <h3>3.3 Service-to-service M2M flow (client credentials)</h3>
+    <pre class="diagram">
+   orders service                Auth0 /oauth/token            inventory service
+        │                              │                              │
+        │ POST grant_type=             │                              │
+        │ client_credentials           │                              │
+        │ client_id, client_secret,    │                              │
+        │ audience=inventory-api  ────▶ │                              │
+        │                              │ mint M2M JWT                  │
+        │ ◀──── access_token (JWT) ──── │  scope=read:inventory        │
+        │                                                             │
+        │ GET /stock  Authorization: Bearer &lt;M2M JWT&gt;  ─────────────▶ │
+        │                                              verify sig+aud │
+        │                                              check scope    │
+        │ ◀──────────────── 200 stock data ────────────────────────  │
+</pre>
+
+    <h3>3.4 Token relay + identity propagation into Kafka and Redis</h3>
+    <pre class="diagram">
+   user JWT (sub=user_42)
+        │
+        ▼
+   [gateway] ──relay user JWT──▶ [orders] ──┬── publish event to Kafka ──▶ [topic: orders]
+        │                                    │   headers: { authorization, x-user-id,
+        │                                    │             traceparent }
+        │                                    │
+        │                                    └── cache user perms in Redis (TTL 60s)
+        ▼                                              key: perms:user_42
+   [Redis denylist]  jti:abc123 → revoked      ◀── every verify checks denylist
+        │
+   consumer [notifications] reads event ──▶ re-verify token from header ──▶ act as user_42
+</pre>
+
+    <div class="callout note"><span class="tag">Note</span><p>Notice the token never disappears. From browser → gateway → service → Kafka header → consumer, the <em>same</em> verifiable identity travels with the work. That continuous, verifiable identity is the heart of identity propagation.</p></div>
+  </section>
+
+  <!-- ============================================================= 4 -->
+  <section id="analogy">
+    <h2>4. Real-World Analogy — The Secure Office Building</h2>
+    <p>Picture a high-security corporate campus.</p>
+    <ul>
+      <li><strong>The lobby turnstile = the API gateway.</strong> Everyone entering the building taps a badge once. Obvious intruders are stopped here. This is edge authentication.</li>
+      <li><strong>Per-room badge readers = per-service token validation.</strong> A perimeter-only building lets anyone who got past the lobby wander into the server room and the CFO's office. A zero-trust building puts a badge reader on <em>every</em> door. Getting into the lobby grants nothing — your badge is re-checked at each room. The badge (token) is what's trusted, not the fact that you're already inside.</li>
+      <li><strong>The badge itself = the JWT.</strong> It is tamper-evident (signed), shows who you are (claims), and is checked against a list of allowed doors (scopes). The reader doesn't phone HR on every tap — it trusts the hologram (signature) it can verify locally, and only consults the central list for revoked badges.</li>
+      <li><strong>A contractor's service badge = the M2M token.</strong> The cleaning robot has its own badge that opens supply closets but <em>not</em> the vault. It is not a person; it has its own narrow set of doors.</li>
+      <li><strong>The visitor escort log = identity propagation / token relay.</strong> When the cleaning robot enters the vault floor "on behalf of" a manager who requested it, the log records <em>both</em>: which robot, acting for which manager.</li>
+      <li><strong>The revoked-badge hotlist at every reader = the Redis denylist.</strong> When security deactivates a stolen badge, every door learns instantly. Without it, a stolen badge works until it "expires."</li>
+    </ul>
+    <div class="callout tip"><span class="tag">Tip</span><p>If anyone ever tells you "we authenticate at the gateway, the internal network is trusted," translate it as "we put a turnstile in the lobby and left every interior door wide open." That sentence should make you nervous in an interview and in production.</p></div>
+  </section>
+
+  <!-- ============================================================= 5 -->
+  <section id="internal">
+    <h2>5. Internal Working — What Actually Happens on Each Hop</h2>
+
+    <h3>5.1 How a service verifies a JWT without calling Auth0 every time</h3>
+    <p>This is the mechanism that makes the whole architecture scale. When a service receives <code>Authorization: Bearer &lt;jwt&gt;</code>, it performs <strong>stateless validation</strong>:</p>
+    <ol>
+      <li><strong>Decode the header</strong> to read <code>alg</code> (must be <code>RS256</code> — asymmetric) and <code>kid</code> (key id).</li>
+      <li><strong>Fetch the public key.</strong> The service downloads Auth0's JWKS from <code>https://YOUR_TENANT/.well-known/jwks.json</code> once, then <em>caches</em> it (keyed by <code>kid</code>) for hours. The private signing key never leaves Auth0.</li>
+      <li><strong>Verify the signature</strong> with the matching public key. If it fails, the token was tampered with or not issued by your tenant. Reject.</li>
+      <li><strong>Validate the claims:</strong> <code>iss</code> equals your tenant, <code>aud</code> equals <em>this service's</em> API identifier, <code>exp</code> not in the past, <code>nbf</code>/<code>iat</code> sane, and the required <code>scope</code>/<code>permissions</code> are present.</li>
+    </ol>
+    <p>Because steps 2–4 use only locally cached public keys, verification is microseconds of CPU, not a network call. <strong>This is why per-service verification doesn't kill performance</strong> — it's offline crypto, not a round-trip.</p>
+
+    <div class="callout warn"><span class="tag">Warn</span><p>The single most dangerous JWT mistake is accepting <code>alg: none</code> or letting the attacker downgrade <code>RS256</code> to <code>HS256</code> (so your <em>public</em> key gets used as an HMAC <em>secret</em>). Always pin the expected algorithm to <code>RS256</code> in your verifier config. Never let the token tell you which algorithm to trust.</p></div>
+
+    <h3>5.2 The <code>aud</code> claim is the per-service lock</h3>
+    <p>Every Auth0 <em>API</em> has an identifier (audience), e.g. <code>https://inventory.helios.internal</code>. A token minted for the orders API has <code>aud: https://orders.helios.internal</code>; the inventory service must <strong>reject</strong> it because the audience doesn't match. This is how a token leaked from one service cannot be replayed against another — the audience is the lock and each service only opens for its own key.</p>
+
+    <h3>5.3 M2M token caching and the denylist check</h3>
+    <p>An M2M token is expensive to mint (a network call to Auth0 + Auth0 may bill per M2M token depending on plan), and it's valid for, say, 24 hours. So the calling service mints it once, caches it in memory (or Redis for multi-instance sharing), and reuses it until ~80% of its lifetime, then refreshes. On the receiving side, after signature+claims pass, the service checks Redis: <em>is this token's <code>jti</code> in the denylist?</em> If yes, reject even though the signature is valid. That single Redis lookup is what converts "valid until expiry" into "revocable in seconds."</p>
+  </section>
+
+  <!-- ============================================================= 6 -->
+  <section id="walkthrough">
+    <h2>6. Code Walkthrough — Polyglot Auth Across the Stack</h2>
+
+    <h3>6.1 The API gateway (edge authentication)</h3>
+    <p>We use a config-driven gateway. Here it validates the JWT at the edge, strips any client-supplied identity headers (so a client can't forge <code>x-user-id</code>), and forwards the original token downstream. This example uses an Envoy-style / Spring Cloud Gateway-style YAML; the principles map to Kong, NGINX, or AWS API Gateway.</p>
+    <pre><code class="language-yaml"># gateway.yaml — Spring Cloud Gateway with OAuth2 Resource Server
+spring:
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          # Auth0 publishes keys here; gateway caches them
+          issuer-uri: https://helios.eu.auth0.com/
+          audiences: https://gateway.helios.internal
+  cloud:
+    gateway:
+      default-filters:
+        # CRITICAL: drop any client-sent identity headers before routing,
+        # otherwise a caller could spoof x-user-id / x-user-scopes.
+        - RemoveRequestHeader=x-user-id
+        - RemoveRequestHeader=x-user-scopes
+      routes:
+        - id: orders
+          uri: http://orders:8080
+          predicates: [ Path=/api/orders/** ]
+          # TokenRelay forwards the validated access token downstream
+          filters: [ TokenRelay ]
+        - id: billing
+          uri: http://billing:8080
+          predicates: [ Path=/api/billing/** ]
+          filters: [ TokenRelay ]
+</code></pre>
+    <div class="callout danger"><span class="tag">Danger</span><p><code>RemoveRequestHeader</code> on identity headers is not optional. If the gateway later <em>adds</em> trusted headers (e.g. <code>x-user-id</code> derived from the verified token), it MUST first strip any incoming copy. Otherwise an attacker sends <code>x-user-id: admin</code> and a downstream service that trusts the header is owned. Trust only headers your own gateway sets after verification.</p></div>
+
+    <h3>6.2 Spring Boot service — resource server + scope enforcement</h3>
+    <pre><code class="language-java">// SecurityConfig.java — inventory service (Spring Boot 3, Spring Security 6)
+@Configuration
+@EnableMethodSecurity
+public class SecurityConfig {
+
+  @Bean
+  SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+    http
+      .authorizeHttpRequests(reg -&gt; reg
+        .requestMatchers("/actuator/health").permitAll()
+        .anyRequest().authenticated())
+      .oauth2ResourceServer(o -&gt; o.jwt(jwt -&gt;
+        jwt.jwtAuthenticationConverter(scopesConverter())));
+    return http.build();
+  }
+
+  // Map the space-delimited "scope" / "permissions" claim to Spring authorities
+  private JwtAuthenticationConverter scopesConverter() {
+    var scopes = new JwtGrantedAuthoritiesConverter();
+    scopes.setAuthorityPrefix("SCOPE_");
+    scopes.setAuthoritiesClaimName("scope");
+    var conv = new JwtAuthenticationConverter();
+    conv.setJwtGrantedAuthoritiesConverter(scopes);
+    return conv;
+  }
+}
+</code></pre>
+    <pre><code class="language-yaml"># application.yaml — pin issuer AND this service's own audience
+spring:
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: https://helios.eu.auth0.com/
+          audiences: https://inventory.helios.internal   # the per-service lock
+</code></pre>
+    <pre><code class="language-java">// StockController.java — declarative scope check at the method
+@RestController
+@RequestMapping("/api/inventory")
+public class StockController {
+
+  @GetMapping("/stock/{sku}")
+  @PreAuthorize("hasAuthority('SCOPE_read:inventory')")
+  public StockDto stock(@PathVariable String sku,
+                        @AuthenticationPrincipal Jwt jwt) {
+    // jwt.getSubject() == user id (user token) OR client id (M2M token)
+    log.info("stock read by sub={} (gty={})", jwt.getSubject(),
+             jwt.getClaimAsString("gty"));
+    return service.find(sku);
+  }
+}
+</code></pre>
+
+    <h3>6.3 Node service — verify the user token, then call inventory with an M2M token</h3>
+    <pre><code class="language-javascript">// orders-service: server.js (Express + express-oauth2-jwt-bearer)
+import { auth, requiredScopes } from "express-oauth2-jwt-bearer";
+import express from "express";
+
+const app = express();
+
+// 1) Verify the incoming USER token. issuerBaseURL+audience are pinned;
+//    the library only accepts RS256 and caches JWKS automatically.
+const checkJwt = auth({
+  issuerBaseURL: "https://helios.eu.auth0.com/",
+  audience: "https://orders.helios.internal",
+  tokenSigningAlg: "RS256",
+});
+
+app.post("/api/orders", checkJwt, requiredScopes("create:orders"),
+  async (req, res) =&gt; {
+    const userId = req.auth.payload.sub;        // the human
+    const stock = await getStock(req, "SKU-42"); // calls inventory svc
+    // ... create order on behalf of userId ...
+    res.json({ ok: true, by: userId, available: stock.qty });
+  });
+
+app.listen(8080);
+</code></pre>
+
+    <pre><code class="language-javascript">// orders-service: m2m.js — mint + cache an M2M token for inventory
+let cached = { token: null, exp: 0 };
+
+async function getInventoryM2MToken() {
+  const now = Date.now() / 1000;
+  if (cached.token &amp;&amp; now &lt; cached.exp - 60) return cached.token; // reuse
+
+  const resp = await fetch("https://helios.eu.auth0.com/oauth/token", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      grant_type: "client_credentials",
+      client_id: process.env.ORDERS_CLIENT_ID,
+      client_secret: process.env.ORDERS_CLIENT_SECRET,   // from a secret store
+      audience: "https://inventory.helios.internal",     // the target API
+      // request only the scopes orders actually needs (least privilege)
+      scope: "read:inventory",
+    }),
+  });
+  const json = await resp.json();
+  cached = { token: json.access_token, exp: now + json.expires_in };
+  return cached.token;
+}
+
+// getStock relays BOTH identities: M2M auth + the original user context
+async function getStock(req, sku) {
+  const m2m = await getInventoryM2MToken();
+  const resp = await fetch(`http://inventory:8080/api/inventory/stock/${sku}`, {
+    headers: {
+      authorization: `Bearer ${m2m}`,            // service auth (who is calling)
+      "x-on-behalf-of": req.auth.payload.sub,    // user context (for whom)
+      traceparent: req.headers["traceparent"] ?? "", // distributed tracing
+    },
+  });
+  return resp.json();
+}
+</code></pre>
+    <div class="callout note"><span class="tag">Note</span><p>Two patterns of identity propagation appear here. <strong>Token relay</strong> forwards the user's own token (used gateway→service). <strong>M2M + on-behalf-of</strong> uses a service token for authentication while carrying the user id as context. Use token relay when the downstream call is logically "still the user"; use M2M when the service is the real actor and the user is just provenance. We discuss the trade-off in the security section.</p></div>
+
+    <h3>6.4 Securing Kafka events with identity context</h3>
+    <pre><code class="language-javascript">// orders-service: publish an identity-bearing event (KafkaJS)
+await producer.send({
+  topic: "orders",
+  messages: [{
+    key: orderId,
+    value: JSON.stringify({ type: "order.created", orderId, sku }),
+    headers: {
+      // carry a verifiable token so the consumer can re-establish identity
+      authorization: `Bearer ${req.headers.authorization?.split(" ")[1]}`,
+      "x-user-id": req.auth.payload.sub,
+      traceparent: req.headers["traceparent"] ?? "",
+    },
+  }],
+});
+</code></pre>
+    <pre><code class="language-java">// notifications-service: consume + RE-VERIFY the token from the header
+@KafkaListener(topics = "orders", groupId = "notifications")
+public void onOrder(ConsumerRecord&lt;String, String&gt; rec) {
+  String bearer = header(rec, "authorization"); // "Bearer ey..."
+  Jwt jwt;
+  try {
+    jwt = jwtDecoder.decode(bearer.substring(7)); // validates sig+exp+aud+iss
+  } catch (JwtException e) {
+    log.warn("rejecting event with invalid/expired token"); // do NOT act
+    return;
+  }
+  if (denylist.contains(jwt.getId())) return;     // Redis revocation check
+  notify(jwt.getSubject(), rec.value());          // act as the original user
+}
+</code></pre>
+    <div class="callout warn"><span class="tag">Warn</span><p>Tokens are short-lived (minutes) but events can sit in a topic for hours or be replayed. If the token has expired by the time the consumer runs, you must <em>not</em> just trust the <code>x-user-id</code> header. Either (a) keep events fresh and process quickly, (b) use a longer-lived purpose-scoped token for async work, or (c) re-mint an M2M token and treat the <code>x-user-id</code> as <em>provenance metadata</em>, not as proof. Never let an unverifiable header drive an authorization decision.</p></div>
+
+    <h3>6.5 Redis — JWKS cache, M2M cache, and the revocation denylist</h3>
+    <pre><code class="language-javascript">// shared revocation helpers (ioredis)
+import Redis from "ioredis";
+const redis = new Redis(process.env.REDIS_URL);
+
+// Revoke a token until its natural expiry (TTL = remaining seconds)
+export async function revoke(jti, exp) {
+  const ttl = Math.max(1, exp - Math.floor(Date.now() / 1000));
+  await redis.set(`denylist:${jti}`, "1", "EX", ttl); // auto-cleans on expiry
+}
+
+// Called inside every verifier after signature+claims pass
+export async function isRevoked(jti) {
+  return (await redis.exists(`denylist:${jti}`)) === 1;
+}
+
+// Cache a user's resolved permissions to avoid recomputation per request
+export async function cachePerms(userId, perms) {
+  await redis.set(`perms:${userId}`, JSON.stringify(perms), "EX", 60);
+}
+</code></pre>
+    <div class="callout tip"><span class="tag">Tip</span><p>Set the denylist key's TTL to the token's remaining lifetime. After the token would have expired anyway, the entry self-deletes — your denylist never grows unbounded, and signature/expiry checks already reject the token from then on.</p></div>
+  </section>
+
+  <!-- ============================================================= 7 -->
+  <section id="practical">
+    <h2>7. Practical Implementation — Wiring It in Auth0</h2>
+    <p>Here is the concrete setup in the Auth0 dashboard / Management API to make the code above work.</p>
+    <ol>
+      <li><strong>Register one API per service</strong> (Auth0 → APIs). Identifier = the audience, e.g. <code>https://inventory.helios.internal</code>. Define permissions/scopes per API: <code>read:inventory</code>, <code>write:inventory</code>, etc. Signing algorithm: <strong>RS256</strong>.</li>
+      <li><strong>Create an M2M application per calling service</strong> (Auth0 → Applications → Machine to Machine). Authorize it against the target API and grant <em>only</em> the scopes it needs. The <code>orders</code> M2M app gets <code>read:inventory</code> — and crucially is <em>not</em> authorized for <code>billing</code>'s <code>create:refunds</code>.</li>
+      <li><strong>Set token lifetimes.</strong> Short user-token TTL (e.g. 5–15 min) so revocation gaps are small; M2M TTL longer (e.g. 24h) since those are cached and refreshed by services.</li>
+      <li><strong>Ensure every access token carries a <code>jti</code></strong> so you can denylist individual tokens. Auth0 includes a <code>jti</code> in JWT access tokens natively; if you need a guaranteed, app-controlled correlation id you can add a <em>namespaced</em> claim via a post-login / client-credentials Action (Auth0 rejects attempts to overwrite registered claims like <code>jti</code> directly).</li>
+    </ol>
+    <pre><code class="language-bash"># Create the inventory API via the Management API
+curl -X POST https://helios.eu.auth0.com/api/v2/resource-servers \
+  -H "Authorization: Bearer $MGMT_TOKEN" \
+  -H "content-type: application/json" \
+  -d '{
+    "name": "Inventory API",
+    "identifier": "https://inventory.helios.internal",
+    "signing_alg": "RS256",
+    "token_lifetime": 900,
+    "scopes": [
+      { "value": "read:inventory",  "description": "Read stock" },
+      { "value": "write:inventory", "description": "Adjust stock" }
+    ]
+  }'
+</code></pre>
+    <pre><code class="language-javascript">// Auth0 Action (Client Credentials) — add audit context for M2M tokens.
+// NOTE: `crypto` is not a global in the Actions runtime — require it.
+// Don't try to set the registered `jti` claim directly (Auth0 blocks that);
+// Auth0 already emits a native `jti` you denylist on. Use a NAMESPACED claim
+// for any app-controlled correlation id.
+const crypto = require("crypto");
+
+exports.onExecuteCredentialsExchange = async (event, api) =&gt; {
+  // app-controlled correlation id (namespaced, so Auth0 accepts it)
+  api.accessToken.setCustomClaim("https://helios/req_id", crypto.randomUUID());
+  // tag M2M calls so receivers can audit "service X acted"
+  api.accessToken.setCustomClaim("https://helios/actor_type", "service");
+};
+</code></pre>
+  </section>
+
+  <!-- ============================================================= 8 -->
+  <section id="architecture">
+    <h2>8. Production Architecture — The Full Picture</h2>
+    <pre class="diagram">
+   Internet
+      │  HTTPS (TLS terminates at LB)
+      ▼
+  ┌─────────┐
+  │   LB    │   WAF / DDoS / rate-limit
+  └────┬────┘
+       ▼
+  ┌──────────────────────────────────────────────────────────┐
+  │                      API GATEWAY                           │
+  │  • verify user JWT (RS256, aud=gateway)                    │
+  │  • strip spoofable headers, add x-request-id              │
+  │  • rate-limit per sub, route, TokenRelay downstream        │
+  └───┬─────────────┬───────────────┬───────────────┬─────────┘
+      ▼             ▼               ▼               ▼
+  ┌────────┐   ┌──────────┐   ┌──────────┐   ┌──────────┐
+  │ orders │   │inventory │   │ billing  │   │analytics │   (mTLS between
+  │  Node  │   │  Spring  │   │  Spring  │   │  Node    │    pods optional,
+  └───┬────┘   └────┬─────┘   └────┬─────┘   └────┬─────┘    via mesh)
+      │  M2M        │  every service verifies JWT + checks denylist
+      └─────────────┘               │
+              ▼                      ▼
+        ┌───────────┐         ┌─────────────┐        ┌──────────────┐
+        │   Kafka   │◀────────│   Redis     │        │   Auth0      │
+        │ identity- │         │ JWKS cache  │        │ JWKS / token │
+        │ aware msgs│         │ M2M cache   │◀───────│ revocation   │
+        └───────────┘         │ denylist    │  push  │ via Action / │
+                              └─────────────┘  jti   │ Log Stream   │
+                                                     └──────────────┘
+</pre>
+    <ul>
+      <li><strong>Edge:</strong> LB + WAF kills volumetric/obvious attacks; gateway does coarse authN, rate-limiting, header hygiene.</li>
+      <li><strong>Mesh (optional):</strong> a service mesh (Istio/Linkerd) can add <strong>mTLS</strong> between pods — that proves <em>which pod</em> is calling (transport identity) while the JWT proves <em>which user/principal</em> (application identity). They are complementary, not substitutes.</li>
+      <li><strong>Redis:</strong> deployed HA (cluster/sentinel), shared by all services for JWKS cache, M2M token cache, denylist, and short-TTL permission cache.</li>
+      <li><strong>Revocation feed:</strong> when a user logs out / is disabled, a process writes the <code>jti</code> (or a "all tokens for sub before time T" rule) into Redis; an Auth0 Log Stream can drive this.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================= 9 -->
+  <section id="security">
+    <h2>9. Security Analysis — Threats and Defenses</h2>
+    <table>
+      <thead><tr><th>Threat</th><th>What it looks like</th><th>Defense</th></tr></thead>
+      <tbody>
+        <tr><td>Lateral movement</td><td>Compromised pod calls other services directly</td><td>Per-service JWT verification + least-privilege M2M scopes; deny by default</td></tr>
+        <tr><td>Header spoofing</td><td>Client sends <code>x-user-id: admin</code></td><td>Gateway strips client identity headers; services trust only verified JWT, not headers</td></tr>
+        <tr><td>Token replay across services</td><td>Token for orders reused against billing</td><td>Per-service <code>aud</code> claim; each service rejects wrong audience</td></tr>
+        <tr><td>Algorithm confusion</td><td><code>alg: none</code> or RS256→HS256 downgrade</td><td>Pin verifier to RS256; never honor token-supplied alg</td></tr>
+        <tr><td>Stolen but valid token</td><td>Leaked token used until it expires</td><td>Short TTLs + Redis denylist by <code>jti</code>; immediate revocation</td></tr>
+        <tr><td>M2M secret leak</td><td>Service client_secret in code/repo</td><td>Secrets manager (Vault/KMS), rotation, secret never in image/env-in-logs</td></tr>
+        <tr><td>Stale event acts as expired user</td><td>Kafka message processed after token expiry</td><td>Re-verify token on consume; treat <code>x-user-id</code> as provenance, not auth</td></tr>
+        <tr><td>Over-broad scopes</td><td>One M2M app can call everything</td><td>One M2M app per caller, authorize only needed APIs/scopes</td></tr>
+        <tr><td>Confused deputy</td><td>Service uses its own privilege for user's request</td><td>Propagate user identity; authorize against the <em>user's</em> permissions where the action is the user's</td></tr>
+      </tbody>
+    </table>
+    <div class="callout danger"><span class="tag">Danger</span><p>The <strong>confused deputy</strong> is the subtle one. If <code>orders</code> calls <code>billing</code> using only its powerful M2M token and forgets the user, then any user who can reach orders can trigger billing actions the <em>user</em> was never allowed to perform — orders becomes a "deputy" tricked into using its higher privilege. Always carry and check the user's identity when the action is conceptually the user's.</p></div>
+  </section>
+
+  <!-- ============================================================= 10 -->
+  <section id="performance">
+    <h2>10. Performance Considerations</h2>
+    <ul>
+      <li><strong>Cache the JWKS.</strong> Never fetch public keys per request. Cache by <code>kid</code> for hours; refresh on unknown <code>kid</code> (handles Auth0 key rotation). A per-request JWKS fetch can add 50–200ms and hammer Auth0.</li>
+      <li><strong>Cache M2M tokens.</strong> Mint once per ~lifetime, reuse from memory/Redis. Minting per call adds latency and may incur cost. Refresh proactively at ~80% TTL to avoid a thundering herd at expiry.</li>
+      <li><strong>JWT verification is cheap; denylist lookups aren't free.</strong> Signature verify is local CPU (microseconds). The Redis <code>EXISTS</code> on every request adds a network hop — keep Redis co-located/low-latency, pipeline where possible, and consider a short in-process LRU of recent denylist results.</li>
+      <li><strong>Keep tokens small.</strong> Big tokens (lots of claims/permissions) bloat every header on every hop and every Kafka message. Ship permissions, not entire role trees; resolve fine-grained authz via a cache or PDP.</li>
+      <li><strong>Edge filtering saves the fleet.</strong> Rejecting unauthenticated traffic at the gateway means services never spend CPU on it — edge auth is a performance optimization, not just security.</li>
+      <li><strong>mTLS cost:</strong> a mesh adds CPU for TLS per hop; budget for it, or scope mTLS to sensitive paths.</li>
+    </ul>
+    <div class="callout tip"><span class="tag">Tip</span><p>Measure the denylist hit path. If the denylist is empty 99.99% of the time, an in-memory bloom filter / negative cache in front of Redis can eliminate most lookups while still catching real revocations.</p></div>
+  </section>
+
+  <!-- ============================================================= 11 -->
+  <section id="mistakes">
+    <h2>11. Common Mistakes</h2>
+    <div class="callout warn"><span class="tag">Mistake 1</span><p><strong>Authenticating only at the gateway.</strong> The "crunchy outside, chewy center." One internal compromise = total breach. Every service must verify.</p></div>
+    <div class="callout warn"><span class="tag">Mistake 2</span><p><strong>Trusting identity headers.</strong> Reading <code>x-user-id</code> as auth instead of the verified JWT. Anyone who reaches the service can forge headers. Strip at the edge; trust the token.</p></div>
+    <div class="callout warn"><span class="tag">Mistake 3</span><p><strong>Not validating <code>aud</code>.</strong> Accepting any well-signed token lets a token for service A be replayed against service B. Pin each service's audience.</p></div>
+    <div class="callout warn"><span class="tag">Mistake 4</span><p><strong>Minting an M2M token per request.</strong> Latency, cost, and rate-limit pain. Cache and refresh.</p></div>
+    <div class="callout warn"><span class="tag">Mistake 5</span><p><strong>Using one all-powerful M2M app for everything.</strong> Defeats least privilege; a leak grants the whole platform. One app per caller, narrow scopes.</p></div>
+    <div class="callout warn"><span class="tag">Mistake 6</span><p><strong>Treating logout as security.</strong> A JWT is valid until expiry regardless of "logout." Without a denylist + short TTLs, a stolen token keeps working.</p></div>
+    <div class="callout warn"><span class="tag">Mistake 7</span><p><strong>Putting client_secret in the image or env that gets logged.</strong> Use a secrets manager and rotate.</p></div>
+    <div class="callout warn"><span class="tag">Mistake 8</span><p><strong>Acting on expired tokens in async consumers.</strong> Events outlive tokens. Re-verify or use purpose-scoped tokens; never trust stale provenance as auth.</p></div>
+  </section>
+
+  <!-- ============================================================= 12 -->
+  <section id="bestpractices">
+    <h2>12. Best Practices</h2>
+    <ul>
+      <li><strong>Default deny.</strong> Every endpoint requires authentication unless explicitly public (e.g. <code>/health</code>). Make "open" the rare, deliberate exception.</li>
+      <li><strong>One API (audience) per service; one M2M app per caller.</strong> This is the backbone of least privilege and replay resistance.</li>
+      <li><strong>Pin <code>RS256</code>, validate <code>iss</code>/<code>aud</code>/<code>exp</code>/scopes everywhere.</strong> Use vetted libraries (<code>express-oauth2-jwt-bearer</code>, Spring Security Resource Server) — never hand-parse JWTs.</li>
+      <li><strong>Strip then set identity headers at the gateway.</strong> Downstream trusts only gateway-set, post-verification headers.</li>
+      <li><strong>Short user-token TTL + Redis denylist by <code>jti</code>.</strong> Revocation in seconds, denylist self-expiring.</li>
+      <li><strong>Propagate user identity end to end</strong> (token relay or on-behalf-of header) including into Kafka, and re-verify on every hop and consume.</li>
+      <li><strong>Cache JWKS and M2M tokens; refresh proactively.</strong></li>
+      <li><strong>Layer mTLS (mesh) under JWT</strong> for transport-level zero trust where the data warrants it.</li>
+      <li><strong>Propagate a trace id</strong> (<code>traceparent</code>) alongside identity so security events are correlatable across services and topics.</li>
+      <li><strong>Audit with the actor.</strong> Log both the service (<code>sub</code>=client) and the user (<code>on-behalf-of</code>) for every privileged action.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================= 13 -->
+  <section id="interview">
+    <h2>13. Interview Questions (with Model Answers)</h2>
+
+    <h3>Q1. Should you validate tokens at the gateway or in each service?</h3>
+    <p><strong>Model answer:</strong> Both, for different reasons. The gateway does coarse authentication so unauthenticated/obviously-bad traffic is rejected early and cheaply, plus rate-limiting and header hygiene. Each service <em>also</em> re-verifies the JWT because, under zero trust, no service assumes a request was already checked upstream — internal callers, misrouted traffic, or a compromised neighbor could otherwise bypass the gateway. Edge validation is an efficiency/UX optimization; per-service validation is the actual security boundary.</p>
+
+    <h3>Q2. How does service A authenticate to service B?</h3>
+    <p><strong>Model answer:</strong> With OAuth 2.0 <em>client credentials</em>. A registers as an M2M application, requests a token from Auth0 with <code>grant_type=client_credentials</code>, <code>audience</code>=B's API identifier, and only the scopes it needs. B verifies that token like any other: signature via JWKS, <code>iss</code>, its own <code>aud</code>, <code>exp</code>, and required scope. The token's <code>sub</code> is A's client id and <code>gty=client-credentials</code>, so B knows a service (not a user) is calling.</p>
+
+    <h3>Q3. How do you propagate the end user's identity across services?</h3>
+    <p><strong>Model answer:</strong> Two patterns. <em>Token relay</em> forwards the user's own access token downstream — the downstream call is authorized as the user. <em>On-behalf-of</em> uses a service M2M token for the call while attaching the user id (and ideally a verifiable user assertion) as context. Token relay is simplest and keeps the user's permissions in force; on-behalf-of is right when the service is the true actor but you still want user provenance for audit and least privilege. Critically, never propagate identity as a plain header that downstream trusts without verification.</p>
+
+    <h3>Q4. A JWT is stateless — how do you revoke one before it expires?</h3>
+    <p><strong>Model answer:</strong> Maintain a denylist (typically in Redis) keyed by the token's <code>jti</code>, with TTL equal to the token's remaining lifetime so it self-cleans. Every verifier, after signature/claims pass, checks the denylist and rejects if present. Pair this with short token TTLs so the revocation window is small even if the denylist is bypassed. For mass revocation, denylist "all tokens for sub issued before time T."</p>
+
+    <h3>Q5. Why isn't "the internal network is trusted" good enough?</h3>
+    <p><strong>Model answer:</strong> Because it makes the network the trust boundary, which means a single compromised workload can move laterally and call anything. Networks get misconfigured, pods get popped, and supply-chain bugs happen. Zero trust assumes the attacker is already inside and verifies identity on every call, so a breach's blast radius is limited to whatever that one token can do.</p>
+
+    <h3>Q6. How do you secure identity in async messaging like Kafka?</h3>
+    <p><strong>Model answer:</strong> Attach the identity context to the message (a verifiable token in a header plus a trace id). The consumer re-verifies the token before acting and checks the denylist. Because tokens are short-lived and events can be delayed/replayed, you must handle expiry: process promptly, use a purpose-scoped longer-lived token for async work, or treat the user id as provenance metadata while the consumer re-authenticates with its own M2M token.</p>
+
+    <h3>Q7. What's the confused-deputy problem here, and how do you avoid it?</h3>
+    <p><strong>Model answer:</strong> If a service uses its own (broad) M2M privileges to perform what is really a user's request, a user can trick it into doing things the user couldn't do directly. Avoid it by propagating and authorizing against the <em>user's</em> identity/permissions for user-initiated actions, reserving pure M2M privilege for genuinely service-owned operations, and keeping M2M scopes minimal.</p>
+
+    <h3>Q8. JWT validation per service — doesn't that kill performance?</h3>
+    <p><strong>Model answer:</strong> No. Verification uses locally cached public keys (JWKS), so it's offline asymmetric-crypto on the CPU — microseconds. There's no per-request call to Auth0. The only network cost is the optional denylist lookup, which you keep cheap with a low-latency Redis and a negative cache. Edge filtering further reduces wasted work.</p>
+  </section>
+
+  <!-- ============================================================= 14 -->
+  <section id="certification">
+    <h2>14. Certification Tips</h2>
+    <ul>
+      <li><strong>Client Credentials grant</strong> is <em>the</em> M2M answer on the exam. Memorize: no user, <code>grant_type=client_credentials</code>, requires <code>audience</code>, returns an access token (never an ID token, never a refresh token).</li>
+      <li><strong>APIs in Auth0 = Resource Servers.</strong> The API <em>identifier</em> is the <code>audience</code>. Permissions/scopes are defined on the API and granted to M2M apps.</li>
+      <li><strong>RS256 vs HS256:</strong> RS256 (asymmetric) is correct for distributed verification — services hold only the public key. HS256 (shared secret) is wrong for microservices because every verifier would need the signing secret.</li>
+      <li><strong>JWKS endpoint</strong> (<code>/.well-known/jwks.json</code>) provides public keys; verifiers cache them and select by <code>kid</code>. Know this is how rotation works.</li>
+      <li><strong>Validate <code>iss</code>, <code>aud</code>, <code>exp</code>, signature</strong> — the exam loves "which claims must you validate?" The answer always includes audience.</li>
+      <li><strong>Token lifetime / revocation:</strong> know that JWTs can't be natively revoked and the standard mitigations are short TTLs + a denylist.</li>
+      <li><strong>ID token ≠ access token:</strong> ID tokens are for the client to learn about the user; access tokens are for calling APIs. Never send an ID token to an API.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================= 15 -->
+  <section id="handson">
+    <h2>15. Hands-On Exercises</h2>
+    <ol>
+      <li><strong>Two services, one token.</strong> Stand up a Node "orders" service and a Spring "inventory" service. Register both APIs in Auth0. Get a user token (via the Auth0 test app) and call orders; confirm inventory <em>rejects</em> that same token because of the <code>aud</code> mismatch.</li>
+      <li><strong>M2M call.</strong> Create an M2M app for orders, authorize <code>read:inventory</code>, and make orders mint a client-credentials token and successfully call inventory. Then remove the scope and watch the call fail with 403.</li>
+      <li><strong>Header spoof test.</strong> Send <code>x-user-id: admin</code> directly to a service. Verify it changes nothing because the service trusts the JWT, not the header. Then verify the gateway strips it.</li>
+      <li><strong>Revocation.</strong> Add a <code>jti</code> via an Action, push one <code>jti</code> to a Redis denylist, and confirm a still-unexpired token is now rejected by both services within seconds.</li>
+      <li><strong>Identity in Kafka.</strong> Publish <code>order.created</code> with the token in a header; have a consumer re-verify it and log the original user. Then expire the token and confirm the consumer refuses to act on stale identity.</li>
+    </ol>
+  </section>
+
+  <!-- ============================================================= 16 -->
+  <section id="assignment">
+    <h2>16. Assignment</h2>
+    <div class="callout note"><span class="tag">Deliverable</span><p>Design and document a <strong>zero-trust auth architecture</strong> for a 5-service e-commerce platform (<code>gateway</code>, <code>catalog</code>, <code>cart</code>, <code>orders</code>, <code>payments</code>). Your submission must include: (1) the list of Auth0 APIs/audiences and the scopes each defines; (2) the M2M authorization matrix — which service may call which, with which scopes (and prove <code>catalog</code> cannot call <code>payments</code>); (3) the gateway responsibilities and the exact identity headers it strips and sets; (4) the per-service validation checklist (alg, iss, aud, exp, scope, denylist); (5) a token-lifetime + revocation plan with concrete TTLs and the Redis denylist key design; (6) how user identity propagates to an async "order.placed" Kafka event and how the payments consumer authorizes safely; (7) one ASCII architecture diagram. Grade yourself against the Security Analysis and Best Practices sections.</p></div>
+  </section>
+
+  <!-- ============================================================= 17 -->
+  <section id="miniproject">
+    <h2>17. Mini Project — "ShipFast" Zero-Trust Slice</h2>
+    <p>Build a runnable vertical slice proving the chapter end to end:</p>
+    <ol>
+      <li><strong>Gateway</strong> (Spring Cloud Gateway or Kong): verify user JWT, strip <code>x-user-*</code>, TokenRelay to services, rate-limit per <code>sub</code>.</li>
+      <li><strong>orders (Node):</strong> verify user token, require <code>create:orders</code>, mint+cache an M2M token, call inventory with M2M + <code>x-on-behalf-of</code>, publish <code>order.created</code> to Kafka with the user token in a header.</li>
+      <li><strong>inventory (Spring Boot):</strong> resource server pinned to its own audience, enforce <code>read:inventory</code>, check Redis denylist.</li>
+      <li><strong>notifications (Spring Boot):</strong> Kafka consumer that re-verifies the token from the event header and emails "order confirmed" as the original user; refuses on expired token.</li>
+      <li><strong>Redis:</strong> JWKS cache, M2M cache, and a <code>denylist:&lt;jti&gt;</code> revocation list with TTL.</li>
+      <li><strong>Demo the breach defense:</strong> simulate a compromised <code>notifications</code> pod trying to call a privileged inventory endpoint with no/under-scoped token and show it is denied.</li>
+    </ol>
+    <p><strong>Acceptance criteria:</strong> a token for one service is rejected by another (audience); an under-scoped M2M call returns 403; a denylisted (still-unexpired) token is rejected platform-wide; the Kafka consumer reconstructs and verifies the user identity; no service trusts an identity header.</p>
+  </section>
+
+  <!-- ============================================================= 18 -->
+  <section id="quiz">
+    <h2>18. Quiz — 22 Questions</h2>
+    <ol>
+      <li>In zero trust, what is the trusted thing: the network location or the token?</li>
+      <li>Why validate the JWT in each service if the gateway already did?</li>
+      <li>Which OAuth grant does a service use to call another service?</li>
+      <li>What claim makes a token usable by only one service?</li>
+      <li>What does <code>gty=client-credentials</code> in a token indicate?</li>
+      <li>Why must you pin the verifier to <code>RS256</code>?</li>
+      <li>What is the JWKS endpoint and why cache it?</li>
+      <li>Define "token relay."</li>
+      <li>Define the "on-behalf-of" propagation pattern and when to prefer it.</li>
+      <li>Why is "we logged the user out" not sufficient to stop a stolen JWT?</li>
+      <li>How does a Redis denylist enable JWT revocation, and what TTL should each entry have?</li>
+      <li>What is the confused-deputy problem in service-to-service calls?</li>
+      <li>Why must the gateway strip incoming <code>x-user-id</code> headers?</li>
+      <li>What's the difference between mTLS identity and JWT identity?</li>
+      <li>Name two reasons to cache M2M tokens instead of minting per request.</li>
+      <li>An access token for the orders API is sent to the inventory service. What happens and why?</li>
+      <li>How do you attach verifiable identity to a Kafka message?</li>
+      <li>A Kafka event is consumed after its token expired. What must the consumer NOT do?</li>
+      <li>Why "one M2M app per calling service" instead of one shared app?</li>
+      <li>What is the "crunchy outside, chewy center" anti-pattern?</li>
+      <li>Which claims must every service validate on an incoming access token?</li>
+      <li>Why is per-service JWT verification not a major performance problem?</li>
+    </ol>
+    <details>
+      <summary>Show answer key</summary>
+      <ol>
+        <li>The token. Location grants nothing; only a cryptographically verifiable token does.</li>
+        <li>Because under zero trust no service assumes upstream verification happened; the gateway can be bypassed by internal/compromised callers, so per-service verification is the real security boundary.</li>
+        <li>OAuth 2.0 Client Credentials grant.</li>
+        <li>The <code>aud</code> (audience) claim — each service accepts only tokens minted for its own API identifier.</li>
+        <li>That the token was issued via client credentials, i.e. the caller is a service, not a user.</li>
+        <li>To prevent <code>alg: none</code> and RS256→HS256 downgrade attacks where the public key is abused as an HMAC secret. The verifier, not the token, must decide the algorithm.</li>
+        <li>It's Auth0's published set of public keys (<code>/.well-known/jwks.json</code>); cache it (by <code>kid</code>) so verification is local CPU and doesn't hit Auth0 per request, refreshing on unknown <code>kid</code> for rotation.</li>
+        <li>Forwarding the user's own access token to downstream services so the call is authorized as the user.</li>
+        <li>The caller uses its own M2M token for authentication while attaching the user id as context; prefer it when the service is the true actor but you still want user provenance and least privilege.</li>
+        <li>A JWT is self-contained and valid until <code>exp</code>; "logout" only clears the client's copy. Without a denylist + short TTL the stolen token still verifies.</li>
+        <li>Verifiers check a Redis key (e.g. <code>denylist:&lt;jti&gt;</code>) after signature/claims pass and reject if present; TTL = the token's remaining lifetime so it self-expires.</li>
+        <li>A service uses its own (broader) privileges to perform a user's request, letting a user trigger actions they weren't authorized for; fix by authorizing against the user's identity for user-initiated actions.</li>
+        <li>So a client can't spoof identity; the gateway sets identity headers only after verifying the token, and any incoming copy must be removed first.</li>
+        <li>mTLS proves which workload/pod is calling (transport identity); the JWT proves which user/principal (application identity). They are complementary.</li>
+        <li>Avoid latency on every call and avoid cost/rate-limit pressure from minting tokens repeatedly (also: smoother load on Auth0). Refresh proactively before expiry.</li>
+        <li>Inventory rejects it because the token's <code>aud</code> is the orders API, not inventory's identifier — audience mismatch.</li>
+        <li>Put a verifiable token in a message header (plus a trace id), and re-verify it on consume.</li>
+        <li>It must NOT act on the unverifiable <code>x-user-id</code> alone; treat it as provenance and re-authenticate (re-verify a fresh token / use its own M2M token) before doing privileged work.</li>
+        <li>Least privilege and blast-radius containment: each app gets only the scopes it needs, and a leaked secret compromises only that one caller's access.</li>
+        <li>Authenticating only at the perimeter and letting the interior trust itself, so one internal breach becomes a total breach.</li>
+        <li>Signature (via JWKS), <code>iss</code>, <code>aud</code> (its own), <code>exp</code> (and sane <code>nbf</code>/<code>iat</code>), and the required scope/permissions — plus a denylist check.</li>
+        <li>Verification uses cached public keys = local asymmetric crypto (microseconds), no per-request network call to Auth0; only the optional denylist lookup touches the network and is kept cheap.</li>
+      </ol>
+    </details>
+  </section>
+
+  <!-- ============================================================= 19 -->
+  <section id="cheatsheet">
+    <h2>19. Cheat Sheet</h2>
+    <pre class="diagram">
+  MICROSERVICES AUTH — QUICK REFERENCE
+  ────────────────────────────────────
+  EDGE (gateway):  verify JWT · strip x-user-* · set trusted hdrs · rate-limit · relay token
+  EACH SERVICE:    verify sig(JWKS) · iss · aud(OWN) · exp · scope · denylist(jti)
+  USER CALL:       Authorization Code + PKCE → user access token (sub=user)
+  SERVICE CALL:    client_credentials + audience=target-api → M2M token (sub=client, gty=cc)
+  PROPAGATE USER:  token relay (acts as user)  OR  M2M + x-on-behalf-of (provenance)
+  KAFKA:           put token + x-user-id + traceparent in headers; consumer RE-VERIFIES
+  REVOCATION:      Redis denylist:&lt;jti&gt; TTL=remaining-life + short token TTLs
+  CACHE:           JWKS (hours) · M2M token (~80% TTL) · perms (short)
+  ALG:             RS256 only (public-key verify); never trust token-supplied alg
+  AUDIENCE:        one API/audience per service = the per-service lock
+  M2M APPS:        one per caller, least-privilege scopes, secret in a vault
+  ZERO TRUST:      trust the token, not the network; assume the attacker is inside
+</pre>
+  </section>
+
+  <!-- ============================================================= 20 -->
+  <section id="takeaways">
+    <h2>20. Key Takeaways</h2>
+    <div class="callout key"><span class="tag">Key</span><p><strong>1.</strong> Zero trust = trust the token, never the network. The gateway authenticates for efficiency; every service re-verifies for security. You need both layers.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p><strong>2.</strong> Service-to-service auth is OAuth 2.0 Client Credentials: one M2M app per caller, audience = target API, least-privilege scopes. The token's <code>sub</code> is the client and <code>gty=client-credentials</code>.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p><strong>3.</strong> The <code>aud</code> claim is the per-service lock and the answer to token replay; pin RS256 and validate <code>iss</code>/<code>aud</code>/<code>exp</code>/scope on every hop using cached JWKS (local crypto = fast).</p></div>
+    <div class="callout key"><span class="tag">Key</span><p><strong>4.</strong> Propagate user identity explicitly — token relay or on-behalf-of — including into Kafka headers, and re-verify on every service and consumer. Never let an identity header drive authorization.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p><strong>5.</strong> JWTs can't be natively revoked, so combine short TTLs with a Redis <code>jti</code> denylist (self-expiring TTL) for revocation in seconds; Redis also caches JWKS, M2M tokens, and permissions.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p><strong>6.</strong> Watch the human-error threats: header spoofing, the confused deputy, all-powerful M2M apps, leaked secrets, and acting on expired tokens in async consumers. Default deny, layer mTLS where data warrants, and log both the service and the user for every privileged action.</p></div>
+  </section>
+
+  <nav class="pager">
+    <a class="prev" href="chapter-23.html">← Previous</a>
+    <a class="next" href="chapter-25.html">Next →</a>
+  </nav>
+</main>
+<footer class="site-footer">Master Auth0 End-to-End · Chapter 24 of 32</footer>
+</body>
+</html>

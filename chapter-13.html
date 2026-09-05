@@ -1,0 +1,833 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 13 — Hands-On Auth0: Configure Tenant, Apps, APIs and Users | Master Auth0</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">🔐 Master Auth0</a>
+  <nav class="topnav">
+    <a href="chapter-12.html">← Prev</a>
+    <a href="index.html">Contents</a>
+    <a href="chapter-14.html">Next →</a>
+  </nav>
+</header>
+<main class="container">
+  <div class="chapter-head">
+    <span class="phase">Phase 6 · Hands-On Auth0</span>
+    <h1>Chapter 13 — Hands-On Auth0: Configure Tenant, Apps, APIs and Users</h1>
+    <p class="lead">Until now you have studied identity, OAuth 2.0, OpenID Connect, JWTs and Auth0's architecture as theory. This chapter is where the theory becomes muscle memory. You will create a real Auth0 tenant, register three different application types (an SPA, a Regular Web App, and a Machine-to-Machine app), publish a protected API with scopes and permissions, build a full RBAC model with roles, switch on Organizations for B2B multi-tenancy, create users while mastering the critical <code>user_metadata</code> vs <code>app_metadata</code> distinction, and turn on social login, enterprise connections, passwordless and MFA. Every dashboard click is mapped as ASCII art, every concept is explained from first principles, and every configuration is backed by runnable code in React, Node.js, Spring Boot, FastAPI, Next.js, curl and Postman. By the end you will be able to stand up a production-grade identity foundation from an empty tenant — and explain <em>why</em> each setting exists.</p>
+  </div>
+
+  <!-- ============================================================= 1 -->
+  <section id="theory">
+    <h2>1. Theory — First Principles of an Auth0 Tenant</h2>
+    <p>Before you click a single button, you must understand the object model you are about to build. Auth0 is not "a login box." It is a hosted <strong>authorization server</strong> (per OAuth 2.0 / RFC 6749) plus an <strong>identity provider</strong> (per OpenID Connect). Everything you configure in the dashboard is just data that changes how that server behaves at token-issuance time.</p>
+
+    <p>The root container is the <strong>tenant</strong>. A tenant is an isolated, namespaced instance of Auth0 with its own:</p>
+    <ul>
+      <li><strong>Domain</strong> — e.g. <code>your-name.us.auth0.com</code>. This is the OAuth <em>issuer</em> (<code>iss</code> claim) and the host of every endpoint: <code>/authorize</code>, <code>/oauth/token</code>, <code>/.well-known/openid-configuration</code>, <code>/.well-known/jwks.json</code>, <code>/userinfo</code>.</li>
+      <li><strong>Signing keys</strong> — an RSA key pair per tenant. The private key signs tokens (RS256); the public key is published at the JWKS endpoint so resource servers can verify signatures without ever contacting Auth0.</li>
+      <li><strong>User store(s)</strong> — called <em>connections</em>. A database connection stores username/password identities; social and enterprise connections federate to external IdPs.</li>
+      <li><strong>Applications (clients)</strong>, <strong>APIs (resource servers / audiences)</strong>, <strong>roles & permissions</strong>, <strong>organizations</strong>, <strong>Actions</strong>, branding and policy.</li>
+    </ul>
+
+    <p>The first-principles mental model is a chain of trust: <em>a user proves identity to a connection → Auth0 (the authorization server) mints signed tokens → your application (client) carries those tokens → your API (resource server) verifies them against the tenant's public keys.</em> Every dashboard task in this chapter wires up one link in that chain.</p>
+
+    <div class="callout key"><span class="tag">Key</span><p>A <strong>tenant = an isolated OAuth authorization server</strong>. An <strong>application = an OAuth client</strong> (something that <em>requests</em> tokens). An <strong>API = an OAuth resource server</strong>, identified by an <strong>audience</strong> (something that <em>consumes</em> tokens). Keep these three nouns straight and the entire dashboard makes sense.</p></div>
+
+    <h3>Why one tenant per environment</h3>
+    <p>Because the signing keys, users, and config are tenant-scoped, the canonical pattern is <strong>one tenant per environment</strong>: <code>acme-dev</code>, <code>acme-staging</code>, <code>acme-prod</code>. This is not optional advice — it is the only way to test a config change (new Action, new connection) without risking production users. The free plan gives you a <em>development</em> tenant; you add more from the tenant switcher.</p>
+  </section>
+
+  <!-- ============================================================= 2 -->
+  <section id="story">
+    <h2>2. Story-Based Explanation — Maya Launches "CineBook"</h2>
+    <p>Maya is the founding engineer at <strong>CineBook</strong>, a cinema-booking startup. On day one she has three things that need to talk to each other and a deadline:</p>
+    <ol>
+      <li>A <strong>React single-page app</strong> where customers browse showtimes and book seats — it runs in the browser, so it can keep <em>no</em> secret.</li>
+      <li>An <strong>admin portal</strong> (a server-rendered Express/Next app) where staff manage screenings — it runs on a server, so it <em>can</em> keep a secret.</li>
+      <li>A <strong>nightly batch job</strong> that reconciles ticket sales — no human is present, so it logs in <em>as itself</em>, not as a user.</li>
+    </ol>
+    <p>All three need to call the same <strong>Booking API</strong>. Maya could hand-roll passwords and sessions… or she can model each actor correctly in Auth0. She creates a tenant <code>cinebook-dev</code>, registers the React app as an <strong>SPA</strong>, the admin portal as a <strong>Regular Web App</strong>, the batch job as a <strong>Machine-to-Machine app</strong>, and the Booking API as an <strong>API with an audience</strong> and scopes like <code>read:bookings</code> and <code>cancel:bookings</code>.</p>
+    <p>Then marketing asks for "Sign in with Google" (a <strong>social connection</strong>), the first enterprise customer demands SAML SSO (an <strong>enterprise connection</strong>), the security team mandates <strong>MFA</strong> for staff, and a second enterprise customer wants their own isolated user space — so Maya turns on <strong>Organizations</strong>. Every requirement in this story maps to exactly one dashboard feature you will configure below. We will follow CineBook as the running example throughout the chapter.</p>
+  </section>
+
+  <!-- ============================================================= 3 -->
+  <section id="diagrams">
+    <h2>3. ASCII Diagrams — The Tenant Object Model & Flows</h2>
+
+    <h3>3.1 The tenant as a container</h3>
+    <pre class="diagram">
++======================================================================+
+|  TENANT:  cinebook-dev.us.auth0.com   (one OAuth authorization srv)   |
+|----------------------------------------------------------------------|
+|                                                                      |
+|  CONNECTIONS (where identities live)                                 |
+|   +-------------------+ +-------------+ +----------------+           |
+|   | Username-Password | |  google-    | |  acme-okta     |           |
+|   |   -Authentication | |  oauth2     | |  (SAML / OIDC) |  ...      |
+|   |  (database)       | | (social)    | |  (enterprise)  |           |
+|   +-------------------+ +-------------+ +----------------+           |
+|                                                                      |
+|  APPLICATIONS (clients that REQUEST tokens)                          |
+|   +-----------+   +-------------------+   +-------------------+       |
+|   |  SPA      |   | Regular Web App   |   | M2M (machine)     |       |
+|   | (React)   |   | (Next/Express)    |   | (batch job)       |       |
+|   | PKCE,     |   | code flow +secret |   | client_credentials|      |
+|   | no secret |   |                   |   |                   |       |
+|   +-----------+   +-------------------+   +-------------------+       |
+|                                                                      |
+|  APIs (resource servers, identified by AUDIENCE)                     |
+|   +---------------------------------------------------------------+  |
+|   | Booking API   audience = https://api.cinebook.com             |  |
+|   | scopes: read:bookings  create:bookings  cancel:bookings ...   |  |
+|   +---------------------------------------------------------------+  |
+|                                                                      |
+|  AUTHORIZATION (RBAC)        ORGANIZATIONS (B2B tenancy)             |
+|   roles -> permissions        org_acme, org_globex (each w/ members)|
+|                                                                      |
+|  SIGNING KEYS (RSA) -> JWKS published at /.well-known/jwks.json      |
++======================================================================+
+    </pre>
+
+    <h3>3.2 Three application types, three flows</h3>
+    <pre class="diagram">
+ SPA (public client)                 user
+   |  /authorize?response_type=code   |
+   |  +PKCE (code_challenge) --------> Auth0 ----> login UI
+   |  &lt;-- code --                       |
+   |  POST /oauth/token (code+verifier)|  NO client_secret
+   |  &lt;-- access_token + id_token + RT  |
+
+ REGULAR WEB APP (confidential client)
+   |  /authorize?response_type=code -> Auth0 -> login
+   |  &lt;-- code (to server redirect_uri) --
+   |  POST /oauth/token (code + CLIENT_SECRET) on the SERVER
+   |  &lt;-- tokens -- (kept server-side in a session/cookie)
+
+ M2M APP (no user at all)
+   |  POST /oauth/token
+   |    grant_type=client_credentials
+   |    client_id + client_secret + audience
+   |  &lt;-- access_token (only) --   NO id_token, NO user
+    </pre>
+
+    <h3>3.3 How a request flows from app to API</h3>
+    <pre class="diagram">
+ [React SPA] --login--> [Auth0 /authorize] --user authenticates-->
+      |
+      |&lt;----------- access_token (JWT, aud=Booking API) ----------
+      |
+      |  GET /bookings   Authorization: Bearer eyJ...
+      v
+ [Booking API] --1. fetch JWKS (cached)--> [Auth0 /jwks.json]
+      |          2. verify RS256 signature
+      |          3. check iss == https://cinebook-dev.us.auth0.com/
+      |          4. check aud == https://api.cinebook.com
+      |          5. check exp not passed
+      |          6. check scope/permissions claim contains read:bookings
+      v
+   200 OK  (or 401 invalid token / 403 insufficient scope)
+    </pre>
+  </section>
+
+  <!-- ============================================================= 4 -->
+  <section id="analogy">
+    <h2>4. Real-World Analogy — The Office Building</h2>
+    <p>Picture a corporate office building. This analogy maps every object you will configure:</p>
+    <table>
+      <thead><tr><th>Auth0 concept</th><th>Office-building equivalent</th><th>Why the analogy holds</th></tr></thead>
+      <tbody>
+        <tr><td>Tenant</td><td>The building itself</td><td>One self-contained property with its own locks, keys and tenant directory.</td></tr>
+        <tr><td>Connection</td><td>The reception desk that checks IDs</td><td>Different desks accept different credentials (employee badge = database, partner pass = enterprise, public guest list = social).</td></tr>
+        <tr><td>Application (client)</td><td>A visitor who wants to enter rooms</td><td>The SPA is a guest with no key of their own; the Regular Web App is staff with a secret badge; the M2M app is the cleaning robot that has its own service key.</td></tr>
+        <tr><td>API (audience)</td><td>A specific locked room (the vault)</td><td>The room only opens for a key stamped with <em>that room's name</em> (the <code>aud</code> claim).</td></tr>
+        <tr><td>Scope / permission</td><td>What the key lets you do inside</td><td>"Enter the vault" vs "open a deposit box" — same room, finer-grained rights.</td></tr>
+        <tr><td>Role</td><td>A job title (e.g. "Branch Manager")</td><td>A bundle of permissions you assign to a person instead of listing every door.</td></tr>
+        <tr><td>Access token</td><td>The physical keycard</td><td>Time-limited, stamped with the room name (aud) and the doors it opens (scope), signed so it can't be forged.</td></tr>
+        <tr><td>ID token</td><td>The photo ID at reception</td><td>Proves <em>who you are</em> to the app — never used to open the vault.</td></tr>
+        <tr><td>Organization</td><td>A company renting a floor</td><td>Co-tenants share the building's security system but have isolated membership and branding.</td></tr>
+        <tr><td>MFA</td><td>Badge + fingerprint at the vault door</td><td>A second factor on the most sensitive rooms.</td></tr>
+      </tbody>
+    </table>
+    <div class="callout note"><span class="tag">Note</span><p>The single most common beginner mistake — using the <strong>ID token to call an API</strong> — is like trying to open the vault with your photo ID instead of your keycard. The vault door (your API) must reject it. APIs accept <strong>access tokens</strong> only.</p></div>
+  </section>
+
+  <!-- ============================================================= 5 -->
+  <section id="internal">
+    <h2>5. Internal Working — What the Dashboard Actually Changes</h2>
+    <p>The dashboard is a friendly face over the <strong>Auth0 Management API</strong>. Every action you take writes to tenant configuration objects. Understanding those objects demystifies everything.</p>
+
+    <h3>5.1 What "Create Application" really creates</h3>
+    <p>Creating an app creates a <strong>client</strong> object with a generated <code>client_id</code> and (for confidential apps) a <code>client_secret</code>. The "Application Type" you pick is not cosmetic — it pre-configures security defaults:</p>
+    <table>
+      <thead><tr><th>Type</th><th>token_endpoint_auth_method</th><th>Default grant types</th><th>Secret?</th></tr></thead>
+      <tbody>
+        <tr><td>SPA</td><td><code>none</code> (public)</td><td>authorization_code (+PKCE), refresh_token</td><td>No</td></tr>
+        <tr><td>Regular Web App</td><td><code>client_secret_post/basic</code></td><td>authorization_code, refresh_token</td><td>Yes</td></tr>
+        <tr><td>Machine to Machine</td><td><code>client_secret_post/basic</code></td><td>client_credentials</td><td>Yes</td></tr>
+        <tr><td>Native</td><td><code>none</code> (public)</td><td>authorization_code (+PKCE), refresh_token, device_code</td><td>No</td></tr>
+      </tbody>
+    </table>
+
+    <h3>5.2 What "Create API" really creates</h3>
+    <p>An API is a <strong>resource server</strong> object. Its <strong>Identifier</strong> (you set this, e.g. <code>https://api.cinebook.com</code>) becomes the <code>audience</code>. When an app requests a token with <code>audience=https://api.cinebook.com</code>, Auth0 mints a <strong>JWT access token</strong> whose <code>aud</code> equals that identifier. If you never create an API and request no audience, Auth0 returns an <em>opaque</em> access token usable only at <code>/userinfo</code> — a frequent source of "my JWT won't decode" confusion.</p>
+
+    <div class="callout warn"><span class="tag">Warn</span><p>The API <strong>Identifier is permanent and should be a URI you control, but it does NOT have to be reachable</strong>. It is a logical name, never an endpoint Auth0 calls. Do not change it after launch — every issued token's <code>aud</code> is tied to it.</p></div>
+
+    <h3>5.3 How RBAC injects permissions into the token</h3>
+    <p>RBAC is off by default. When you flip <strong>"Enable RBAC"</strong> and <strong>"Add Permissions in the Access Token"</strong> on an API, Auth0's pipeline does this at issuance time:</p>
+    <pre class="diagram">
+ token request
+   |
+   v
+ [ resolve user's direct permissions + permissions via assigned roles ]
+   |
+   v
+ [ intersect with the scopes the app requested (scope param) ]
+   |
+   v
+ [ if "Add Permissions in Access Token" = ON ]
+   |        --> write array claim:  "permissions": ["read:bookings", ...]
+   |        --> AND fold granted scopes into "scope": "read:bookings ..."
+   v
+ sign (RS256) -> access_token
+    </pre>
+    <p>So <code>scope</code> is "what the app asked for and was granted," while <code>permissions</code> is the explicit RBAC array. Both are derived from the user's roles intersected with the request — Auth0 never grants more than the user actually has.</p>
+  </section>
+
+  <!-- ============================================================= 6 -->
+  <section id="code-walkthrough">
+    <h2>6. Code Walkthrough — Reading the Tokens You Just Configured</h2>
+    <p>Configuration is meaningless until you see its fingerprint in a token. Here is a decoded access token from a correctly configured tenant (RBAC on, permissions added):</p>
+    <pre><code class="language-json">{
+  "iss": "https://cinebook-dev.us.auth0.com/",
+  "sub": "auth0|66a1f0c2e4b0d9f1a2b3c4d5",
+  "aud": [
+    "https://api.cinebook.com",
+    "https://cinebook-dev.us.auth0.com/userinfo"
+  ],
+  "iat": 1718800000,
+  "exp": 1718886400,
+  "scope": "openid profile email read:bookings create:bookings",
+  "permissions": ["read:bookings", "create:bookings"],
+  "azp": "AbCdEf123SpaClientId",
+  "org_id": "org_aCme123"
+}</code></pre>
+    <ul>
+      <li><code>iss</code> proves which tenant signed it — note the <strong>trailing slash</strong>, a classic verification gotcha.</li>
+      <li><code>aud</code> is an <em>array</em> here because the SPA also requested <code>openid</code> (which adds the userinfo audience). Your API must accept a token whose <code>aud</code> <em>contains</em> its identifier, not equals it.</li>
+      <li><code>scope</code> vs <code>permissions</code> — exactly the two derivations from §5.3.</li>
+      <li><code>org_id</code> appears only because the user logged in through an Organization.</li>
+    </ul>
+
+    <p>And here is the M2M token from the same tenant — notice there is <strong>no user</strong> (<code>sub</code> is the client), no <code>scope</code> of <code>openid</code>, and no <code>permissions</code> array (RBAC permissions are user-centric; M2M uses scopes granted to the client):</p>
+    <pre><code class="language-json">{
+  "iss": "https://cinebook-dev.us.auth0.com/",
+  "sub": "M2mBatchClientId@clients",
+  "aud": "https://api.cinebook.com",
+  "gty": "client-credentials",
+  "scope": "read:bookings reconcile:sales",
+  "azp": "M2mBatchClientId"
+}</code></pre>
+    <div class="callout tip"><span class="tag">Tip</span><p><code>sub</code> ending in <code>@clients</code> and a <code>gty</code> of <code>client-credentials</code> are the two unmistakable signs you are looking at a machine token, not a user token.</p></div>
+  </section>
+
+  <!-- ============================================================= 7 -->
+  <section id="practical">
+    <h2>7. Practical Implementation — The Full Dashboard Walkthrough</h2>
+    <p>This is the heart of the chapter. Follow it click-by-click. Each step is mapped as a screen layout so you can find every control even before you log in.</p>
+
+    <h3>7.1 Create a tenant</h3>
+    <p>Sign up at <code>auth0.com</code>. Auth0 creates your first tenant during sign-up; create additional ones from the top-left switcher.</p>
+    <pre class="diagram">
+ [ Auth0 Dashboard ]  top-left tenant switcher
+ +-------------------------------+
+ |  cinebook-dev  v   |  &lt;-- click the chevron
+ +---------------------+
+ | + Create tenant     |  ---> Domain: cinebook-staging
+ | cinebook-staging    |       Region: US / EU / AU / JP
+ | cinebook-prod       |       Environment: Development | Production
+ +---------------------+
+    </pre>
+    <div class="callout warn"><span class="tag">Warn</span><p>The <strong>Region</strong> and the <strong>domain prefix</strong> are permanent. The region sets data residency (<code>us</code>, <code>eu</code>, <code>au</code>, <code>jp</code>) and appears in your domain (<code>cinebook-dev.us.auth0.com</code>). Choose the region closest to your users for latency and to satisfy data-residency law.</p></div>
+
+    <h3>7.2 Configure an SPA (React)</h3>
+    <pre class="diagram">
+ Applications &gt; Applications &gt; [+ Create Application]
+ +--------------------------------------------------------+
+ |  Name: CineBook Web (React)                            |
+ |  Choose type:                                          |
+ |   ( ) Native     (o) Single Page Web Applications      |
+ |   ( ) Regular Web App   ( ) Machine to Machine         |
+ |                                    [ Create ]          |
+ +--------------------------------------------------------+
+ Settings tab -> scroll to "Application URIs":
+   Allowed Callback URLs:  http://localhost:3000/callback
+   Allowed Logout URLs:    http://localhost:3000
+   Allowed Web Origins:    http://localhost:3000
+ [ Save Changes ]
+    </pre>
+    <p><strong>Why these URIs matter:</strong> the Callback URL is an exact-match allowlist of where Auth0 may redirect after login — it is your defence against open-redirect token theft. Web Origins enables silent token renewal via the <code>/authorize</code> iframe. Save them, then copy your <code>Domain</code> and <code>Client ID</code>.</p>
+
+    <h3>7.3 Configure a Regular Web App</h3>
+    <pre class="diagram">
+ [+ Create Application] -> Name: CineBook Admin (Next.js)
+   Type: (o) Regular Web Applications   [ Create ]
+ Settings:
+   Allowed Callback URLs: http://localhost:3001/api/auth/callback
+   Allowed Logout URLs:   http://localhost:3001
+   Copy: Domain, Client ID, *Client Secret*  (keep the secret safe!)
+   Credentials tab -> Auth Method: Client Secret (Post)
+    </pre>
+
+    <h3>7.4 Register an API with audience and permissions</h3>
+    <pre class="diagram">
+ Applications &gt; APIs &gt; [+ Create API]
+ +--------------------------------------------------------+
+ |  Name:        Booking API                              |
+ |  Identifier:  https://api.cinebook.com   (= audience)  |
+ |  Signing Alg: RS256  (keep RS256, never HS256)         |
+ |                                    [ Create ]          |
+ +--------------------------------------------------------+
+ API &gt; Permissions tab -> add:
+   read:bookings     "Read bookings"
+   create:bookings   "Create a booking"
+   cancel:bookings   "Cancel a booking"
+   reconcile:sales   "Run sales reconciliation"
+ API &gt; Settings tab:
+   [x] Enable RBAC
+   [x] Add Permissions in the Access Token
+   [ Save ]
+    </pre>
+
+    <h3>7.5 Create the M2M app and authorize it for the API</h3>
+    <pre class="diagram">
+ [+ Create Application] -> Name: CineBook Batch (M2M)
+   Type: (o) Machine to Machine   [ Create ]
+   -> "Authorize Machine to Machine" dialog:
+        Select API: Booking API
+        Tick scopes the robot may use:
+          [x] read:bookings   [x] reconcile:sales
+        [ Authorize ]
+ (You can re-edit later under APIs &gt; Booking API &gt; "Machine to Machine Applications")
+    </pre>
+
+    <h3>7.6 Create roles & assign permissions (RBAC)</h3>
+    <pre class="diagram">
+ User Management &gt; Roles &gt; [+ Create Role]
+   Name: Customer       Desc: Standard cinema customer
+   Name: Staff          Desc: Box-office staff
+   Name: Admin          Desc: Full management
+ Open role "Customer" &gt; Permissions tab &gt; [Add Permissions]
+   -> choose API "Booking API"
+   -> [x] read:bookings  [x] create:bookings  [x] cancel:bookings
+ Open "Admin" &gt; add ALL Booking API permissions.
+    </pre>
+
+    <h3>7.7 Create Organizations</h3>
+    <pre class="diagram">
+ Organizations &gt; [+ Create Organization]
+   Name (slug):     acme            Display: Acme Cinemas
+   Branding: logo, primary color, page background
+   Connections tab: enable which login methods this org may use
+                    (e.g. acme-okta enterprise + Username-Password)
+   Members tab: add users / send invitations
+ Applications &gt; CineBook Web &gt; Organizations tab:
+   "Type of Users": (o) Business Users
+   "Login Flow":    Prompt for Organization  | No prompt | etc.
+    </pre>
+
+    <h3>7.8 Create users; metadata; social; enterprise; passwordless; MFA</h3>
+    <pre class="diagram">
+ User Management &gt; Users &gt; [+ Create User]
+   Email: maya@cinebook.com   Password: ****   Connection: Username-Password
+   Open user &gt; "Metadata" tab:
+       user_metadata  { "theme": "dark", "seatPref": "aisle" }
+       app_metadata   { "plan": "pro", "internal": true }
+   "Roles" tab -> Assign Roles -> Customer / Staff / Admin
+
+ Authentication &gt; Social &gt; [+ Create Connection] &gt; Google
+   Client ID / Secret from Google Cloud Console (prod) OR dev keys
+   Applications tab: toggle ON for CineBook Web
+
+ Authentication &gt; Enterprise &gt; SAML / OIDC / Okta / Azure AD
+   Create connection -> upload IdP metadata -> enable for the app/org
+
+ Authentication &gt; Passwordless &gt; Email (magic link/OTP) or SMS
+   enable -> toggle ON for the app
+
+ Security &gt; Multi-factor Auth
+   Factors: [x] One-Time Password (authenticator app)  [x] WebAuthn
+   Define policy: Always | Use Adaptive MFA | via Actions (custom rules)
+    </pre>
+  </section>
+
+  <!-- ============================================================= 8 -->
+  <section id="production-architecture">
+    <h2>8. Production Architecture — Wiring Real Apps to This Tenant</h2>
+    <p>Now connect actual code to the tenant you configured. Use environment variables — never hard-code IDs or secrets.</p>
+
+    <h3>8.1 React SPA (public client, PKCE)</h3>
+    <pre><code class="language-jsx">// main.jsx — @auth0/auth0-react
+import { Auth0Provider } from "@auth0/auth0-react";
+import { createRoot } from "react-dom/client";
+import App from "./App";
+
+createRoot(document.getElementById("root")).render(
+  &lt;Auth0Provider
+    domain={import.meta.env.VITE_AUTH0_DOMAIN}            // cinebook-dev.us.auth0.com
+    clientId={import.meta.env.VITE_AUTH0_CLIENT_ID}
+    authorizationParams={{
+      redirect_uri: window.location.origin + "/callback",
+      audience: "https://api.cinebook.com",               // ask for an API token!
+      scope: "openid profile email read:bookings create:bookings"
+    }}
+    useRefreshTokens={true}
+    cacheLocation="localstorage"
+  &gt;
+    &lt;App /&gt;
+  &lt;/Auth0Provider&gt;
+);</code></pre>
+    <pre><code class="language-jsx">// Calling the Booking API with the access token
+import { useAuth0 } from "@auth0/auth0-react";
+
+function BookingsButton() {
+  const { getAccessTokenSilently } = useAuth0();
+  async function load() {
+    const token = await getAccessTokenSilently();
+    const res = await fetch("https://localhost:8080/bookings", {
+      headers: { Authorization: `Bearer ${token}` }       // access_token, NOT id_token
+    });
+    console.log(await res.json());
+  }
+  return &lt;button onClick={load}&gt;Load my bookings&lt;/button&gt;;
+}</code></pre>
+
+    <h3>8.2 Next.js Regular Web App (confidential client)</h3>
+    <pre><code class="language-bash"># .env.local  (server-side secrets stay on the server)
+AUTH0_SECRET='use [openssl rand -hex 32]'
+AUTH0_BASE_URL='http://localhost:3001'
+AUTH0_ISSUER_BASE_URL='https://cinebook-dev.us.auth0.com'
+AUTH0_CLIENT_ID='your-regular-web-app-client-id'
+AUTH0_CLIENT_SECRET='your-regular-web-app-client-secret'
+AUTH0_AUDIENCE='https://api.cinebook.com'
+AUTH0_SCOPE='openid profile email read:bookings'</code></pre>
+    <pre><code class="language-js">// app/api/[auth0]/route.js  (@auth0/nextjs-auth0 v3)
+import { handleAuth, handleLogin } from "@auth0/nextjs-auth0";
+
+export const GET = handleAuth({
+  login: handleLogin({
+    authorizationParams: {
+      audience: process.env.AUTH0_AUDIENCE,
+      scope: process.env.AUTH0_SCOPE,
+    },
+  }),
+});</code></pre>
+
+    <h3>8.3 Spring Boot resource server (verifies the API token)</h3>
+    <pre><code class="language-yaml"># application.yml
+spring:
+  security:
+    oauth2:
+      resourceserver:
+        jwt:
+          issuer-uri: https://cinebook-dev.us.auth0.com/
+          audiences: https://api.cinebook.com</code></pre>
+    <pre><code class="language-java">// SecurityConfig.java — map the Auth0 "permissions" claim to authorities
+@Configuration
+@EnableMethodSecurity
+public class SecurityConfig {
+
+  @Bean
+  SecurityFilterChain api(HttpSecurity http) throws Exception {
+    http.authorizeHttpRequests(a -&gt; a
+            .requestMatchers(HttpMethod.GET, "/bookings").hasAuthority("read:bookings")
+            .requestMatchers(HttpMethod.DELETE, "/bookings/**").hasAuthority("cancel:bookings")
+            .anyRequest().authenticated())
+        .oauth2ResourceServer(o -&gt; o.jwt(j -&gt; j.jwtAuthenticationConverter(conv())));
+    return http.build();
+  }
+
+  private JwtAuthenticationConverter conv() {
+    JwtGrantedAuthoritiesConverter ga = new JwtGrantedAuthoritiesConverter();
+    ga.setAuthoritiesClaimName("permissions");  // Auth0's RBAC claim
+    ga.setAuthorityPrefix("");                    // keep "read:bookings" verbatim
+    JwtAuthenticationConverter c = new JwtAuthenticationConverter();
+    c.setJwtGrantedAuthoritiesConverter(ga);
+    return c;
+  }
+}</code></pre>
+
+    <h3>8.4 FastAPI resource server</h3>
+    <pre><code class="language-python"># auth.py — verify RS256 token against tenant JWKS
+import jwt                          # PyJWT
+from jwt import PyJWKClient
+from fastapi import Depends, HTTPException, Security
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+
+DOMAIN = "cinebook-dev.us.auth0.com"
+AUDIENCE = "https://api.cinebook.com"
+ISSUER = f"https://{DOMAIN}/"
+jwks = PyJWKClient(f"https://{DOMAIN}/.well-known/jwks.json")
+bearer = HTTPBearer()
+
+def verify(creds: HTTPAuthorizationCredentials = Security(bearer)):
+    token = creds.credentials
+    key = jwks.get_signing_key_from_jwt(token).key
+    try:
+        return jwt.decode(token, key, algorithms=["RS256"],
+                          audience=AUDIENCE, issuer=ISSUER)
+    except Exception as e:
+        raise HTTPException(401, f"invalid token: {e}")
+
+def require(perm: str):
+    def dep(claims: dict = Depends(verify)):
+        if perm not in claims.get("permissions", []):
+            raise HTTPException(403, "insufficient_permissions")
+        return claims
+    return dep</code></pre>
+    <pre><code class="language-python"># main.py
+from fastapi import FastAPI, Depends
+from auth import require
+app = FastAPI()
+
+@app.get("/bookings")
+def list_bookings(claims = Depends(require("read:bookings"))):
+    return {"sub": claims["sub"], "ok": True}</code></pre>
+
+    <h3>8.5 Node.js M2M (client credentials) + curl + Postman</h3>
+    <pre><code class="language-bash"># curl — exactly what the batch job does
+curl --request POST \
+  --url 'https://cinebook-dev.us.auth0.com/oauth/token' \
+  --header 'content-type: application/json' \
+  --data '{
+    "grant_type": "client_credentials",
+    "client_id": "M2mBatchClientId",
+    "client_secret": "M2M_SECRET",
+    "audience": "https://api.cinebook.com"
+  }'
+# -> { "access_token": "eyJ...", "token_type": "Bearer", "expires_in": 86400 }</code></pre>
+    <pre><code class="language-js">// reconcile.js — Node fetch, cache the token until it expires
+let cache = { token: null, exp: 0 };
+async function getToken() {
+  if (cache.token &amp;&amp; Date.now() &lt; cache.exp - 60_000) return cache.token;
+  const r = await fetch("https://cinebook-dev.us.auth0.com/oauth/token", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      grant_type: "client_credentials",
+      client_id: process.env.M2M_CLIENT_ID,
+      client_secret: process.env.M2M_CLIENT_SECRET,
+      audience: "https://api.cinebook.com",
+    }),
+  });
+  const j = await r.json();
+  cache = { token: j.access_token, exp: Date.now() + j.expires_in * 1000 };
+  return cache.token;
+}</code></pre>
+    <div class="callout note"><span class="tag">Note · Postman</span><p>In Postman, set Authorization → Type = <strong>OAuth 2.0</strong> → Grant Type = <strong>Client Credentials</strong>, Access Token URL = <code>https://cinebook-dev.us.auth0.com/oauth/token</code>, fill Client ID/Secret, and add a <strong>Scope</strong> field plus an <strong>audience</strong> body param via "Advanced Options". Click "Get New Access Token" and Postman caches it for you.</p></div>
+  </section>
+
+  <!-- ============================================================= 9 -->
+  <section id="security">
+    <h2>9. Security Analysis</h2>
+    <ul>
+      <li><strong>Public vs confidential clients.</strong> SPAs and native apps cannot hold a secret — anything shipped to a browser or device is extractable. That is <em>why</em> they use PKCE instead of a client secret. Never "fix" a CORS error by turning an SPA into a Regular Web App and embedding the secret in JS.</li>
+      <li><strong>Callback URL allowlisting.</strong> Exact-match callback/logout URLs prevent attackers from redirecting the authorization response (and thus the code/tokens) to a site they control. Never use wildcards in production; never add <code>http://localhost</code> to a production app.</li>
+      <li><strong>RS256, not HS256.</strong> RS256 lets resource servers verify with a <em>public</em> key from JWKS — no shared secret to leak. HS256 forces every API to hold the signing secret, multiplying the blast radius. Keep the API on RS256.</li>
+      <li><strong>Validate <code>aud</code> and <code>iss</code>.</strong> A token minted for another API (different <code>aud</code>) must be rejected even if the signature is valid — otherwise a low-privilege API's token could be replayed against a high-privilege one.</li>
+      <li><strong>Least-privilege scopes for M2M.</strong> Authorize each M2M client for only the permissions it needs. The batch job gets <code>reconcile:sales</code>, not <code>cancel:bookings</code>.</li>
+      <li><strong><code>app_metadata</code> is the security boundary.</strong> Users can edit their own <code>user_metadata</code> via self-service flows; they can <em>never</em> edit <code>app_metadata</code>. Put authorization-relevant data (plan tier, internal flags, tenant id) in <code>app_metadata</code> only.</li>
+      <li><strong>MFA on privileged roles.</strong> Require MFA for Staff/Admin via a policy or an Action that checks the user's roles. Adaptive MFA steps up only on risky logins, balancing security and friction.</li>
+    </ul>
+    <div class="callout danger"><span class="tag">Danger</span><p>Putting authorization flags in <code>user_metadata</code> (e.g. <code>{"isAdmin": true}</code>) is a critical privilege-escalation bug. Self-service profile endpoints let users write <code>user_metadata</code> — they could make themselves admin. Authorization data lives in roles/permissions or <code>app_metadata</code>, full stop.</p></div>
+  </section>
+
+  <!-- ============================================================= 10 -->
+  <section id="performance">
+    <h2>10. Performance Considerations</h2>
+    <ul>
+      <li><strong>Cache the JWKS.</strong> Resource servers should fetch <code>/.well-known/jwks.json</code> once and cache the keys (Spring, PyJWKClient and express-jwt do this automatically). Re-fetch only on key rotation / unknown <code>kid</code>. Fetching per request adds a network round-trip to every API call.</li>
+      <li><strong>Cache M2M tokens.</strong> Client-credentials tokens live for hours (default 24h). Caching them (as in §8.5) avoids hammering <code>/oauth/token</code> and the per-token M2M billing on paid plans.</li>
+      <li><strong>Keep tokens lean.</strong> Every role/permission and custom claim inflates the JWT. Large tokens slow every request (bigger headers) and can exceed proxy header limits (often 8 KB). If a user has hundreds of permissions, prefer coarse roles or fetch fine-grained authz server-side.</li>
+      <li><strong>RBAC adds negligible issuance cost</strong> but the permission resolution happens per token — another reason to cache and reuse tokens within their lifetime rather than re-authenticating constantly.</li>
+      <li><strong>Region choice = latency.</strong> The <code>/authorize</code> and <code>/oauth/token</code> round-trips go to your tenant's region. Pick the region nearest your user base.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================= 11 -->
+  <section id="mistakes">
+    <h2>11. Common Mistakes</h2>
+    <table>
+      <thead><tr><th>Mistake</th><th>Symptom</th><th>Fix</th></tr></thead>
+      <tbody>
+        <tr><td>No <code>audience</code> requested</td><td>Access token is opaque, "JWT won't decode," API can't verify</td><td>Always pass <code>audience=https://api.cinebook.com</code> in the auth request.</td></tr>
+        <tr><td>Calling API with the ID token</td><td>API returns 401; <code>aud</code> is the client_id, not the API</td><td>Send the <strong>access token</strong>. ID tokens are for the client only.</td></tr>
+        <tr><td>RBAC enabled but "Add Permissions in Access Token" off</td><td><code>permissions</code> claim missing; <code>hasAuthority</code> fails</td><td>Toggle both switches on the API settings tab.</td></tr>
+        <tr><td>Issuer mismatch (trailing slash)</td><td>"invalid issuer" on verification</td><td>Issuer is <code>https://tenant.region.auth0.com/</code> <em>with</em> trailing slash.</td></tr>
+        <tr><td>Secret embedded in an SPA</td><td>Secret leaks via browser dev tools</td><td>Use SPA type + PKCE; secrets only in confidential apps/servers.</td></tr>
+        <tr><td>Authz flags in <code>user_metadata</code></td><td>Privilege escalation</td><td>Use roles/permissions or <code>app_metadata</code>.</td></tr>
+        <tr><td>Wildcard / missing callback URL</td><td>"Callback URL mismatch" error, or open redirect</td><td>Add exact callback URLs per environment.</td></tr>
+        <tr><td>Testing config in the prod tenant</td><td>Broken logins for real users</td><td>One tenant per environment; promote config via deploy tooling.</td></tr>
+        <tr><td>M2M app over-authorized</td><td>Stolen machine token can do too much</td><td>Grant only the scopes the job needs.</td></tr>
+        <tr><td>Forgetting to enable a connection on the app</td><td>Login screen missing Google / enterprise button</td><td>Toggle the connection ON under its "Applications" tab.</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- ============================================================= 12 -->
+  <section id="best-practices">
+    <h2>12. Best Practices</h2>
+    <ul>
+      <li><strong>Name things by environment and type:</strong> <code>CineBook Web (React) — dev</code>. Future-you will thank present-you.</li>
+      <li><strong>One tenant per environment</strong>, and manage config as code with the <strong>Auth0 Deploy CLI</strong> or Terraform so dev → staging → prod is reproducible (covered deeply in later chapters).</li>
+      <li><strong>Design scopes by capability</strong> (<code>read:bookings</code>, <code>cancel:bookings</code>), not by role. Roles <em>bundle</em> scopes; the API checks scopes/permissions.</li>
+      <li><strong>Enable RBAC + add permissions to the token</strong> from day one so your resource servers have a stable authorization signal.</li>
+      <li><strong>Keep secrets in a vault / env vars,</strong> rotate them, and never commit <code>.env</code>.</li>
+      <li><strong>Use Organizations for B2B</strong> isolation (per-customer branding, connections, membership) rather than overloading metadata.</li>
+      <li><strong>Put display/preference data in <code>user_metadata</code>, authorization/business data in <code>app_metadata</code>.</strong></li>
+      <li><strong>Turn on MFA early</strong> (at least for privileged roles) and prefer phishing-resistant factors (WebAuthn/passkeys) plus Adaptive MFA.</li>
+      <li><strong>Prefer enterprise & passwordless connections</strong> where they reduce password risk, and always enable the connection on the specific app/org that needs it.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================= 13 -->
+  <section id="interview">
+    <h2>13. Interview Questions (with model answers)</h2>
+
+    <h4>Q1. What is the difference between an Auth0 Application and an Auth0 API?</h4>
+    <p><strong>Model answer:</strong> An Application is an OAuth <em>client</em> — it requests tokens (SPA, Regular Web App, M2M). An API is an OAuth <em>resource server</em> identified by an <em>audience</em> — it consumes/verifies access tokens. The app obtains a token whose <code>aud</code> equals the API's identifier, then calls the API with it. They are two sides of the OAuth exchange.</p>
+
+    <h4>Q2. Why does an SPA use PKCE while a Regular Web App can use a client secret?</h4>
+    <p><strong>Model answer:</strong> An SPA is a public client — its code runs in the browser, so any embedded secret is extractable. PKCE binds the authorization code to a dynamically generated verifier known only to that browser session, so an intercepted code is useless. A Regular Web App runs on a server, can safely store a secret, and authenticates the token request with it.</p>
+
+    <h4>Q3. How do RBAC permissions end up in the access token?</h4>
+    <p><strong>Model answer:</strong> You enable "RBAC" and "Add Permissions in the Access Token" on the API. At issuance, Auth0 resolves the user's permissions (direct + via roles), intersects them with the requested scopes, and writes them as a <code>permissions</code> array (and folds granted scopes into <code>scope</code>). The resource server then authorizes on that claim.</p>
+
+    <h4>Q4. <code>user_metadata</code> vs <code>app_metadata</code> — when do you use each?</h4>
+    <p><strong>Model answer:</strong> <code>user_metadata</code> is user-editable, for preferences/display (theme, language). <code>app_metadata</code> is read-only to the user and set by the backend, for authorization/business data (plan, tenant id, internal flags). Putting authz data in <code>user_metadata</code> is a privilege-escalation risk because self-service flows can write it.</p>
+
+    <h4>Q5. What does the audience parameter do, and what happens if you omit it?</h4>
+    <p><strong>Model answer:</strong> <code>audience</code> tells Auth0 which API the token is for; the issued token's <code>aud</code> is set to that identifier and it becomes a verifiable JWT. Omit it and Auth0 returns an opaque access token only valid at <code>/userinfo</code> — your API cannot verify it as a JWT.</p>
+
+    <h4>Q6. When would you use Organizations instead of separate tenants?</h4>
+    <p><strong>Model answer:</strong> Organizations model B2B customers <em>within one tenant</em> — shared infrastructure but isolated membership, per-org connections (e.g. each customer's SSO) and branding. Separate tenants are for environments (dev/staging/prod) or hard data-isolation/compliance boundaries, not per-customer multi-tenancy.</p>
+
+    <h4>Q7. How does an M2M token differ from a user token?</h4>
+    <p><strong>Model answer:</strong> M2M uses the client-credentials grant — no user, no interactive login. The token's <code>sub</code> is the client (<code>...@clients</code>), <code>gty</code> is <code>client-credentials</code>, there is no <code>id_token</code>, and authorization comes from scopes granted to the client, not user roles.</p>
+
+    <h4>Q8. Why RS256 over HS256 for an API?</h4>
+    <p><strong>Model answer:</strong> RS256 is asymmetric: Auth0 signs with a private key, resource servers verify with the public key from JWKS — no shared secret. HS256 is symmetric, forcing every verifier to hold the signing secret, increasing leak risk and coupling. RS256 also supports clean key rotation via <code>kid</code>.</p>
+  </section>
+
+  <!-- ============================================================= 14 -->
+  <section id="certification">
+    <h2>14. Certification Tips</h2>
+    <ul>
+      <li><strong>Know the four application types cold</strong> and the grant/auth-method each defaults to (SPA→PKCE/public, RWA→code+secret, M2M→client_credentials, Native→PKCE/device).</li>
+      <li><strong>The exam loves the audience trap:</strong> "Why is the access token opaque?" → no audience requested. "Why 401 calling the API?" → ID token used, or wrong <code>aud</code>.</li>
+      <li><strong>RBAC two-switch rule:</strong> permissions appear in the token only when <em>both</em> "Enable RBAC" and "Add Permissions in Access Token" are on.</li>
+      <li><strong>Metadata:</strong> remember user_metadata = user-editable preferences; app_metadata = backend-set, security-sensitive, not user-editable.</li>
+      <li><strong>Connections are enabled per application/organization</strong> — a connection existing isn't enough; it must be toggled on for the app.</li>
+      <li><strong>Organizations</strong> = B2B within a tenant; understand "Business Users", login prompt behaviour, and the <code>org_id</code> claim.</li>
+      <li><strong>Passwordless and MFA</strong> are configured under Authentication / Security and must be enabled for the relevant connection/app; know OTP, magic link, SMS, WebAuthn factors.</li>
+      <li><strong>Region and domain are immutable;</strong> the domain is the issuer; one tenant per environment is the recommended topology.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================= 15 -->
+  <section id="exercises">
+    <h2>15. Hands-On Exercises</h2>
+    <ol>
+      <li>Create a development tenant named <code>&lt;yourname&gt;-dev</code> and note its full domain (issuer).</li>
+      <li>Register an SPA called "Lab SPA"; set callbacks/origins for <code>http://localhost:3000</code>. Copy the Client ID.</li>
+      <li>Register a Regular Web App "Lab RWA"; copy its Client ID and Secret; confirm a secret exists (it should — SPAs have none).</li>
+      <li>Create an API "Lab API" with identifier <code>https://api.lab.test</code>; add permissions <code>read:items</code> and <code>write:items</code>; enable RBAC and "Add Permissions in Access Token".</li>
+      <li>Create an M2M app "Lab Bot"; authorize it for <code>read:items</code> only. Run the §8.5 curl and decode the token at jwt.io — confirm <code>gty=client-credentials</code> and <code>sub</code> ends in <code>@clients</code>.</li>
+      <li>Create roles "Reader" (read:items) and "Editor" (read+write:items). Create a user and assign "Editor".</li>
+      <li>On the user, set <code>user_metadata = {"theme":"dark"}</code> and <code>app_metadata = {"plan":"pro"}</code>. Confirm which one a self-service profile edit could change.</li>
+      <li>Enable a Google social connection in dev (Auth0 dev keys are fine) and toggle it ON for "Lab SPA".</li>
+      <li>Enable Email passwordless and confirm the connection appears in the login widget for "Lab SPA".</li>
+      <li>Enable MFA with OTP (authenticator app) and set the policy to "Always".</li>
+    </ol>
+  </section>
+
+  <!-- ============================================================= 16 -->
+  <section id="assignment">
+    <h2>16. Assignment</h2>
+    <p>Stand up the complete <strong>CineBook identity foundation</strong> in a fresh dev tenant and produce a one-page "tenant map" document. Deliverables:</p>
+    <ol>
+      <li>Tenant <code>cinebook-dev</code> with three apps (SPA, RWA, M2M) and the Booking API with all four permissions, RBAC enabled.</li>
+      <li>Three roles (Customer, Staff, Admin) with correct permission bundles; at least three users, one per role.</li>
+      <li>One Organization (<code>acme</code>) with branding and at least one member; SPA configured for "Business Users".</li>
+      <li>Google social, Email passwordless, and OTP MFA enabled and toggled onto the SPA.</li>
+      <li>Wire the React SPA (§8.1) and one resource server (Spring/FastAPI/Node) to the tenant and successfully call <code>GET /bookings</code> with a token that carries <code>read:bookings</code>; capture the decoded token JSON as proof.</li>
+      <li>Document, for each object, its purpose and the security reason behind each non-default setting you changed.</li>
+    </ol>
+    <div class="callout tip"><span class="tag">Tip</span><p>The "tenant map" is exactly the artifact a senior engineer is expected to produce when onboarding a new identity setup — practising it now pays off in interviews and on the job.</p></div>
+  </section>
+
+  <!-- ============================================================= 17 -->
+  <section id="mini-project">
+    <h2>17. Mini Project — "CineBook Bookings" End-to-End Slice</h2>
+    <p>Build a thin but complete vertical slice that exercises every object you configured:</p>
+    <pre class="diagram">
+ +-----------+    login (PKCE)     +--------+   issues   +-------------+
+ | React SPA |&lt;------------------&gt;| Auth0  |----------&gt;| access_token |
+ |  customer |   audience=BookingAPI       |           |  perms:read |
+ +-----+-----+                     +--------+           +------+------+
+       |  GET /bookings  Bearer access_token                   |
+       v                                                       |
+ +-----------------------------+   verify (JWKS, aud, iss, perm)|
+ | Resource server (FastAPI or |&lt;------------------------------+
+ | Spring) checks read:bookings|
+ +--------------+--------------+
+                |  also called nightly by:
+                v
+        +-----------------+  client_credentials  +--------+
+        | M2M batch (Node)|--------------------&gt;| Auth0  |
+        | reconcile:sales |   audience=BookingAPI +--------+
+        +-----------------+
+    </pre>
+    <p><strong>Acceptance criteria:</strong></p>
+    <ol>
+      <li>A logged-in <em>Customer</em> can <code>GET /bookings</code> (has <code>read:bookings</code>) but receives <strong>403</strong> on <code>DELETE /bookings/123</code> if they lack <code>cancel:bookings</code>.</li>
+      <li>An <em>Admin</em> can both read and cancel.</li>
+      <li>The M2M batch obtains a token via client credentials and calls a <code>reconcile</code> endpoint guarded by <code>reconcile:sales</code>; a token without that scope is rejected.</li>
+      <li>Logging in via Google produces a user with the same RBAC behaviour once a role is assigned.</li>
+      <li>Switching MFA policy to "Always" forces a second factor on next login.</li>
+    </ol>
+    <p>Optional stretch: enable an enterprise connection (use Auth0's built-in SAML test IdP or Okta dev) and verify an enterprise user gets the same access token shape, plus an <code>org_id</code> when logging in through the Organization.</p>
+  </section>
+
+  <!-- ============================================================= 18 -->
+  <section id="quiz">
+    <h2>18. Quiz — Test Yourself (25 questions)</h2>
+    <ol>
+      <li>What OAuth role does an Auth0 <em>tenant</em> play?</li>
+      <li>What OAuth role does an Auth0 <em>Application</em> play, and an Auth0 <em>API</em>?</li>
+      <li>Which application type uses PKCE and holds no client secret?</li>
+      <li>Which grant type does a Machine-to-Machine app use?</li>
+      <li>What configuration value becomes the <code>aud</code> claim of issued access tokens?</li>
+      <li>What happens to the access token if you request no <code>audience</code>?</li>
+      <li>Which two switches must both be ON for permissions to appear in the access token?</li>
+      <li>Where do you assign permissions to a role?</li>
+      <li>True/False: the ID token is the correct token to send to your API.</li>
+      <li>Which metadata field is editable by the end user?</li>
+      <li>Which metadata field should hold authorization/business data and why?</li>
+      <li>What claim distinguishes an M2M token's subject from a user's?</li>
+      <li>Why is the issuer string written with a trailing slash?</li>
+      <li>What is the difference between using Organizations and using separate tenants?</li>
+      <li>Which claim appears in a token only when the user logs in through an Organization?</li>
+      <li>Why must callback URLs be exact-match and not wildcards?</li>
+      <li>Why is RS256 preferred over HS256 for verifying API tokens?</li>
+      <li>What must you do after creating a Google social connection before users see the button?</li>
+      <li>Name two passwordless factors Auth0 supports.</li>
+      <li>Name two phishing-resistant or stronger MFA factors.</li>
+      <li>Why should resource servers cache the JWKS?</li>
+      <li>Why should M2M clients cache their access token?</li>
+      <li>What is the recommended tenant topology across environments?</li>
+      <li>What is the difference between <code>scope</code> and <code>permissions</code> in the token?</li>
+      <li>A Customer gets 403 on cancel but 200 on read — what is the likely RBAC cause?</li>
+    </ol>
+
+    <details>
+      <summary>Show answer key</summary>
+      <ol>
+        <li>An isolated OAuth 2.0 <strong>authorization server</strong> / OIDC identity provider with its own domain (issuer) and signing keys.</li>
+        <li>Application = OAuth <strong>client</strong> (requests tokens); API = OAuth <strong>resource server</strong>, identified by an audience (consumes/verifies tokens).</li>
+        <li>Single Page Application (and Native), a public client.</li>
+        <li><code>client_credentials</code>.</li>
+        <li>The API's <strong>Identifier</strong> (audience).</li>
+        <li>Auth0 returns an <strong>opaque</strong> access token, valid only at <code>/userinfo</code> — not a verifiable JWT.</li>
+        <li>"Enable RBAC" and "Add Permissions in the Access Token" on the API.</li>
+        <li>User Management → Roles → the role → Permissions tab → Add Permissions (select the API).</li>
+        <li>False — APIs accept <strong>access tokens</strong>; ID tokens are for the client.</li>
+        <li><code>user_metadata</code>.</li>
+        <li><code>app_metadata</code> — it is not user-editable, so it is safe for authorization data.</li>
+        <li><code>sub</code> ends with <code>@clients</code> (and <code>gty=client-credentials</code>).</li>
+        <li>Because Auth0's issuer value is the domain with a trailing slash, e.g. <code>https://tenant.us.auth0.com/</code>; verifiers must match it exactly.</li>
+        <li>Organizations = B2B customers within one tenant (shared infra, isolated membership/branding/connections); separate tenants = environment or hard isolation boundaries.</li>
+        <li><code>org_id</code>.</li>
+        <li>To prevent open-redirect attacks that steal the authorization code/tokens by redirecting to an attacker-controlled URL.</li>
+        <li>RS256 is asymmetric — verifiers use the public JWKS key, no shared secret to leak; supports key rotation via <code>kid</code>.</li>
+        <li>Toggle the connection ON for that Application (Connections/Applications tab).</li>
+        <li>Email magic link / Email OTP and SMS OTP (also WebAuthn-style passwordless).</li>
+        <li>WebAuthn / passkeys and OTP authenticator apps (push, Duo) — avoid SMS where stronger factors exist.</li>
+        <li>To avoid a network round-trip per request; keys change only on rotation.</li>
+        <li>Tokens are long-lived (hours); caching avoids hammering <code>/oauth/token</code> and extra cost/latency.</li>
+        <li>One tenant per environment: dev, staging, prod.</li>
+        <li><code>scope</code> = what the app requested and was granted; <code>permissions</code> = the explicit RBAC array resolved from the user's roles.</li>
+        <li>The user's role lacks the <code>cancel:bookings</code> permission (or it wasn't added to the role / not in the token).</li>
+      </ol>
+    </details>
+  </section>
+
+  <!-- ============================================================= 19 -->
+  <section id="cheatsheet">
+    <h2>19. Cheat Sheet</h2>
+    <pre class="diagram">
+ OBJECTS
+   Tenant  = authorization server   (domain = issuer, has signing keys)
+   App     = OAuth client           (requests tokens)
+   API     = resource server        (Identifier = audience, verifies tokens)
+   Role    = bundle of permissions  (assigned to users)
+   Org     = B2B tenancy in a tenant (isolated members/branding/connections)
+
+ APP TYPES
+   SPA          -> PKCE, no secret, public client
+   Regular Web  -> auth code + client_secret (server-side)
+   M2M          -> client_credentials (no user, sub=...@clients)
+   Native       -> PKCE + device code, no secret
+
+ MUST-DO TOGGLES
+   API: Enable RBAC  +  Add Permissions in Access Token
+   Connection: enable per Application/Organization
+
+ TOKEN RULES
+   Call APIs with the ACCESS TOKEN (not id_token)
+   Always send audience= to get a JWT (else opaque)
+   Verify: signature(RS256/JWKS) + iss + aud + exp + scope/permissions
+
+ METADATA
+   user_metadata = user-editable preferences (theme, lang)
+   app_metadata  = backend-only, authz/business data (plan, tenant, flags)
+
+ KEY ENDPOINTS  (tenant.region.auth0.com)
+   /authorize                       start login
+   /oauth/token                     exchange code / client_credentials
+   /userinfo                        profile (opaque token ok here)
+   /.well-known/openid-configuration   discovery
+   /.well-known/jwks.json           public keys for verification
+
+ CLI/CURL (M2M)
+   POST /oauth/token  grant_type=client_credentials
+        client_id + client_secret + audience
+</pre>
+  </section>
+
+  <!-- ============================================================= 20 -->
+  <section id="takeaways">
+    <h2>20. Key Takeaways</h2>
+    <div class="callout key"><span class="tag">Key</span><p>A <strong>tenant is an isolated OAuth authorization server</strong>; <strong>Applications request tokens</strong>, <strong>APIs (audiences) consume them</strong>. Get those three nouns right and the entire dashboard is just wiring them together.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p>Pick the <strong>application type that matches where the code runs</strong>: SPA/Native are public clients (PKCE, no secret); Regular Web Apps and M2M are confidential (hold a secret). Never embed a secret in a browser.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p>To get a verifiable JWT for your API, always request an <strong>audience</strong>; to get <strong>permissions in the token</strong>, enable <strong>both</strong> RBAC switches on the API.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p><strong>Roles bundle permissions</strong> for users; <strong>scopes</strong> are what the app requests; the resource server authorizes on the resulting <code>permissions</code>/<code>scope</code> claim after verifying signature, <code>iss</code>, <code>aud</code> and <code>exp</code>.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p><strong>user_metadata = user-editable preferences; app_metadata = backend-only authorization/business data.</strong> Never put security flags in user_metadata.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p>Use <strong>Organizations for B2B multi-tenancy</strong>, enable <strong>connections per app/org</strong>, and turn on <strong>social, passwordless and MFA</strong> deliberately — each is a separate, intentional toggle, not a default.</p></div>
+    <p>You can now stand up a complete identity foundation from an empty tenant and justify every setting. In <a href="chapter-14.html">Chapter 14</a> we automate and extend this with Actions, custom claims, the Management API, and advanced M2M patterns.</p>
+  </section>
+
+  <nav class="pager">
+    <a class="prev" href="chapter-12.html">← Previous</a>
+    <a class="next" href="chapter-14.html">Next →</a>
+  </nav>
+</main>
+<footer class="site-footer">Master Auth0 End-to-End · Chapter 13 of 32</footer>
+</body>
+</html>

@@ -1,0 +1,816 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 12 — Auth0 Extensibility and Platform Security | Master Auth0</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">🔐 Master Auth0</a>
+  <nav class="topnav">
+    <a href="chapter-11.html">← Prev</a>
+    <a href="index.html">Contents</a>
+    <a href="chapter-13.html">Next →</a>
+  </nav>
+</header>
+<main class="container">
+  <div class="chapter-head">
+    <span class="phase">Phase 5 · Auth0 Fundamentals</span>
+    <h1>Chapter 12 — Auth0 Extensibility and Platform Security</h1>
+    <p class="lead">A vanilla identity provider gives you login. A <em>production</em> identity provider lets you reshape the login pipeline to fit your business, and then defends that pipeline against attackers who treat your login box as the front door to every account you own. This chapter is about both halves: <strong>extensibility</strong> (Actions, the legacy Rules/Hooks they replace, custom claims) and <strong>platform security</strong> (Attack Protection, Adaptive MFA, anomaly detection, rate limits, custom domains, branding, password policies, logs and log streams, and infrastructure-as-code with the Deploy CLI and Terraform). We build every concept from first principles — why it exists before how to wire it — so that by the end you can extend a tenant safely, harden it against real attacks, and codify the whole thing in version control.</p>
+  </div>
+
+  <!-- 1 -->
+  <section id="theory">
+    <h2>1. Theory — First Principles of Extensibility and Platform Security</h2>
+    <p>Start with the fundamental tension. Auth0 is a <em>multi-tenant SaaS</em>: one shared codebase serves thousands of customers. If Auth0 hard-coded every business rule any customer ever wanted ("block logins from competitor email domains", "add the user's subscription tier to the token", "force step-up MFA when the cart total exceeds $500"), the product would collapse under its own weight. So Auth0 solves this the way every successful platform does: it exposes <strong>extension points</strong> — well-defined moments in the authentication pipeline where <em>your</em> code runs inside <em>their</em> infrastructure.</p>
+    <p>That single design decision creates everything in this chapter. Extension points are where you customize behaviour (Actions, Rules, Hooks, custom claims). But the moment you let customer code run during login, and the moment that login endpoint is exposed to the public internet, you have created an attack surface. So the same pipeline needs <strong>guardrails</strong>: brute-force protection, breached-password detection, suspicious-IP throttling, MFA, anomaly detection, and rate limits. Extensibility and security are two faces of the same coin — the programmable login pipeline.</p>
+    <p>Three first principles anchor the whole chapter:</p>
+    <ul>
+      <li><strong>The pipeline is a sequence of triggers.</strong> Authentication is not one atomic event; it is a series of stages (credentials verified → post-login → token minted). Each stage is a <em>trigger</em> you can hook into. Understanding the trigger order is understanding the system.</li>
+      <li><strong>Defense in depth.</strong> No single control stops every attack. Brute-force protection stops password guessing; breached-password detection stops credential stuffing; MFA stops a stolen password; anomaly detection catches the rest. You layer them because attackers only need one gap.</li>
+      <li><strong>Configuration is code.</strong> A tenant is infrastructure. Click-ops in a dashboard does not survive audits, rollbacks, or a second environment. The Deploy CLI and Terraform exist because identity config must be reviewable, versioned, and reproducible.</li>
+    </ul>
+    <div class="callout key"><span class="tag">Key</span><p>Everything in this chapter flows from one idea: Auth0 is a <em>programmable, internet-facing login pipeline</em>. Extensibility is the programming model; platform security is the set of guardrails that keep the open pipeline from becoming an open door.</p></div>
+  </section>
+
+  <!-- 2 -->
+  <section id="story">
+    <h2>2. Story-Based Explanation</h2>
+    <p>Meet <strong>Lena</strong>, the lead backend engineer at <em>CineWave</em>, a streaming startup. CineWave launched on Auth0 with the defaults. Three things happen over six months, and each one teaches a piece of this chapter.</p>
+    <p><strong>Month 1 — the missing claim.</strong> Product wants the frontend to show a "Premium" badge without an extra API call. The cleanest fix: stamp the user's <code>subscription_tier</code> into the ID token at login. Lena discovers Auth0 <em>Actions</em> — small functions that run on the <code>post-login</code> trigger and can add custom claims. Ten lines of code, deployed, done. This is <strong>extensibility</strong>.</p>
+    <p><strong>Month 3 — the attack.</strong> Lena's pager goes off at 2 a.m. The logs show 40,000 login attempts in ten minutes from a botnet, cycling through email/password pairs leaked from an unrelated breach. This is <em>credential stuffing</em>. CineWave is lucky — Auth0's <strong>Breached Password Detection</strong> and <strong>Suspicious IP Throttling</strong> were silently absorbing most of it. Lena turns on <strong>Brute-Force Protection</strong> lockouts and <strong>Bot Detection</strong>, and enables <strong>Adaptive MFA</strong> so risky logins get challenged while normal users sail through. This is <strong>platform security</strong>.</p>
+    <p><strong>Month 6 — the audit and the second environment.</strong> CineWave needs SOC 2. The auditor asks: "Show me how your production tenant differs from staging, and who changed the password policy last quarter." Lena has no answer — it was all dashboard clicks. She adopts <strong>Terraform with the auth0 provider</strong>, codifies every Action, connection, and Attack Protection setting, and now every change is a reviewed pull request. This is <strong>configuration as code</strong>.</p>
+    <div class="callout note"><span class="tag">Note</span><p>Lena's arc is the chapter's arc: you <em>extend</em> first because the business asks for it, you <em>secure</em> next because the internet finds you, and you <em>codify</em> last because the organization demands it. We will return to CineWave throughout.</p></div>
+  </section>
+
+  <!-- 3 -->
+  <section id="diagrams">
+    <h2>3. ASCII Diagrams — The Pipeline and Its Triggers</h2>
+    <p>First, the overall authentication pipeline and where each extension point and guardrail sits.</p>
+    <pre class="diagram">
+        ┌──────────────────────────────────────────────────────────────┐
+        │                  AUTH0 LOGIN PIPELINE                          │
+        └──────────────────────────────────────────────────────────────┘
+
+   USER                                                          YOUR APP
+    │  1. /authorize                                                ▲
+    ▼                                                               │
+ ┌──────────────┐   guardrails fire here (before code runs)        │
+ │  EDGE / WAF  │── Rate limits · Bot Detection · Suspicious IP ───┤
+ └──────┬───────┘                                                  │
+        │ 2. credentials posted                                    │
+        ▼                                                          │
+ ┌──────────────────────┐   Brute-Force lockout · Breached-Pw      │
+ │  CREDENTIAL VERIFY    │── check ───────────────────────────────┤
+ └──────┬───────────────┘                                          │
+        │ 3. identity established                                  │
+        ▼                                                          │
+ ┌──────────────────────┐                                          │
+ │  TRIGGER: post-login  │◄── YOUR ACTION runs here:               │
+ │   (Actions / Rules)   │     • add custom claims                 │
+ │                       │     • Adaptive MFA decision (api.mfa)   │
+ │                       │     • deny / redirect / enrich          │
+ └──────┬───────────────┘                                          │
+        │ 4. MFA challenge (if required)                           │
+        ▼                                                          │
+ ┌──────────────────────┐                                          │
+ │  TOKEN MINTING        │── claims baked into ID + Access token ──┘
+ │  (TRIGGER: ctx token  │
+ │   for client-creds)   │
+ └──────────────────────┘
+        │
+        ▼  5. logs emitted → Log Streams → SIEM
+   ┌─────────────────┐
+   │ MONITORING /SIEM│
+   └─────────────────┘
+    </pre>
+    <p>Next, the Action <em>secrets and event/api</em> model — the contract every Action follows.</p>
+    <pre class="diagram">
+   ┌─────────────────────── ACTION RUNTIME ───────────────────────┐
+   │                                                               │
+   │   exports.onExecutePostLogin = async (event, api) =&gt; {        │
+   │                              │            │                   │
+   │        READ-ONLY  ──────────┘            └──── MUTATIONS      │
+   │   event.user, event.client,         api.idToken.setCustomClaim│
+   │   event.request.ip, event.secrets,  api.access.deny(...)      │
+   │   event.authentication              api.multifactor.enable(...)│
+   │                                                               │
+   │   SECRETS (encrypted at rest, never in code):                 │
+   │   event.secrets.STRIPE_KEY ◄── set in dashboard / via CLI     │
+   │                                                               │
+   │   DEPENDENCIES (npm): require('axios') after adding in editor │
+   │   }                                                            │
+   └───────────────────────────────────────────────────────────────┘
+    </pre>
+    <p>Finally, the migration path from legacy to modern extensibility.</p>
+    <pre class="diagram">
+   LEGACY (deprecated)                         MODERN (use this)
+   ┌───────────────┐                           ┌──────────────────┐
+   │ Rules         │  run sequentially,        │ Actions          │
+   │ (login only)  │  shared mutable `context` │ • versioned      │
+   ├───────────────┤  ──── migrate ──────►     │ • secrets vault  │
+   │ Hooks         │  per-extensibility-point  │ • npm deps       │
+   │ (4 hook pts)  │                           │ • bound to triggers
+   └───────────────┘                           └──────────────────┘
+        EOL: Nov 2026 (per Auth0 deprecation)   Triggers: post-login,
+                                                 pre-user-reg, post-user-reg,
+                                                 credentials-exchange, mfa, ...
+    </pre>
+  </section>
+
+  <!-- 4 -->
+  <section id="analogy">
+    <h2>4. Real-World Analogy</h2>
+    <p>Picture a high-security office building, and map every concept onto it.</p>
+    <table>
+      <thead><tr><th>Building element</th><th>Auth0 concept</th><th>Why the mapping holds</th></tr></thead>
+      <tbody>
+        <tr><td>The lobby's front door</td><td>The login pipeline (<code>/authorize</code>)</td><td>One controlled entry every visitor must pass through.</td></tr>
+        <tr><td>The receptionist who runs custom checks ("does this visitor have a meeting?")</td><td>Actions on the <code>post-login</code> trigger</td><td>Your business logic runs at a defined moment for every entrant.</td></tr>
+        <tr><td>The visitor badge that encodes "floor access: 3, 7"</td><td>Custom claims in the token</td><td>Authorization data travels with the holder, no re-check needed downstream.</td></tr>
+        <tr><td>A locked safe behind the desk holding master keys</td><td>Action secrets</td><td>Sensitive material the receptionist can use but never carries openly.</td></tr>
+        <tr><td>Guard who locks the door after 5 failed badge swipes</td><td>Brute-force protection</td><td>Stops someone trying every keycard combination.</td></tr>
+        <tr><td>A list of stolen keycards that are auto-rejected</td><td>Breached-password detection</td><td>Known-compromised credentials are refused on sight.</td></tr>
+        <tr><td>Extra retina scan only when something looks off</td><td>Adaptive MFA</td><td>Friction applied <em>by risk</em>, not to everyone.</td></tr>
+        <tr><td>Turnstile that admits only N people per minute</td><td>Rate limits</td><td>Caps throughput so a crowd cannot overwhelm the lobby.</td></tr>
+        <tr><td>The building's official street address on the directory</td><td>Custom domain</td><td>Visitors trust <code>login.cinewave.com</code>, not a generic <code>*.auth0.com</code>.</td></tr>
+        <tr><td>Security-camera feed sent to a central monitoring company</td><td>Log streams to a SIEM</td><td>Events leave the building in real time for independent analysis.</td></tr>
+        <tr><td>The architectural blueprints in the city records office</td><td>Terraform / Deploy CLI config</td><td>The building can be rebuilt exactly from versioned plans.</td></tr>
+      </tbody>
+    </table>
+    <div class="callout tip"><span class="tag">Tip</span><p>If you ever forget what a feature is <em>for</em>, return to the building. Security features are guards and turnstiles; extensibility features are the receptionist's clipboard; configuration-as-code is the blueprints. None of them replace the others.</p></div>
+  </section>
+
+  <!-- 5 -->
+  <section id="internals">
+    <h2>5. Internal Working</h2>
+    <h3>How Actions actually execute</h3>
+    <p>An Action is a JavaScript function bound to a <strong>trigger</strong>. When the pipeline reaches that trigger, Auth0 runs your function inside a sandboxed Node.js runtime (currently Node 22 for new Actions) on its serverless infrastructure. The function receives two objects:</p>
+    <ul>
+      <li><code>event</code> — an immutable snapshot of the current context: the user, the client (application), the connection, the request (IP, user agent, geo), the tenant, and <code>event.secrets</code>.</li>
+      <li><code>api</code> — the only way to <em>change</em> anything: <code>api.idToken.setCustomClaim()</code>, <code>api.accessToken.setCustomClaim()</code>, <code>api.access.deny()</code>, <code>api.redirect.sendUserTo()</code>, <code>api.multifactor.enable()</code>, etc.</li>
+    </ul>
+    <p>This <em>read from <code>event</code>, mutate via <code>api</code></em> split is deliberate: it makes the side effects explicit and auditable, the opposite of Rules' shared mutable <code>context</code> object where any rule could quietly overwrite another's work.</p>
+    <h3>Triggers and flows</h3>
+    <p>A <strong>trigger</strong> is a named extension point (e.g. <code>post-login</code>, <code>credentials-exchange</code>, <code>pre-user-registration</code>, <code>post-user-registration</code>, <code>send-phone-message</code>, <code>password-reset-post-challenge</code>). A <strong>flow</strong> is the ordered list of Actions bound to a trigger; Auth0 runs them top-to-bottom, and each can short-circuit the pipeline (e.g. <code>api.access.deny()</code>).</p>
+    <h3>Secrets</h3>
+    <p>Secrets are key/value pairs stored encrypted at rest, scoped to a single Action, and injected at runtime as <code>event.secrets.NAME</code>. They never appear in the code body, never get committed to source control, and are write-only from the UI (you can replace but not read them back). That is exactly how a secret should behave.</p>
+    <h3>How Attack Protection decides</h3>
+    <p>Each guardrail keeps server-side counters and signals:</p>
+    <ul>
+      <li><strong>Brute-force</strong> tracks failed attempts <em>per user account</em> and per IP. Cross a threshold and Auth0 blocks the offending IP for that account and (optionally) emails the user.</li>
+      <li><strong>Suspicious IP throttling</strong> tracks high-velocity login/signup attempts <em>per IP</em> across accounts — the credential-stuffing signature — and throttles or blocks that IP.</li>
+      <li><strong>Breached-password detection</strong> matches submitted credentials against a continuously updated corpus of credentials exposed in third-party breaches. On a match it can block login and notify the user to reset.</li>
+      <li><strong>Bot detection</strong> injects a CAPTCHA when traffic looks automated, raising the cost of scripted attacks.</li>
+    </ul>
+    <h3>Anomaly Detection — the umbrella term</h3>
+    <p>"Anomaly Detection" is Auth0's historical name for the protection suite, and the term still appears in docs, dashboards, and exam questions, so be precise about what it covers. Classically, <strong>Anomaly Detection</strong> referred to exactly two controls — <strong>Brute-Force Protection</strong> and <strong>Breached Password Detection</strong> — both reached today under <em>Security → Attack Protection</em>. Newer controls (Suspicious IP Throttling and Bot Detection) were added under the same Attack Protection roof. So treat "Anomaly Detection" and "Attack Protection" as describing the <em>same family of features</em>: server-side detectors that watch login/signup traffic for abnormal patterns and respond with shields. The distinction worth memorising:</p>
+    <ul>
+      <li><strong>Anomaly / Attack Protection is behavioural and stateful.</strong> It correlates events over time (failed attempts, velocity per IP, credential matches) to <em>detect</em> an attack and then act per account or per IP.</li>
+      <li><strong>Rate limits are flat and stateless by comparison.</strong> They cap raw request volume per endpoint/IP regardless of whether the traffic is malicious. A request can be perfectly legitimate and still be rate-limited; an anomaly shield only fires when the pattern looks like an attack.</li>
+    </ul>
+    <p>Both layers run <em>before</em> your Action code. By the time <code>post-login</code> executes, the anomaly detectors have already had their say — which is why an Action is the place for <em>business</em> risk decisions (step-up MFA for admins, deny disposable emails), not for re-implementing brute-force counting.</p>
+    <h3>How risk → MFA works (Adaptive MFA)</h3>
+    <p>On each login, Auth0 computes a <strong>confidence score</strong> from device, location, and behavioural signals. Adaptive MFA challenges only when confidence is low. In an Action you can read that risk via <code>event.authentication?.riskAssessment</code> and decide to call <code>api.multifactor.enable('any', { allowRememberBrowser: true })</code>.</p>
+    <pre class="diagram">
+   LOGIN ATTEMPT
+        │
+        ▼
+   ┌──────────────┐  signals: new device? impossible travel?
+   │ RISK ENGINE  │  IP reputation? velocity?
+   └──────┬───────┘
+          │ confidence score
+          ▼
+   ┌───────────────┐   high ──► allow (no MFA)
+   │  THRESHOLD    │   med  ──► challenge MFA
+   │  EVALUATION   │   low  ──► challenge MFA (or block)
+   └───────────────┘
+    </pre>
+  </section>
+
+  <!-- 6 -->
+  <section id="walkthrough">
+    <h2>6. Code Walkthrough</h2>
+    <h3>6.1 A post-login Action that adds custom claims</h3>
+    <p>The single most common Action. Note the namespaced claim name — OIDC requires non-standard claims to be URI-namespaced so they cannot collide with reserved claims.</p>
+    <pre><code class="language-javascript">/**
+ * Trigger: post-login
+ * Adds the user's subscription tier and roles as namespaced custom claims.
+ */
+exports.onExecutePostLogin = async (event, api) =&gt; {
+  const namespace = 'https://cinewave.com';
+
+  // Read app_metadata that you control (set via Management API), NOT user_metadata
+  // which the user can edit.
+  const tier = event.user.app_metadata?.subscription_tier ?? 'free';
+  const roles = event.authorization?.roles ?? [];
+
+  // Stamp into BOTH tokens only where each is actually consumed:
+  // ID token  -&gt; consumed by your frontend (display the Premium badge)
+  // Access token -&gt; consumed by your API (authorization decisions)
+  api.idToken.setCustomClaim(`${namespace}/tier`, tier);
+  api.accessToken.setCustomClaim(`${namespace}/tier`, tier);
+  api.accessToken.setCustomClaim(`${namespace}/roles`, roles);
+};
+</code></pre>
+    <div class="callout warn"><span class="tag">Warn</span><p>A non-namespaced custom claim (e.g. just <code>tier</code>) is silently dropped by Auth0 unless it is one of a small allow-list. Always namespace with an HTTPS URL you control. The URL is an identifier, not a fetched resource — Auth0 never calls it.</p></div>
+
+    <h3>6.2 A post-login Action using secrets and an npm dependency</h3>
+    <pre><code class="language-javascript">/**
+ * Trigger: post-login
+ * Calls your billing service to enrich the token, using a secret API key.
+ * Add "axios" under the editor's Dependencies panel before deploying.
+ */
+const axios = require('axios');
+
+exports.onExecutePostLogin = async (event, api) =&gt; {
+  const namespace = 'https://cinewave.com';
+  try {
+    const { data } = await axios.get(
+      `https://billing.internal.cinewave.com/v1/users/${event.user.user_id}`,
+      { headers: { Authorization: `Bearer ${event.secrets.BILLING_API_KEY}` },
+        timeout: 2000 } // keep it tight; this runs inline in login
+    );
+    api.idToken.setCustomClaim(`${namespace}/credits`, data.credits);
+  } catch (err) {
+    // Fail OPEN for enrichment: a billing outage must not block all logins.
+    console.log('billing enrichment failed:', err.message);
+  }
+};
+</code></pre>
+
+    <h3>6.3 Adaptive / step-up MFA in an Action</h3>
+    <pre><code class="language-javascript">/**
+ * Trigger: post-login
+ * Force MFA when the risk engine is not confident OR for admins.
+ */
+exports.onExecutePostLogin = async (event, api) =&gt; {
+  const roles = event.authorization?.roles ?? [];
+  const risk  = event.authentication?.riskAssessment?.confidence; // 'high'|'medium'|'low'
+
+  const isAdmin   = roles.includes('admin');
+  const lowTrust  = risk === 'low' || risk === 'medium';
+
+  if (isAdmin || lowTrust) {
+    api.multifactor.enable('any', { allowRememberBrowser: true });
+  }
+};
+</code></pre>
+
+    <h3>6.4 A pre-user-registration Action (block disposable emails)</h3>
+    <pre><code class="language-javascript">/**
+ * Trigger: pre-user-registration
+ * Reject signups from known disposable email domains.
+ */
+exports.onExecutePreUserRegistration = async (event, api) =&gt; {
+  const blocked = ['mailinator.com', 'tempmail.com', '10minutemail.com'];
+  const domain  = (event.user.email ?? '').split('@')[1]?.toLowerCase();
+  if (blocked.includes(domain)) {
+    api.access.deny('disposable_email', 'Please use a permanent email address.');
+  }
+};
+</code></pre>
+
+    <h3>6.5 The legacy Rule this replaces (for migration context)</h3>
+    <pre><code class="language-javascript">// LEGACY RULE — deprecated, shown only so you can recognize and migrate it.
+function addTierClaim(user, context, callback) {
+  const namespace = 'https://cinewave.com';
+  const tier = (user.app_metadata &amp;&amp; user.app_metadata.subscription_tier) || 'free';
+  context.idToken[namespace + '/tier'] = tier;       // mutate shared context
+  context.accessToken[namespace + '/tier'] = tier;
+  return callback(null, user, context);              // MUST call callback
+}
+</code></pre>
+    <p>The Rule mutates a shared <code>context</code> and must invoke a <code>callback</code> — forget it and the whole login hangs. The Action is async/await, scoped, and explicit. That is the migration in a nutshell.</p>
+  </section>
+
+  <!-- 7 -->
+  <section id="practical">
+    <h2>7. Practical Implementation — Consuming and Configuring</h2>
+    <h3>7.1 curl — read the OIDC config and request a token</h3>
+    <pre><code class="language-bash"># Discover endpoints (everything else derives from here)
+curl -s https://YOUR_TENANT.us.auth0.com/.well-known/openid-configuration | jq .
+
+# Get a Management API token (M2M app) to script tenant config
+curl -s --request POST \
+  --url https://YOUR_TENANT.us.auth0.com/oauth/token \
+  --header 'content-type: application/json' \
+  --data '{
+    "client_id":"MGMT_CLIENT_ID",
+    "client_secret":"MGMT_CLIENT_SECRET",
+    "audience":"https://YOUR_TENANT.us.auth0.com/api/v2/",
+    "grant_type":"client_credentials"
+  }'
+</code></pre>
+
+    <h3>7.2 curl — toggle Attack Protection via the Management API</h3>
+    <pre><code class="language-bash">MGMT=https://YOUR_TENANT.us.auth0.com/api/v2
+TOKEN=eyJ...   # the M2M token from above
+
+# Enable brute-force protection with a lockout shield
+curl -s -X PATCH "$MGMT/attack-protection/brute-force-protection" \
+  -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d '{ "enabled": true, "max_attempts": 10, "shields": ["block","user_notification"] }'
+
+# Enable breached-password detection
+curl -s -X PATCH "$MGMT/attack-protection/breached-password-detection" \
+  -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d '{ "enabled": true, "shields": ["block","admin_notification"], "method": "enhanced" }'
+
+# Enable suspicious IP throttling
+curl -s -X PATCH "$MGMT/attack-protection/suspicious-ip-throttling" \
+  -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
+  -d '{ "enabled": true, "shields": ["block","admin_notification"] }'
+</code></pre>
+
+    <h3>7.3 Node.js / Express — validate a token and read custom claims</h3>
+    <pre><code class="language-javascript">// npm i express express-oauth2-jwt-bearer
+const express = require('express');
+const { auth, requiredScopes } = require('express-oauth2-jwt-bearer');
+
+const app = express();
+const checkJwt = auth({
+  audience: 'https://api.cinewave.com',
+  issuerBaseURL: 'https://login.cinewave.com/', // your CUSTOM DOMAIN
+});
+
+app.get('/premium', checkJwt, (req, res) =&gt; {
+  const ns = 'https://cinewave.com';
+  const tier = req.auth.payload[`${ns}/tier`];
+  if (tier !== 'premium') return res.status(403).json({ error: 'upgrade required' });
+  res.json({ content: 'premium stream URL' });
+});
+
+app.listen(3000);
+</code></pre>
+
+    <h3>7.4 Spring Boot — resource server reading a namespaced claim</h3>
+    <pre><code class="language-java">// application.yml
+// spring.security.oauth2.resourceserver.jwt.issuer-uri: https://login.cinewave.com/
+// spring.security.oauth2.resourceserver.jwt.audiences: https://api.cinewave.com
+
+@RestController
+class PremiumController {
+  @GetMapping("/premium")
+  @PreAuthorize("isAuthenticated()")
+  ResponseEntity&lt;?&gt; premium(@AuthenticationPrincipal Jwt jwt) {
+    String tier = jwt.getClaimAsString("https://cinewave.com/tier");
+    if (!"premium".equals(tier)) {
+      return ResponseEntity.status(403).body(Map.of("error","upgrade required"));
+    }
+    return ResponseEntity.ok(Map.of("content","premium stream URL"));
+  }
+}
+</code></pre>
+
+    <h3>7.5 Postman</h3>
+    <ol>
+      <li>Create an environment with <code>tenant</code>, <code>mgmt_client_id</code>, <code>mgmt_client_secret</code>.</li>
+      <li>POST <code>{{tenant}}/oauth/token</code> with the client-credentials body; in <em>Tests</em>, save the token: <code>pm.environment.set('mgmt_token', pm.response.json().access_token);</code></li>
+      <li>For every Management API call, set Authorization → Bearer Token → <code>{{mgmt_token}}</code>.</li>
+      <li>Use <em>Authorization → OAuth 2.0 → Get New Access Token</em> with PKCE to test your <em>app</em> login and inspect custom claims at <a href="https://jwt.io">jwt.io</a> (or decode locally — never paste production tokens into third-party sites).</li>
+    </ol>
+  </section>
+
+  <!-- 8 -->
+  <section id="architecture">
+    <h2>8. Production Architecture</h2>
+    <p>A production-grade CineWave tenant layered for extensibility, security, and operability:</p>
+    <pre class="diagram">
+                         ┌─────────────────────────────┐
+   users ──► login.cinewave.com (CUSTOM DOMAIN, TLS) ──►│  AUTH0 TENANT (prod)  │
+                         └──────────────┬──────────────┘
+            ┌───────────────────────────┼───────────────────────────┐
+            ▼                           ▼                           ▼
+   ┌─────────────────┐        ┌──────────────────┐       ┌──────────────────┐
+   │ ATTACK PROTECTION│       │  ACTIONS (flows) │       │  BRANDING / EMAIL │
+   │ brute-force      │       │  post-login:     │       │  Universal Login  │
+   │ breached-pw      │       │   • custom claims│       │  custom templates │
+   │ susp-IP throttle │       │   • adaptive MFA │       │  page-template +  │
+   │ bot detection    │       │   • enrichment   │       │  email templates  │
+   └─────────────────┘        │  pre/post-reg    │       └──────────────────┘
+                              └────────┬─────────┘
+                                       │ secrets vault (BILLING_API_KEY ...)
+                                       ▼
+                              ┌──────────────────┐
+                              │  LOG STREAMS      │──► Datadog / Splunk / S3
+                              └──────────────────┘     (alerts, retention, SIEM)
+
+   ALL OF THE ABOVE DEFINED IN ──► Terraform (auth0 provider) / Deploy CLI
+                                   prod &amp; staging from the SAME modules
+    </pre>
+    <ul>
+      <li><strong>Separate tenants per environment</strong> (dev / staging / prod). A tenant is the isolation boundary; never test Actions against prod users.</li>
+      <li><strong>Custom domain on prod</strong> so cookies, emails, and token <code>iss</code> all use <code>login.cinewave.com</code>. Switching later breaks existing token validators.</li>
+      <li><strong>Log streams to a SIEM</strong> with alerting on <code>f</code> (failed login), <code>limit_wc</code> (rate-limit), <code>fcoa</code> (breached-pw) event types.</li>
+      <li><strong>Terraform as the source of truth</strong>; the dashboard is for emergency break-glass only, and drift is reconciled back into code.</li>
+    </ul>
+  </section>
+
+  <!-- 9 -->
+  <section id="security">
+    <h2>9. Security Analysis</h2>
+    <h3>Threats and the controls that answer them</h3>
+    <table>
+      <thead><tr><th>Threat</th><th>What it looks like</th><th>Primary control</th><th>Backstop</th></tr></thead>
+      <tbody>
+        <tr><td>Brute force</td><td>Many guesses against <em>one</em> account</td><td>Brute-force protection (per-account lockout)</td><td>MFA, strong password policy</td></tr>
+        <tr><td>Credential stuffing</td><td>One guess each against <em>many</em> accounts from many IPs</td><td>Breached-password detection + suspicious-IP throttling + bot detection</td><td>Adaptive MFA</td></tr>
+        <tr><td>Account takeover via stolen password</td><td>Valid creds, wrong human</td><td>MFA / Adaptive MFA</td><td>Anomaly detection, log alerts</td></tr>
+        <tr><td>Phishing of credentials</td><td>Fake login page on look-alike domain</td><td>Custom domain + branding (users learn the real URL)</td><td>Phishing-resistant factors (WebAuthn/passkeys)</td></tr>
+        <tr><td>Token claim tampering</td><td>Trusting a self-asserted claim</td><td>Set authorization claims server-side in Actions from <code>app_metadata</code>, never <code>user_metadata</code></td><td>Signature + audience validation at the API</td></tr>
+        <tr><td>Secret leakage</td><td>API key committed to git</td><td>Action secrets vault</td><td>Code review, secret scanning</td></tr>
+        <tr><td>DoS on login</td><td>Flood of requests</td><td>Rate limits (platform) + bot detection</td><td>WAF / CDN in front</td></tr>
+      </tbody>
+    </table>
+    <div class="callout danger"><span class="tag">Danger</span><p><strong>Never trust <code>user_metadata</code> for authorization.</strong> Users can edit their own <code>user_metadata</code>. Roles, tiers, and entitlements belong in <code>app_metadata</code> (admin-only) and must be stamped into tokens by an Action. A "premium" flag in <code>user_metadata</code> is a self-service upgrade button for attackers.</p></div>
+    <div class="callout warn"><span class="tag">Warn</span><p>Decide <em>fail-open vs fail-closed</em> per Action consciously. Enrichment (adding a nice-to-have claim) should fail <strong>open</strong> so a downstream outage does not lock everyone out. Security decisions (deny disposable emails, enforce MFA) should fail <strong>closed</strong> — if the check cannot run, do not let the user through.</p></div>
+  </section>
+
+  <!-- 10 -->
+  <section id="performance">
+    <h2>10. Performance Considerations</h2>
+    <p>Every Action in the <code>post-login</code> flow runs <em>inline</em> on the critical path of every login. Latency here is latency every user feels.</p>
+    <ul>
+      <li><strong>Budget your Actions.</strong> Each Action has an execution time limit; external calls inside one count against the user-perceived login time. Keep outbound calls under ~2 s with explicit timeouts.</li>
+      <li><strong>Cache across executions.</strong> Code outside the handler runs once per "warm" container and can hold a cached token or client. Use this for things like a Management API token instead of fetching it every login.</li>
+      <li><strong>Minimize dependencies.</strong> Large npm packages slow cold starts. Prefer the platform's built-in <code>fetch</code>/lightweight HTTP over heavy SDKs where practical.</li>
+      <li><strong>Do not enrich what you do not need.</strong> Putting a 5 KB array of permissions in the access token bloats every request header for the token's whole lifetime. Put a role <em>name</em> in the token and resolve fine-grained permissions at the API.</li>
+      <li><strong>Adaptive MFA over blanket MFA.</strong> Challenging every login adds friction and support cost; risk-based challenging preserves throughput for trusted sessions.</li>
+      <li><strong>Respect rate limits with backoff.</strong> Management API calls (from Actions or your scripts) are rate-limited; read the <code>X-RateLimit-Remaining</code> header and back off, do not hammer.</li>
+    </ul>
+    <pre class="diagram">
+   GOOD: cache outside handler            BAD: fetch every login
+   ┌─────────────────────────┐           ┌─────────────────────────┐
+   │ let token; // module     │           │ handler(){               │
+   │ handler(){               │           │   token = await getMgmt()│ ◄ +200ms
+   │  if(!token||expired)     │           │   ...                    │   every time
+   │    token=await getMgmt() │           │ }                        │
+   │  ...                     │           └─────────────────────────┘
+   │ }                        │
+   └─────────────────────────┘
+    </pre>
+  </section>
+
+  <!-- 11 -->
+  <section id="mistakes">
+    <h2>11. Common Mistakes</h2>
+    <ol>
+      <li><strong>Forgetting to namespace custom claims</strong> → claim silently disappears from the token. Always use an HTTPS-URI namespace.</li>
+      <li><strong>Putting authorization data in <code>user_metadata</code></strong> → privilege escalation. Use <code>app_metadata</code>.</li>
+      <li><strong>Hard-coding secrets in Action code</strong> → leaked keys in source control. Use the secrets vault and <code>event.secrets</code>.</li>
+      <li><strong>Failing closed on enrichment</strong> → a billing-service blip blocks all logins. Wrap enrichment in try/catch and fail open.</li>
+      <li><strong>Failing open on security checks</strong> → MFA or denial silently skipped on error. Security Actions must fail closed.</li>
+      <li><strong>Leaving Rules and Hooks in place "for now"</strong> → they are deprecated and add invisible coupling. Migrate to Actions deliberately.</li>
+      <li><strong>Switching to a custom domain after launch without a plan</strong> → the token <code>iss</code> changes and every resource server's validator breaks. Plan the cutover and update <code>issuer-uri</code> everywhere.</li>
+      <li><strong>Turning off Attack Protection during a "false positive" panic</strong> → opens the door mid-attack. Tune thresholds and allow-lists instead.</li>
+      <li><strong>No log streaming</strong> → you discover the breach from customers, not dashboards. Stream logs to a SIEM and alert.</li>
+      <li><strong>Click-ops the production tenant</strong> → no audit trail, no rollback, drift between environments. Use Terraform / Deploy CLI.</li>
+      <li><strong>Returning huge claim payloads</strong> → token bloat and header-size errors. Keep tokens lean.</li>
+      <li><strong>Testing Actions against the prod tenant</strong> → real users get half-built logic. Use a dev tenant.</li>
+    </ol>
+  </section>
+
+  <!-- 12 -->
+  <section id="best-practices">
+    <h2>12. Best Practices</h2>
+    <ul>
+      <li><strong>One responsibility per Action.</strong> Small, composable Actions in a flow beat one mega-Action — easier to test, reorder, and disable.</li>
+      <li><strong>Namespace everything</strong> and document your namespace (e.g. <code>https://cinewave.com</code>) in your team wiki.</li>
+      <li><strong>Authorization data: <code>app_metadata</code> → Action → token.</strong> Make this the unbreakable rule.</li>
+      <li><strong>Secrets in the vault, dependencies pinned</strong> in the editor's Dependencies panel.</li>
+      <li><strong>Enable the full Attack Protection suite</strong> (brute-force, breached-password, suspicious-IP, bot detection) on every production tenant; start in monitor mode if unsure, then enforce.</li>
+      <li><strong>Prefer Adaptive MFA</strong> and offer phishing-resistant factors (WebAuthn / passkeys) before SMS.</li>
+      <li><strong>Set a strong password policy</strong> (at least "Good" or "Excellent") and turn on breached-password checks at signup and login.</li>
+      <li><strong>Custom domain from day one</strong> on tenants that will reach production.</li>
+      <li><strong>Brand the Universal Login</strong> and email templates so users can spot a phish.</li>
+      <li><strong>Stream logs to a SIEM</strong>, set retention, and alert on failed-login spikes, rate-limit events, and breached-password events.</li>
+      <li><strong>Everything in Terraform/Deploy CLI</strong>; promote dev → staging → prod through reviewed PRs; keep secrets out of state.</li>
+      <li><strong>Test in a dev tenant</strong>, use Actions' built-in test runner, and version your Actions.</li>
+    </ul>
+  </section>
+
+  <!-- 13 -->
+  <section id="interview">
+    <h2>13. Interview Questions (with Model Answers)</h2>
+    <h3>Q1. What is an Auth0 Action and how does it differ from a Rule or Hook?</h3>
+    <p><strong>Model answer:</strong> An Action is a JavaScript function bound to a specific <em>trigger</em> in the pipeline (e.g. <code>post-login</code>), running in a sandboxed Node runtime. It receives an immutable <code>event</code> and mutates state only through an <code>api</code> object. Rules (login-only, shared mutable <code>context</code>, callback-based) and Hooks (four narrow extensibility points) are the legacy predecessors; Actions add versioning, a secrets vault, npm dependencies, and per-trigger binding, and are the recommended model. Rules and Hooks are deprecated.</p>
+    <h3>Q2. Why must custom claims be namespaced?</h3>
+    <p><strong>Model answer:</strong> OIDC reserves a set of standard claim names. To prevent collisions and tampering with reserved claims, Auth0 requires non-standard claims to use a collision-resistant URI namespace (an HTTPS URL you control). Auth0 never dereferences the URL; it is purely an identifier. Non-namespaced custom claims are dropped from the token.</p>
+    <h3>Q3. A customer reports being locked out during a credential-stuffing attack. Which controls are involved and how do you tune them?</h3>
+    <p><strong>Model answer:</strong> Credential stuffing triggers suspicious-IP throttling (per-IP velocity), breached-password detection (matching leaked creds), and possibly brute-force protection. The fix is not to disable them but to tune: add the customer's IPs to an allow-list, ensure brute-force lockout targets the attacker pattern, enable bot detection (CAPTCHA), and turn on Adaptive MFA so legitimate but risky logins are challenged rather than blocked.</p>
+    <h3>Q4. Where do you store a user's role, and how does it reach your API?</h3>
+    <p><strong>Model answer:</strong> In <code>app_metadata</code> (admin-controlled), never <code>user_metadata</code> (user-editable). A <code>post-login</code> Action reads it and writes a namespaced claim into the access token. The API validates the token's signature, issuer, and audience, then reads the claim. The API still enforces fine-grained permissions itself rather than blindly trusting the token.</p>
+    <h3>Q5. How would you manage Auth0 configuration across dev/staging/prod?</h3>
+    <p><strong>Model answer:</strong> Separate tenants per environment, all defined with the Terraform <code>auth0</code> provider (or the Deploy CLI). Config lives in version control; changes go through reviewed PRs and CI applies them. Secrets stay out of state (injected via CI variables). The dashboard is break-glass only; drift is reconciled back into code.</p>
+    <h3>Q6. What is Adaptive MFA and when does it challenge?</h3>
+    <p><strong>Model answer:</strong> Adaptive MFA challenges based on a per-login risk/confidence score derived from device, location, IP reputation, and behavioural signals. High-confidence logins pass without a second factor; low/medium confidence triggers a challenge. It balances security and friction, and you can refine the decision in an Action using <code>event.authentication.riskAssessment</code>.</p>
+    <h3>Q7. Should an Action fail open or fail closed?</h3>
+    <p><strong>Model answer:</strong> It depends on the Action's purpose. Enrichment should fail open (don't block login if an external dependency is down). Security enforcement (denying signups, requiring MFA) must fail closed (if the check can't run, don't admit the user). Decide explicitly and wrap external calls in try/catch accordingly.</p>
+    <h3>Q8. Why use a custom domain, and what breaks if you add one late?</h3>
+    <p><strong>Model answer:</strong> A custom domain (e.g. <code>login.cinewave.com</code>) builds user trust, keeps cookies first-party, and makes the token <code>iss</code> your own domain. Adding it late changes the issuer, so every resource server validating <code>iss</code>/JWKS must be updated; plan a coordinated cutover.</p>
+  </section>
+
+  <!-- 14 -->
+  <section id="certification">
+    <h2>14. Certification Tips</h2>
+    <div class="callout note"><span class="tag">Exam focus</span><p>The Auth0 certification leans heavily on this chapter. Drill these:</p></div>
+    <ul>
+      <li><strong>Triggers by name</strong> and what each is for: <code>post-login</code>, <code>credentials-exchange</code> (M2M token enrichment), <code>pre-user-registration</code>, <code>post-user-registration</code>, <code>send-phone-message</code>, <code>password-reset-post-challenge</code>.</li>
+      <li><strong>event vs api.</strong> Know that <code>event</code> is read-only and <code>api</code> performs mutations. Memorize the common <code>api</code> calls.</li>
+      <li><strong>Custom claims must be namespaced</strong> — this is a frequent gotcha question.</li>
+      <li><strong>app_metadata vs user_metadata</strong> — who can write each, and which is safe for authorization.</li>
+      <li><strong>Attack Protection trio</strong>: brute-force (per account), suspicious-IP throttling (per IP, stuffing), breached-password (leaked corpus). Know the difference cold.</li>
+      <li><strong>"Anomaly Detection" = the Attack Protection family</strong> (classically brute-force + breached-password). Don't confuse anomaly/attack protection (behavioural, fires on attack patterns) with rate limits (flat per-endpoint caps that apply to all traffic).</li>
+      <li><strong>Shields</strong>: <code>block</code>, <code>user_notification</code>, <code>admin_notification</code>, CAPTCHA.</li>
+      <li><strong>Adaptive MFA vs always-on MFA</strong>, and supported factors (OTP, push/Guardian, SMS, email, WebAuthn/passkeys, recovery codes).</li>
+      <li><strong>Rules/Hooks are deprecated</strong>; Actions are the answer to "how do I customize X".</li>
+      <li><strong>Deploy CLI vs Terraform</strong>: both do config-as-code; Terraform is declarative state, Deploy CLI imports/exports tenant config as files.</li>
+      <li><strong>Log event type codes</strong> appear in questions: <code>s</code> success login, <code>f</code> failed login, <code>fp</code> failed password, <code>limit_wc</code> rate limit, <code>fcoa</code>/<code>fcpro</code> attack-protection events.</li>
+    </ul>
+  </section>
+
+  <!-- 15 -->
+  <section id="exercises">
+    <h2>15. Hands-On Exercises</h2>
+    <ol>
+      <li><strong>Add a namespaced claim.</strong> In a dev tenant, write a <code>post-login</code> Action that adds <code>https://yourdomain.com/tier</code> from <code>app_metadata</code>. Log in, decode the ID token, confirm the claim.</li>
+      <li><strong>Break it on purpose.</strong> Remove the namespace and observe the claim vanish. Restore it. Internalize <em>why</em>.</li>
+      <li><strong>Use a secret.</strong> Add a secret <code>DEMO_KEY</code>, read it via <code>event.secrets.DEMO_KEY</code>, and log its length (never the value) to prove access without exposure.</li>
+      <li><strong>Enforce step-up MFA</strong> for users with role <code>admin</code> using <code>api.multifactor.enable</code>.</li>
+      <li><strong>Enable the Attack Protection suite</strong> via the dashboard, then re-create the same settings via the Management API with curl (section 7.2).</li>
+      <li><strong>Set a custom domain</strong> (or, if not on a paid tier, document the exact steps and what changes in the token <code>iss</code>).</li>
+      <li><strong>Stream logs</strong> to an HTTP endpoint (use <code>https://webhook.site</code>) and trigger a failed login; observe the <code>f</code> event arrive.</li>
+      <li><strong>Pin a dependency.</strong> Add <code>axios</code> in the Action editor, make an outbound call to a public API with a 2 s timeout, and handle failure by failing open.</li>
+    </ol>
+  </section>
+
+  <!-- 16 -->
+  <section id="assignment">
+    <h2>16. Assignment</h2>
+    <div class="callout key"><span class="tag">Deliverable</span><p>Harden and codify a dev tenant end-to-end, then write a one-page security posture summary.</p></div>
+    <ol>
+      <li>Create a fresh dev tenant. Configure a Regular Web App and an API (audience <code>https://api.assignment.dev</code>).</li>
+      <li>Write three Actions: (a) add namespaced <code>tier</code> + <code>roles</code> claims; (b) <code>pre-user-registration</code> that blocks disposable emails (fail closed); (c) <code>post-login</code> Adaptive MFA that challenges when <code>riskAssessment.confidence</code> is not <code>high</code>.</li>
+      <li>Enable brute-force, breached-password, suspicious-IP, and bot detection. Set the password policy to at least "Good".</li>
+      <li>Brand the Universal Login (logo + primary color) and customize the "Verify Email" template subject.</li>
+      <li>Configure a log stream to <code>webhook.site</code> and confirm events flow.</li>
+      <li>Export the entire tenant with the Deploy CLI <em>or</em> import it into Terraform, and commit it to a git repo (secrets excluded).</li>
+      <li>Write a one-page summary: which threat each control addresses, and which Actions fail open vs closed and why.</li>
+    </ol>
+    <p><strong>Acceptance:</strong> a reviewer can <code>terraform apply</code> (or run the Deploy CLI) against an empty tenant and reproduce your configuration, except secrets, which are injected at apply time.</p>
+  </section>
+
+  <!-- 17 -->
+  <section id="mini-project">
+    <h2>17. Mini Project — "CineWave Guardrails" as Code</h2>
+    <p>Build a reproducible, secured tenant for CineWave using Terraform's <code>auth0</code> provider, plus the Actions from this chapter. This is a portfolio-worthy artifact.</p>
+    <h3>17.1 Provider and tenant settings</h3>
+    <pre><code class="language-hcl">terraform {
+  required_providers {
+    auth0 = { source = "auth0/auth0", version = "~&gt; 1.0" }
+  }
+}
+
+# Configure via env vars (never commit these):
+#   AUTH0_DOMAIN, AUTH0_CLIENT_ID, AUTH0_CLIENT_SECRET
+provider "auth0" {}
+
+resource "auth0_tenant" "cinewave" {
+  friendly_name         = "CineWave (managed)"
+  session_lifetime      = 168          # hours
+  idle_session_lifetime = 72
+  flags {
+    enable_public_signup_user_exists_error = true
+  }
+}
+</code></pre>
+    <h3>17.2 Attack Protection</h3>
+    <pre><code class="language-hcl">resource "auth0_attack_protection" "ap" {
+  breached_password_detection {
+    enabled = true
+    method  = "enhanced"
+    shields = ["block", "admin_notification"]
+  }
+  brute_force_protection {
+    enabled      = true
+    max_attempts = 10
+    mode         = "count_per_identifier_and_ip"
+    shields      = ["block", "user_notification"]
+  }
+  suspicious_ip_throttling {
+    enabled = true
+    shields = ["block", "admin_notification"]
+  }
+}
+</code></pre>
+    <h3>17.3 A post-login Action (custom claims + adaptive MFA), in code</h3>
+    <pre><code class="language-hcl">resource "auth0_action" "post_login" {
+  name    = "cinewave-post-login"
+  runtime = "node22"
+  deploy  = true
+  supported_triggers {
+    id      = "post-login"
+    version = "v3"
+  }
+  secrets {
+    name  = "BILLING_API_KEY"
+    value = var.billing_api_key   # injected at apply time, kept out of state where possible
+  }
+  code = file("${path.module}/actions/post-login.js")
+}
+
+# Bind the action to the post-login flow
+resource "auth0_trigger_actions" "post_login_binding" {
+  trigger = "post-login"
+  actions {
+    id           = auth0_action.post_login.id
+    display_name = auth0_action.post_login.name
+  }
+}
+</code></pre>
+    <h3>17.4 Connection password policy</h3>
+    <pre><code class="language-hcl">resource "auth0_connection" "db" {
+  name     = "Username-Password-Authentication"
+  strategy = "auth0"
+  options {
+    password_policy = "good"
+    brute_force_protection = true
+    password_complexity_options { min_length = 12 }
+    password_history {
+      enable = true
+      size   = 5
+    }
+    password_no_personal_info { enable = true }
+  }
+}
+</code></pre>
+    <h3>17.5 Log stream to a SIEM</h3>
+    <pre><code class="language-hcl">resource "auth0_log_stream" "datadog" {
+  name   = "cinewave-datadog"
+  type   = "datadog"
+  status = "active"
+  sink {
+    datadog_region  = "us"
+    datadog_api_key = var.datadog_api_key
+  }
+}
+</code></pre>
+    <h3>17.6 Alternative: the Deploy CLI</h3>
+    <pre><code class="language-bash"># Export a tenant to a directory of YAML/JSON you can commit
+npm i -g auth0-deploy-cli
+a0deploy export \
+  --format yaml \
+  --output_folder ./tenant \
+  --config_file ./config.json   # holds AUTH0_DOMAIN + client creds
+
+# Promote to another environment
+a0deploy import \
+  --input_file ./tenant \
+  --config_file ./staging-config.json
+</code></pre>
+    <p><strong>Outcome:</strong> a git repo where <code>terraform apply</code> (or <code>a0deploy import</code>) reconstructs a fully hardened, branded, observable tenant with custom claims and adaptive MFA — exactly the artifact a senior interviewer wants to see.</p>
+  </section>
+
+  <!-- 18 -->
+  <section id="quiz">
+    <h2>18. Quiz (25 Questions)</h2>
+    <ol>
+      <li>What two objects does a post-login Action receive, and which one is read-only?</li>
+      <li>Why are non-standard custom claims required to be namespaced with a URI?</li>
+      <li>Name three Auth0 triggers besides <code>post-login</code>.</li>
+      <li>Where should authorization data (roles, tier) be stored, and why not the alternative?</li>
+      <li>How does an Action access a secret without exposing it in code?</li>
+      <li>What is the difference between brute-force protection and suspicious-IP throttling?</li>
+      <li>What attack does breached-password detection defend against?</li>
+      <li>What is a "shield" in Attack Protection? Name three.</li>
+      <li>What signal does Adaptive MFA use to decide whether to challenge?</li>
+      <li>List four MFA factors Auth0 supports.</li>
+      <li>Which is phishing-resistant: SMS OTP or WebAuthn/passkeys? Why?</li>
+      <li>Why are Rules and Hooks discouraged for new development?</li>
+      <li>In a Rule, what happens if you forget to call <code>callback</code>?</li>
+      <li>Why should enrichment Actions fail open but security Actions fail closed?</li>
+      <li>What changes in your tokens when you adopt a custom domain?</li>
+      <li>Name two things you must update elsewhere after adding a custom domain.</li>
+      <li>Why brand the Universal Login and email templates (security reason)?</li>
+      <li>Where on the login pipeline do rate limits and bot detection act?</li>
+      <li>What is the risk of putting a large permissions array in the access token?</li>
+      <li>How can an Action cache a value across executions, and why?</li>
+      <li>What does the Deploy CLI do, and how does it differ from Terraform?</li>
+      <li>Which Terraform resource binds an Action to its trigger flow?</li>
+      <li>What log event type codes correspond to a failed login and a rate-limit event?</li>
+      <li>Why keep secrets out of Terraform state, and how do you inject them?</li>
+      <li>What does "Anomaly Detection" refer to in Auth0, and how does it differ from rate limits?</li>
+    </ol>
+    <details>
+      <summary>Show answer key</summary>
+      <ol>
+        <li><code>event</code> (read-only snapshot) and <code>api</code> (mutations). <code>event</code> is read-only.</li>
+        <li>To avoid collisions with OIDC reserved/standard claims; the URI is a unique identifier Auth0 never dereferences. Non-namespaced custom claims are dropped.</li>
+        <li>Any three of: <code>credentials-exchange</code>, <code>pre-user-registration</code>, <code>post-user-registration</code>, <code>send-phone-message</code>, <code>password-reset-post-challenge</code>, <code>mfa</code>.</li>
+        <li><code>app_metadata</code> (admin-only). <code>user_metadata</code> is user-editable, so storing entitlements there enables privilege escalation.</li>
+        <li>Via <code>event.secrets.NAME</code>; secrets are stored encrypted and injected at runtime, never written in the code body.</li>
+        <li>Brute-force tracks failed attempts against a single account (and IP); suspicious-IP throttling tracks high-velocity attempts per IP across many accounts (the credential-stuffing signature).</li>
+        <li>Credential stuffing / use of credentials leaked in third-party breaches.</li>
+        <li>An automated response to suspicious activity. Examples: <code>block</code>, <code>user_notification</code>, <code>admin_notification</code>, CAPTCHA.</li>
+        <li>A per-login risk/confidence score from device, location, IP reputation, and behavioural signals.</li>
+        <li>Any four: OTP (authenticator app), push (Guardian), SMS, email, WebAuthn/passkeys, recovery codes, Duo.</li>
+        <li>WebAuthn/passkeys — they are bound to the origin (domain) and use public-key cryptography, so a phishing site cannot relay the credential; SMS OTP can be phished or SIM-swapped.</li>
+        <li>They are deprecated, use a shared mutable <code>context</code>, lack secrets/versioning/dependencies, and are being replaced by Actions.</li>
+        <li>The login hangs/times out because the Rule pipeline never continues.</li>
+        <li>Enrichment is non-critical, so an external outage shouldn't block logins (fail open); security checks must not be skipped on error, or attackers slip through (fail closed).</li>
+        <li>The issuer (<code>iss</code>) becomes your custom domain (e.g. <code>https://login.cinewave.com/</code>); cookies and emails also use it.</li>
+        <li>The <code>issuer-uri</code>/JWKS URL in every resource server and SDK; allowed callback/logout URLs and any hard-coded <code>*.auth0.com</code> references.</li>
+        <li>Users learn the legitimate, branded login page, making look-alike phishing pages easier to spot.</li>
+        <li>At the edge, before credential verification — they throttle/deny traffic and inject CAPTCHAs for automated traffic.</li>
+        <li>Token bloat: larger headers on every request for the token's lifetime, risking size limits; put a role name in the token and resolve permissions at the API.</li>
+        <li>Code outside the handler runs once per warm container; storing a value (e.g. a Management API token) there avoids re-fetching on every login.</li>
+        <li>The Deploy CLI exports/imports tenant config as files (YAML/JSON) for promotion across tenants; Terraform manages config declaratively with state and a plan/apply workflow.</li>
+        <li><code>auth0_trigger_actions</code>.</li>
+        <li>Failed login = <code>f</code> (failed password specifically = <code>fp</code>); rate limit = <code>limit_wc</code>.</li>
+        <li>State can be read by anyone with state access; inject secrets via environment/CI variables at apply time and use a secure backend, avoiding plaintext in committed state.</li>
+        <li>"Anomaly Detection" is Auth0's umbrella name for the Attack Protection family (classically brute-force protection + breached-password detection). It is behavioural — it correlates events over time and fires only on attack-like patterns, acting per account or per IP. Rate limits are flat per-endpoint/IP caps that apply to all traffic regardless of intent, so legitimate traffic can be rate-limited while an anomaly shield only triggers on suspicious activity.</li>
+      </ol>
+    </details>
+  </section>
+
+  <!-- 19 -->
+  <section id="cheatsheet">
+    <h2>19. Cheat Sheet</h2>
+    <pre class="diagram">
+ACTIONS
+  handler:  exports.onExecutePostLogin = async (event, api) =&gt; {}
+  read:     event.user / .client / .request.ip / .authorization.roles
+            event.authentication.riskAssessment.confidence  // adaptive MFA
+            event.secrets.NAME                              // secrets
+  write:    api.idToken.setCustomClaim(ns+'/x', v)
+            api.accessToken.setCustomClaim(ns+'/x', v)
+            api.access.deny(reason, msg)
+            api.redirect.sendUserTo(url)
+            api.multifactor.enable('any', {allowRememberBrowser:true})
+  NAMESPACE custom claims with an HTTPS URI you own.
+
+TRIGGERS
+  post-login · credentials-exchange (M2M) · pre/post-user-registration
+  send-phone-message · password-reset-post-challenge · mfa
+
+METADATA
+  app_metadata  = admin-only  -&gt; SAFE for authz
+  user_metadata = user-editable -&gt; NEVER for authz
+
+ATTACK PROTECTION  (Mgmt API: /api/v2/attack-protection/*)
+  brute-force-protection         per account (+IP)   shields: block,user_notification
+  suspicious-ip-throttling       per IP, stuffing    shields: block,admin_notification
+  breached-password-detection    leaked corpus       method: enhanced
+  bot-detection                  CAPTCHA on bots
+
+MFA
+  adaptive (risk-based) | always-on
+  factors: OTP, push(Guardian), SMS, email, WebAuthn/passkeys, recovery codes
+  prefer passkeys (phishing-resistant) over SMS
+
+PLATFORM
+  custom domain  -&gt; changes token iss; update issuer-uri everywhere
+  branding + email templates -&gt; anti-phishing
+  password policy: none|low|fair|good|excellent  (+history,+no-personal-info)
+  rate limits: honor X-RateLimit-Remaining; back off
+
+OBSERVABILITY
+  log streams -&gt; Datadog/Splunk/S3/HTTP   event codes: s,f,fp,limit_wc,fcoa
+  alert on failed-login spikes, rate-limit, breached-pw
+
+CONFIG AS CODE
+  Terraform: auth0 provider — auth0_action, auth0_trigger_actions,
+             auth0_attack_protection, auth0_connection, auth0_log_stream
+  Deploy CLI: a0deploy export/import  (YAML/JSON files, tenant promotion)
+  secrets OUT of state; inject at apply time
+    </pre>
+  </section>
+
+  <!-- 20 -->
+  <section id="takeaways">
+    <h2>20. Key Takeaways</h2>
+    <div class="callout key"><span class="tag">Key</span><p><strong>Auth0 is a programmable, internet-facing login pipeline.</strong> Extensibility (Actions) lets you shape it; platform security (Attack Protection, MFA, anomaly detection, rate limits, custom domains) guards it; config-as-code makes it reproducible.</p></div>
+    <ul>
+      <li><strong>Actions</strong> are trigger-bound functions: read from <code>event</code>, mutate via <code>api</code>, secrets in <code>event.secrets</code>, npm deps in the editor. They replace deprecated Rules and Hooks — migrate.</li>
+      <li><strong>Custom claims must be namespaced</strong>, sourced from <code>app_metadata</code>, and kept lean.</li>
+      <li><strong>Defense in depth:</strong> brute-force (per account), suspicious-IP throttling (per IP / stuffing), breached-password (leaked corpus), bot detection, and Adaptive MFA each close a different gap.</li>
+      <li><strong>Fail open for enrichment, fail closed for security</strong> — decide deliberately per Action.</li>
+      <li><strong>Custom domain, branding, and strong password policy</strong> are first-class security controls, not cosmetics, because they fight phishing and weak credentials.</li>
+      <li><strong>Stream logs to a SIEM and alert</strong> — you cannot defend what you cannot see.</li>
+      <li><strong>Codify everything</strong> with Terraform or the Deploy CLI; the dashboard is break-glass only; keep secrets out of state.</li>
+      <li><strong>Performance matters:</strong> post-login Actions run inline on every login — budget time, cache across executions, and respect rate limits.</li>
+    </ul>
+  </section>
+
+  <nav class="pager">
+    <a class="prev" href="chapter-11.html">← Previous</a>
+    <a class="next" href="chapter-13.html">Next →</a>
+  </nav>
+</main>
+<footer class="site-footer">Master Auth0 End-to-End · Chapter 12 of 32</footer>
+</body>
+</html>

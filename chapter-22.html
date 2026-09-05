@@ -1,0 +1,742 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 22 — Project 6 — FastAPI | Master Auth0</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">🔐 Master Auth0</a>
+  <nav class="topnav">
+    <a href="chapter-21.html">← Prev</a>
+    <a href="index.html">Contents</a>
+    <a href="chapter-23.html">Next →</a>
+  </nav>
+</header>
+<main class="container">
+  <div class="chapter-head">
+    <span class="phase">Phase 8 · Integration Projects</span>
+    <h1>Chapter 22 — Project 6 — FastAPI</h1>
+    <p class="lead">A frontend can <em>display</em> a token, but only a backend can <em>trust</em> one. In this project we build a production-grade Python API with <strong>FastAPI</strong> that accepts Auth0-issued access tokens, cryptographically verifies them against Auth0's public keys, and authorizes each request by scope — all without ever calling Auth0 on the hot path. We will derive, from first principles, exactly what a JWT is, why signature verification is the entire ballgame, how the JWKS endpoint distributes Auth0's public keys, why <code>PyJWKClient</code> caches them, and how FastAPI's dependency-injection system lets us turn "is this caller allowed?" into a one-line decorator on any route. By the end you will have a fully secured API, an interactive Swagger UI that knows how to obtain tokens, and curl and Postman recipes to prove every path works. This is the resource-server half of OAuth 2.0, done correctly.</p>
+  </div>
+
+  <!-- ============================================================= 1 -->
+  <section id="theory">
+    <h2>1. Theory — First Principles of Stateless API Authorization</h2>
+
+    <p>Before a single line of Python, we must answer one question precisely: <strong>when an HTTP request arrives at our API carrying a token, what does it mean to "verify" it, and why is that enough to trust the caller?</strong> Everything else is plumbing.</p>
+
+    <h3>The three actors of OAuth 2.0</h3>
+    <p>Our FastAPI service plays exactly one role in the OAuth 2.0 cast, and confusing the roles is the most common source of broken integrations:</p>
+    <ul>
+      <li><strong>Authorization Server (AS)</strong> — Auth0. It authenticates users, mints access tokens, and publishes its public keys. We do <em>not</em> build this.</li>
+      <li><strong>Client</strong> — the app that obtained the token (a React SPA, a mobile app, a machine-to-machine service). We do <em>not</em> build this here either.</li>
+      <li><strong>Resource Server (RS)</strong> — <em>our FastAPI API.</em> Its only job: accept a request, validate the access token attached to it, and serve or deny the resource. This chapter is entirely about being a correct Resource Server.</li>
+    </ul>
+
+    <h3>What an access token actually is</h3>
+    <p>An Auth0 access token (for an API audience) is a <strong>JWT</strong> — a JSON Web Token. It is three Base64URL-encoded segments joined by dots: <code>header.payload.signature</code>. Crucially, the first two parts are <em>not encrypted</em> — anyone can decode and read them. The token is not a secret you keep; it is a <strong>signed claim</strong> you verify. The security comes entirely from the third segment: a digital signature produced by Auth0's <em>private</em> key, verifiable by Auth0's <em>public</em> key.</p>
+
+    <table>
+      <thead><tr><th>Segment</th><th>Contains</th><th>Example fields</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Header</strong></td><td>Algorithm &amp; key id</td><td><code>alg: RS256</code>, <code>kid: "abc123"</code>, <code>typ: "JWT"</code></td></tr>
+        <tr><td><strong>Payload (claims)</strong></td><td>Who, for whom, when, what</td><td><code>iss</code>, <code>aud</code>, <code>sub</code>, <code>exp</code>, <code>iat</code>, <code>scope</code>, <code>permissions</code></td></tr>
+        <tr><td><strong>Signature</strong></td><td>Proof the AS signed it</td><td>RSA-SHA256 over <code>header.payload</code></td></tr>
+      </tbody>
+    </table>
+
+    <h3>Why asymmetric (RS256) and not symmetric (HS256)</h3>
+    <p>HS256 signs with a shared secret: whoever can <em>verify</em> can also <em>forge</em>. That is acceptable only when issuer and verifier are the same trusted party. With Auth0 they are not — Auth0 issues, your API verifies. So Auth0 uses <strong>RS256</strong>: it signs with a private key it never reveals, and publishes the matching <strong>public key</strong> so any number of resource servers can verify without ever being able to mint a token. This asymmetry is the foundation of decentralized, stateless trust.</p>
+
+    <h3>The five checks that constitute "valid"</h3>
+    <p>A token is trustworthy only if <em>all</em> of these pass. Skipping any one is a real vulnerability:</p>
+    <ol>
+      <li><strong>Signature</strong> — verified against Auth0's public key for the matching <code>kid</code>. Proves authenticity and integrity.</li>
+      <li><strong>Issuer (<code>iss</code>)</strong> — must equal <code>https://YOUR_TENANT/</code>. Proves <em>which</em> AS minted it.</li>
+      <li><strong>Audience (<code>aud</code>)</strong> — must contain <em>your API's identifier</em>. Proves the token was meant for <em>you</em>, not some other API in the same tenant.</li>
+      <li><strong>Expiry (<code>exp</code>)</strong> / not-before (<code>nbf</code>) — must be currently valid. Limits the blast radius of a stolen token.</li>
+      <li><strong>Authorization (scope/permissions)</strong> — does this valid token grant the specific action this route requires?</li>
+    </ol>
+
+    <div class="callout key"><span class="tag">Key</span><p>Authentication of the token (checks 1–4) answers "is this a genuine, current Auth0 token meant for me?" Authorization (check 5) answers "does it permit <em>this</em> operation?" A valid token is necessary but never sufficient — a read token must not delete.</p></div>
+  </section>
+
+  <!-- ============================================================= 2 -->
+  <section id="story">
+    <h2>2. Story-Based Explanation — The Nightclub With No Phone</h2>
+    <p>Picture a nightclub, <strong>Club FastAPI</strong>. At the door stands a bouncer. Patrons arrive holding wristbands issued earlier that evening by a separate, trusted ticketing office across town — call it <strong>Auth0 Tickets Inc.</strong></p>
+    <p>A naïve bouncer would, for every patron, phone the ticketing office and ask "is wristband #4471 real?" That works, but it is slow, and if the phone line goes down the club grinds to a halt. The clever bouncer does something better: at the start of the night he picks up a <strong>tamper-proof reference card</strong> from the office showing the exact embossing pattern genuine wristbands carry. Now he can verify any wristband <em>by inspection</em> — no phone call per guest. He only refreshes the reference card if he sees an embossing pattern he doesn't recognize.</p>
+    <p>That reference card is the <strong>JWKS</strong> (JSON Web Key Set): Auth0's published public keys. The embossing pattern is the <strong>RS256 signature</strong>. The bouncer verifying by inspection is your API doing <em>local, offline</em> JWT validation. And the rare refresh-on-unknown-pattern is exactly how <code>PyJWKClient</code> behaves — cache the keys, refetch only when an unfamiliar <code>kid</code> appears.</p>
+    <p>But the wristband alone is not the whole story. Some bands say "GENERAL", some say "VIP", some say "STAFF — backstage". The bouncer at the <em>main</em> door only checks the band is genuine and unexpired. The bouncer at the <em>backstage</em> door additionally checks it says "STAFF". That second check is the <strong>scope/permission</strong> check, and in FastAPI it becomes a tiny, reusable dependency we attach to exactly the routes that need it.</p>
+    <div class="callout note"><span class="tag">Note</span><p>The whole point of stateless verification: the bouncer never phones the office per guest. Your API never calls Auth0 per request. That is what makes JWT-based APIs scale to millions of requests with single-digit-millisecond auth overhead.</p></div>
+  </section>
+
+  <!-- ============================================================= 3 -->
+  <section id="diagrams">
+    <h2>3. ASCII Diagrams — How a Request Becomes a Decision</h2>
+
+    <h3>3.1 The end-to-end token lifecycle</h3>
+    <pre class="diagram">
+   ┌────────────┐   1. login / client-credentials    ┌──────────────────┐
+   │   CLIENT   │ ──────────────────────────────────▶ │   AUTH0  (AS)    │
+   │ SPA/mobile │ ◀────── 2. access_token (JWT) ────── │  issuer + keys   │
+   │  /M2M svc  │                                       └────────┬─────────┘
+   └─────┬──────┘                                                │ publishes
+         │ 3. GET /api/private                                   │ public keys
+         │    Authorization: Bearer eyJhbGci...                  ▼
+         │                                          ┌────────────────────────┐
+         ▼                                          │  /.well-known/jwks.json │
+   ┌──────────────────────────────────────────┐    └────────────┬───────────┘
+   │            FASTAPI  (Resource Server)     │ 4. fetch+cache JWKS (once)
+   │                                           │ ◀───────────────┘
+   │  verify: sig · iss · aud · exp · scope    │
+   └─────┬──────────────────────────┬──────────┘
+         │ 5a. all pass             │ 5b. any fail
+         ▼                          ▼
+     200 + data            401 (bad token) / 403 (bad scope)
+    </pre>
+
+    <h3>3.2 Anatomy of the JWT on the wire</h3>
+    <pre class="diagram">
+   Authorization: Bearer  eyJhbGciOiJSUzI1NiIsImtpZCI6ImFiYzEyMyJ9 . eyJpc3MiOiJ... . QkZ2k3...
+                          └──────────── HEADER ─────────────────┘   └─ PAYLOAD ─┘   └ SIGNATURE ┘
+                                   {                                 {
+                                     "alg":"RS256",                    "iss":"https://t/",
+                                     "kid":"abc123",  ◀── picks key     "aud":"https://api",
+                                     "typ":"JWT"          from JWKS     "sub":"auth0|123",
+                                   }                                    "exp":1730000000,
+                                                                        "scope":"read:items"
+                                                                      }
+    </pre>
+
+    <h3>3.3 FastAPI dependency-injection auth pipeline</h3>
+    <pre class="diagram">
+   HTTP request
+        │
+        ▼
+   HTTPBearer ── extracts "Bearer xxx" ──▶ credentials.credentials (raw JWT)
+        │
+        ▼
+   verify_token(token)
+        │  ├─ PyJWKClient.get_signing_key_from_jwt(token)   (cached)
+        │  ├─ jwt.decode(token, key, algorithms=[RS256],
+        │  │             audience=API_ID, issuer=ISSUER)
+        │  └─ returns claims dict  ── or raises 401
+        ▼
+   require_scope("read:items")
+        │  └─ "read:items" in claims["scope"].split()? ── no ▶ 403
+        ▼
+   route handler runs with verified claims
+    </pre>
+
+    <h3>3.4 JWKS cache state machine</h3>
+    <pre class="diagram">
+        ┌──────────┐  first request / unknown kid   ┌───────────────┐
+        │  EMPTY   │ ─────────────────────────────▶ │  FETCHING     │
+        └──────────┘                                 └──────┬────────┘
+              ▲                                             │ 200 OK
+              │ kid not found after refetch (rare)          ▼
+        ┌─────┴──────┐   kid found in cache         ┌───────────────┐
+        │   ERROR    │ ◀────────────────────────────│   CACHED      │──┐
+        │  (401)     │                               └───────────────┘  │ serve key
+        └────────────┘                                     ▲            │ (no network)
+                                                           └────────────┘
+    </pre>
+  </section>
+
+  <!-- ============================================================= 4 -->
+  <section id="analogy">
+    <h2>4. Real-World Analogy — The Passport and the Visa</h2>
+    <p>Think of international travel. Your <strong>passport</strong> is issued by a government (the authorization server). A border officer in another country (your API) does not phone your government to verify you — that would be absurd at scale. Instead, every government distributes the security features of its passports (holograms, chip signatures) to border agencies. The officer verifies the passport <em>locally</em> against those known features. That distribution is the <strong>JWKS</strong>; the local check is <strong>signature verification</strong>.</p>
+    <p>But a valid passport only proves <em>who you are</em>. To <em>enter</em> the country you may also need a <strong>visa</strong> — and a tourist visa does not let you take up employment. The passport is authentication; the visa class is authorization. In our API, the JWT signature/issuer/audience checks are the passport; the <strong>scope</strong> (<code>read:items</code> vs <code>delete:items</code>) is the visa class. A genuine passport with a tourist visa correctly gets you across the border (200 on a read) but correctly gets you turned away at the work-permit desk (403 on a delete).</p>
+    <p>The <code>exp</code> claim is the passport/visa expiry date. The <code>aud</code> claim is the destination stamped on the visa — a visa for France does not admit you to Germany, just as a token minted for <em>another</em> API must be rejected by yours even though both came from the same Auth0 tenant.</p>
+    <div class="callout tip"><span class="tag">Tip</span><p>The audience check is the one beginners most often forget — and it is a genuine privilege-escalation hole. Without it, a token your tenant issued for a low-value API would be accepted by your high-value API. Always pin <code>audience</code> to <em>your</em> API identifier.</p></div>
+  </section>
+
+  <!-- ============================================================= 5 -->
+  <section id="internal">
+    <h2>5. Internal Working — What Happens Inside <code>jwt.decode</code></h2>
+    <p>To trust a library you must know what it does. Here is the exact sequence <code>PyJWT</code> performs when you call <code>jwt.decode(token, key, algorithms=["RS256"], audience=..., issuer=...)</code>:</p>
+    <ol>
+      <li><strong>Split &amp; decode.</strong> The token string is split on dots into three parts. The header and payload are Base64URL-decoded into JSON. No crypto yet — anyone can do this.</li>
+      <li><strong>Algorithm gate.</strong> The header's <code>alg</code> is checked against your explicit <code>algorithms=["RS256"]</code> allow-list. This single line defeats the infamous <em>alg-confusion</em> and <em>alg=none</em> attacks (more in §9).</li>
+      <li><strong>Recompute the signing input.</strong> The library takes the raw <code>base64(header) + "." + base64(payload)</code> bytes — exactly what Auth0 signed.</li>
+      <li><strong>Verify the signature.</strong> Using the RSA public key, it computes whether the provided signature is a valid RSA-SHA256 signature of the signing input. If the token was altered by even one bit, this fails. This is the cryptographic heart of the whole system.</li>
+      <li><strong>Validate registered claims.</strong> With the signature trusted, the library checks <code>exp</code> (not expired, allowing optional leeway), <code>nbf</code>/<code>iat</code>, then compares <code>aud</code> against your expected audience and <code>iss</code> against your expected issuer. Any mismatch raises a specific exception.</li>
+      <li><strong>Return claims.</strong> Only if every step passes does it return the payload dict for your code to authorize against.</li>
+    </ol>
+
+    <h3>Where the key comes from: <code>PyJWKClient</code></h3>
+    <p>Step 4 needs the <em>right</em> public key. Auth0 may hold several keys (it rotates them). The token's header <code>kid</code> says which one signed it. <code>PyJWKClient</code> encapsulates this:</p>
+    <ul>
+      <li>On first use, it HTTP-GETs <code>https://YOUR_TENANT/.well-known/jwks.json</code> — a JSON document listing every public key with its <code>kid</code>, modulus <code>n</code>, exponent <code>e</code>, and type.</li>
+      <li>It builds an in-memory cache mapping <code>kid → key</code>.</li>
+      <li><code>get_signing_key_from_jwt(token)</code> reads the token's <code>kid</code> and returns the cached key. If the <code>kid</code> is unknown, it refetches the JWKS once (handling key rotation) before giving up.</li>
+    </ul>
+    <p>The net effect: <strong>at most one network call per unique key</strong>, not one per request. With <code>lifespan</code>-cached or module-level client instances, your steady-state auth cost is pure CPU — an RSA verification, microseconds of work.</p>
+
+    <div class="callout note"><span class="tag">Note</span><p>The JWKS document never contains a private key. The fields <code>n</code> (modulus) and <code>e</code> (exponent) fully describe the RSA <em>public</em> key. You can mathematically verify signatures with them but cannot derive the private key — that is the one-way trapdoor RSA is built on.</p></div>
+  </section>
+
+  <!-- ============================================================= 6 -->
+  <section id="walkthrough">
+    <h2>6. Code Walkthrough — Building the Verifier Piece by Piece</h2>
+
+    <h3>6.1 Dependencies</h3>
+    <p>Install the minimal, production-correct set. <code>PyJWT[crypto]</code> pulls in the <code>cryptography</code> package that provides RS256 support — plain <code>PyJWT</code> alone cannot do RSA.</p>
+    <pre><code class="language-bash"># requirements.txt
+fastapi==0.115.*
+uvicorn[standard]==0.32.*
+"PyJWT[crypto]"==2.10.*
+pydantic-settings==2.*
+
+# install
+pip install -r requirements.txt</code></pre>
+
+    <h3>6.2 Configuration (never hard-code tenant values)</h3>
+    <p>Pull your Auth0 domain and API audience from environment variables. The <code>issuer</code> is your domain wrapped in <code>https://…/</code> (note the trailing slash — Auth0 includes it, and a mismatch will reject every token).</p>
+    <pre><code class="language-python"># config.py
+from pydantic_settings import BaseSettings
+
+class Settings(BaseSettings):
+    auth0_domain: str           # e.g. "my-tenant.us.auth0.com"
+    auth0_api_audience: str      # e.g. "https://api.myapp.com"
+    auth0_algorithms: str = "RS256"
+
+    @property
+    def issuer(self) -&gt; str:
+        return f"https://{self.auth0_domain}/"
+
+    @property
+    def jwks_url(self) -&gt; str:
+        return f"https://{self.auth0_domain}/.well-known/jwks.json"
+
+    class Config:
+        env_file = ".env"
+
+settings = Settings()</code></pre>
+    <pre><code class="language-bash"># .env  (never commit this)
+AUTH0_DOMAIN=my-tenant.us.auth0.com
+AUTH0_API_AUDIENCE=https://api.myapp.com</code></pre>
+
+    <h3>6.3 The JWT verifier</h3>
+    <p>This is the core. A single <code>PyJWKClient</code> is created once at import time (so the cache is shared across all requests). <code>verify_jwt</code> performs every check from §1 and raises a precise <code>HTTPException</code> on each failure mode.</p>
+    <pre><code class="language-python"># auth.py
+import jwt
+from jwt import PyJWKClient
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from config import settings
+
+# One client, created once → shared, cached JWKS for the whole process.
+_jwks_client = PyJWKClient(settings.jwks_url, cache_keys=True)
+
+# Tells FastAPI to read the "Authorization: Bearer &lt;token&gt;" header
+# and to advertise Bearer auth in the OpenAPI schema.
+bearer_scheme = HTTPBearer(auto_error=True)
+
+def verify_jwt(
+    creds: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+) -&gt; dict:
+    token = creds.credentials
+    try:
+        # 1. Resolve the right public key by the token's "kid" (cached).
+        signing_key = _jwks_client.get_signing_key_from_jwt(token)
+
+        # 2. Verify signature + iss + aud + exp in one call.
+        claims = jwt.decode(
+            token,
+            signing_key.key,
+            algorithms=[settings.auth0_algorithms],   # RS256 ONLY
+            audience=settings.auth0_api_audience,       # must match our API
+            issuer=settings.issuer,                     # must match our tenant
+            options={"require": ["exp", "iat", "iss", "aud"]},
+        )
+        return claims
+
+    except jwt.ExpiredSignatureError:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Token expired")
+    except jwt.InvalidAudienceError:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid audience")
+    except jwt.InvalidIssuerError:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid issuer")
+    except jwt.PyJWKClientError:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Signing key not found")
+    except jwt.InvalidTokenError:
+        # Catch-all for signature failures, malformed tokens, etc.
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid token")</code></pre>
+
+    <h3>6.4 The scope checker (a dependency factory)</h3>
+    <p>Authorization is a separate concern from authentication. <code>require_scope</code> is a <em>factory</em>: you call it with the scope a route needs, and it returns a dependency that runs <em>after</em> <code>verify_jwt</code>, inspecting the already-verified claims.</p>
+    <pre><code class="language-python"># auth.py (continued)
+from typing import Callable
+
+def require_scope(required: str) -&gt; Callable:
+    def checker(claims: dict = Depends(verify_jwt)) -&gt; dict:
+        # Auth0 puts space-delimited scopes in "scope";
+        # RBAC-enabled APIs may also use a "permissions" list.
+        token_scopes = set(claims.get("scope", "").split())
+        token_perms = set(claims.get("permissions", []))
+        granted = token_scopes | token_perms
+        if required not in granted:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                f"Missing required scope: {required}",
+            )
+        return claims
+    return checker</code></pre>
+
+    <div class="callout key"><span class="tag">Key</span><p>Note the status codes: a bad/missing/expired token is <strong>401 Unauthorized</strong> ("we don't know who you are"). A <em>valid</em> token lacking the needed scope is <strong>403 Forbidden</strong> ("we know who you are, and you may not do this"). Getting this distinction right is both a correctness issue and a frequent interview/cert question.</p></div>
+  </section>
+
+  <!-- ============================================================= 7 -->
+  <section id="practical">
+    <h2>7. Practical Implementation — Securing Real Routes</h2>
+    <p>Now we wire the verifier into an actual API. We expose a public route (no auth), a private route (any valid token), and a scoped route (requires a specific permission).</p>
+    <pre><code class="language-python"># main.py
+from fastapi import FastAPI, Depends
+from auth import verify_jwt, require_scope
+
+app = FastAPI(
+    title="Auth0-Protected API",
+    description="A FastAPI resource server validating Auth0 RS256 access tokens.",
+    version="1.0.0",
+)
+
+# --- Public: anyone, no token needed --------------------------------
+@app.get("/api/public")
+def public():
+    return {"message": "Anyone can see this — no token required."}
+
+# --- Private: any authenticated caller ------------------------------
+@app.get("/api/private")
+def private(claims: dict = Depends(verify_jwt)):
+    return {
+        "message": "You presented a valid Auth0 token.",
+        "subject": claims["sub"],
+        "scopes": claims.get("scope", ""),
+    }
+
+# --- Scoped: valid token AND the read:items permission --------------
+@app.get("/api/items")
+def list_items(claims: dict = Depends(require_scope("read:items"))):
+    return {"items": ["alpha", "beta", "gamma"], "owner": claims["sub"]}
+
+# --- Scoped write: requires delete:items ----------------------------
+@app.delete("/api/items/{item_id}")
+def delete_item(item_id: str,
+                claims: dict = Depends(require_scope("delete:items"))):
+    return {"deleted": item_id, "by": claims["sub"]}</code></pre>
+
+    <p>Run it:</p>
+    <pre><code class="language-bash">uvicorn main:app --reload --port 8000
+# Swagger UI:  http://localhost:8000/docs
+# ReDoc:       http://localhost:8000/redoc</code></pre>
+
+    <h3>7.1 Making Swagger obtain tokens for you</h3>
+    <p>By default <code>HTTPBearer</code> lets testers paste a token into Swagger's "Authorize" box. To let Swagger run the full Authorization Code + PKCE flow against Auth0, configure OpenAPI's OAuth2 settings:</p>
+    <pre><code class="language-python"># main.py — let Swagger drive the Auth0 login flow
+app = FastAPI(
+    title="Auth0-Protected API",
+    swagger_ui_init_oauth={
+        "clientId": "YOUR_SPA_CLIENT_ID",
+        "usePkceWithAuthorizationCodeGrant": True,
+        "scopes": "openid profile read:items delete:items",
+        "additionalQueryStringParams": {
+            "audience": "https://api.myapp.com",   # forces a JWT access token
+        },
+    },
+)</code></pre>
+    <div class="callout warn"><span class="tag">Warn</span><p>The <code>audience</code> query param is essential. Without it, Auth0 may return an <em>opaque</em> access token (not a JWT) usable only against <code>/userinfo</code>. Passing your API identifier as the audience forces Auth0 to mint a verifiable RS256 JWT for your API.</p></div>
+  </section>
+
+  <!-- ============================================================= 8 -->
+  <section id="architecture">
+    <h2>8. Production Architecture — Where the API Sits</h2>
+    <pre class="diagram">
+                         Internet
+                            │
+                   ┌────────▼─────────┐
+                   │   CDN / WAF      │  TLS termination, DDoS, bot filtering
+                   └────────┬─────────┘
+                            │
+                   ┌────────▼─────────┐
+                   │  API Gateway /   │  rate-limit, routing, optional
+                   │  Load Balancer   │  coarse JWT pre-check
+                   └────────┬─────────┘
+              ┌─────────────┼─────────────┐
+              ▼             ▼             ▼
+        ┌──────────┐  ┌──────────┐  ┌──────────┐   each replica holds its OWN
+        │ FastAPI  │  │ FastAPI  │  │ FastAPI  │   in-process JWKS cache → no
+        │ (uvicorn │  │ (uvicorn │  │ (uvicorn │   shared state needed for auth
+        │ +gunicorn│  │ +gunicorn│  │ +gunicorn│
+        └────┬─────┘  └────┬─────┘  └────┬─────┘
+             └─────────────┼─────────────┘
+                           │  (JWKS fetched lazily, per process, then cached)
+                  ┌────────▼─────────┐
+                  │  AUTH0  /.well-  │  public keys; hit ~once per process
+                  │  known/jwks.json │  lifetime or per key-rotation
+                  └──────────────────┘
+    </pre>
+    <p>Key architectural properties that fall out of stateless JWT validation:</p>
+    <ul>
+      <li><strong>Horizontal scaling is free.</strong> Because each replica verifies tokens with its own cached keys and no session store, you can add or kill instances at will. No sticky sessions, no shared Redis for auth.</li>
+      <li><strong>Auth0 is off the hot path.</strong> A traffic spike to your API does <em>not</em> spike traffic to Auth0. The JWKS endpoint is hit a handful of times per process lifetime.</li>
+      <li><strong>Run with multiple workers.</strong> In production use <code>gunicorn -k uvicorn.workers.UvicornWorker -w 4 main:app</code>. Each worker has its own cache — acceptable, since JWKS is tiny and fetched rarely.</li>
+      <li><strong>Resilience.</strong> If Auth0's JWKS endpoint is briefly unreachable, already-cached keys keep serving traffic. Only first-ever startup or a key rotation depends on reachability.</li>
+    </ul>
+    <div class="callout tip"><span class="tag">Tip</span><p>For very large fleets, warm the JWKS cache at startup in a <code>lifespan</code> handler so the first real user request never pays the fetch latency, and so a misconfigured tenant fails fast on boot rather than on first traffic.</p></div>
+  </section>
+
+  <!-- ============================================================= 9 -->
+  <section id="security">
+    <h2>9. Security Analysis — Attacks and Defenses</h2>
+    <table>
+      <thead><tr><th>Attack</th><th>How it works</th><th>Our defense</th></tr></thead>
+      <tbody>
+        <tr><td><code>alg=none</code></td><td>Attacker sets header <code>alg:"none"</code> and sends an unsigned token, hoping the verifier skips signature checks.</td><td>We pass an explicit <code>algorithms=["RS256"]</code> allow-list; PyJWT rejects anything else, including <code>none</code>.</td></tr>
+        <tr><td>Algorithm confusion (RS256→HS256)</td><td>Attacker takes the public key, signs an HS256 token with it as the "secret"; a naïve verifier that trusts the header's <code>alg</code> validates it.</td><td>Same explicit allow-list. We never let the token's header choose the algorithm.</td></tr>
+        <tr><td>Token for another audience</td><td>A token your tenant minted for a different (lower-value) API is replayed against yours.</td><td>Mandatory <code>audience=</code> check pins to <em>our</em> API identifier.</td></tr>
+        <tr><td>Expired-token replay</td><td>A leaked old token is reused.</td><td><code>exp</code> is required and validated; tokens are short-lived (minutes–hours).</td></tr>
+        <tr><td>Forged / tampered token</td><td>Attacker edits the payload (e.g. adds <code>admin</code> scope).</td><td>Any payload change invalidates the RSA signature → rejected.</td></tr>
+        <tr><td>Token leakage in logs/URLs</td><td>Tokens end up in access logs, query strings, error trackers.</td><td>Only accept tokens in the <code>Authorization</code> header (never query strings); scrub headers from logs; enforce TLS.</td></tr>
+        <tr><td>Over-broad scopes</td><td>Client requests every scope "just in case".</td><td>Per-route <code>require_scope</code> enforces least privilege; APIs define granular scopes.</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Defense-in-depth checklist</h3>
+    <ul>
+      <li><strong>Always HTTPS.</strong> A bearer token is a password-equivalent; never transmit it over plaintext.</li>
+      <li><strong>Explicit algorithm allow-list.</strong> Never derive the algorithm from the token. This is non-negotiable.</li>
+      <li><strong>Validate <code>iss</code> and <code>aud</code> every time.</strong> They are cheap and they close real holes.</li>
+      <li><strong>Short token lifetimes + refresh tokens at the client.</strong> Limits the value of a stolen access token.</li>
+      <li><strong>Treat scope absence as deny.</strong> Default to 403; never "allow if unsure".</li>
+      <li><strong>Consider revocation needs.</strong> JWTs are valid until <code>exp</code>; if you need instant revocation, keep lifetimes very short or add a fast denylist check for high-risk operations.</li>
+    </ul>
+
+    <div class="callout danger"><span class="tag">Danger</span><p>The single most dangerous shortcut is calling <code>jwt.decode(token, options={"verify_signature": False})</code> "just to read the claims." Any code path that trusts an unverified token is a full authentication bypass. Decode-without-verify is only ever acceptable for non-security display (and even then, label it loudly).</p></div>
+  </section>
+
+  <!-- ============================================================= 10 -->
+  <section id="performance">
+    <h2>10. Performance Considerations</h2>
+    <ul>
+      <li><strong>JWKS caching is the whole game.</strong> A naïve implementation that fetches JWKS on every request adds a network round-trip (tens to hundreds of ms) to every call <em>and</em> can rate-limit you out of Auth0. With <code>PyJWKClient</code>'s cache, steady-state auth cost is one RSA verify — typically well under a millisecond.</li>
+      <li><strong>RSA verification is CPU work, not I/O.</strong> RS256 verification is cheap but not free. At extreme throughput, profile it; it parallelizes across workers/cores.</li>
+      <li><strong>Reuse one client instance.</strong> Creating a new <code>PyJWKClient</code> per request throws away the cache and re-fetches. Define it once at module scope (as we did) or in <code>lifespan</code>.</li>
+      <li><strong>Async I/O for the rest.</strong> FastAPI shines with <code>async def</code> handlers; verification itself is sync/CPU, but everything downstream (DB, upstream calls) should be async so a slow dependency doesn't block the event loop.</li>
+      <li><strong>Decode order matters.</strong> Resolve the signing key (cache lookup) before the expensive verify; PyJWT already orders cheap checks (alg gate) before the RSA math.</li>
+      <li><strong>Avoid per-request object churn.</strong> Compile the settings once; don't rebuild the issuer/audience strings on every call.</li>
+    </ul>
+    <table>
+      <thead><tr><th>Strategy</th><th>Per-request latency</th><th>Auth0 load</th><th>Verdict</th></tr></thead>
+      <tbody>
+        <tr><td>Fetch JWKS every request</td><td>+50–300 ms</td><td>1 call / request</td><td>Never do this</td></tr>
+        <tr><td>Cached JWKS (<code>PyJWKClient</code>)</td><td>&lt; 1 ms</td><td>~1 call / process</td><td>Correct default</td></tr>
+        <tr><td>Call <code>/userinfo</code> per request (opaque token)</td><td>+50–300 ms</td><td>1 call / request</td><td>Only for opaque tokens; avoid for APIs</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- ============================================================= 11 -->
+  <section id="mistakes">
+    <h2>11. Common Mistakes</h2>
+    <ol>
+      <li><strong>Forgetting the trailing slash in <code>issuer</code>.</strong> Auth0's <code>iss</code> is <code>https://tenant/</code>. Comparing against <code>https://tenant</code> (no slash) rejects every token.</li>
+      <li><strong>Omitting <code>audience</code>.</strong> Without it you accept tokens minted for other APIs in the same tenant — a privilege-escalation hole.</li>
+      <li><strong>Not passing the <code>audience</code> to the client.</strong> If the client doesn't request your API as audience, Auth0 returns an opaque token your verifier can't decode. Symptom: "Invalid token / not enough segments".</li>
+      <li><strong>Letting the token pick the algorithm.</strong> Passing <code>algorithms=jwt.get_unverified_header(token)["alg"]</code> reopens alg-confusion. Hard-code <code>["RS256"]</code>.</li>
+      <li><strong>Creating a new <code>PyJWKClient</code> per request.</strong> Destroys caching; hammers Auth0; adds latency.</li>
+      <li><strong>Using 403 for missing tokens (or 401 for missing scopes).</strong> 401 = unauthenticated; 403 = authenticated-but-forbidden. Mixing them confuses clients and breaks retries.</li>
+      <li><strong>Treating absence of a claim as permission.</strong> Always default to deny.</li>
+      <li><strong>Installing plain <code>PyJWT</code> without <code>[crypto]</code>.</strong> RS256 silently unavailable → "Algorithm not supported" at runtime.</li>
+      <li><strong>Reading <code>permissions</code> but not <code>scope</code> (or vice versa).</strong> Client-credentials tokens use <code>scope</code>; RBAC-enabled user tokens may use <code>permissions</code>. Check both.</li>
+      <li><strong>Logging the full <code>Authorization</code> header.</strong> Leaks live tokens into log aggregators.</li>
+    </ol>
+    <div class="callout warn"><span class="tag">Warn</span><p>"Not enough segments" and "Invalid header padding" almost always mean you received an opaque token, not a JWT. The fix is on the <em>client</em> side: request your API's identifier as the <code>audience</code>.</p></div>
+  </section>
+
+  <!-- ============================================================= 12 -->
+  <section id="bestpractices">
+    <h2>12. Best Practices</h2>
+    <ul>
+      <li><strong>Externalize all tenant config</strong> (domain, audience) to environment variables; fail fast at startup if missing.</li>
+      <li><strong>One verifier dependency, reused everywhere.</strong> Keep <code>verify_jwt</code> and <code>require_scope</code> in a single <code>auth.py</code>; never inline JWT logic in routes.</li>
+      <li><strong>Model scopes after actions, not roles:</strong> <code>read:items</code>, <code>create:orders</code>, <code>delete:users</code>. Map roles→scopes inside Auth0, keep the API checking concrete permissions.</li>
+      <li><strong>Document security in OpenAPI.</strong> Because we use <code>HTTPBearer</code>/OAuth2 security schemes, Swagger shows a lock icon per protected route and an Authorize button — self-documenting and testable.</li>
+      <li><strong>Return precise errors</strong> (401 vs 403, with a clear <code>WWW-Authenticate</code> header where appropriate) but never leak <em>why</em> a signature failed in a way that helps an attacker.</li>
+      <li><strong>Warm the cache in <code>lifespan</code></strong> for predictable latency and boot-time validation.</li>
+      <li><strong>Write tests against forged, expired, wrong-audience, and wrong-scope tokens</strong> — not just the happy path. The failure paths are where security lives.</li>
+      <li><strong>Pin dependency versions</strong> and track <code>PyJWT</code>/<code>cryptography</code> CVEs.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================= 13 -->
+  <section id="interview">
+    <h2>13. Interview Questions (with model answers)</h2>
+
+    <h3>Q1. Why does a FastAPI resource server not need to call Auth0 on every request?</h3>
+    <p><strong>Model answer:</strong> Auth0 access tokens are self-contained, RS256-signed JWTs. The API verifies them locally using Auth0's <em>public</em> keys, fetched once from the JWKS endpoint and cached. Because verification is offline cryptography, there is no per-request call to Auth0 — only an occasional JWKS fetch (first use or key rotation). This is what makes the design horizontally scalable and resilient.</p>
+
+    <h3>Q2. What exactly do you validate in a token, and why each?</h3>
+    <p><strong>Model answer:</strong> Signature (authenticity/integrity, via the public key matching the header <code>kid</code>), issuer (it came from <em>our</em> tenant), audience (it was minted for <em>our</em> API, preventing cross-API replay), expiry/nbf (it is currently valid), and then scope/permissions for the specific action (authorization). The first four are authentication; the last is authorization.</p>
+
+    <h3>Q3. RS256 vs HS256 for a third-party-issued token — which and why?</h3>
+    <p><strong>Model answer:</strong> RS256. HS256 uses a shared secret, so any verifier could also forge tokens — unacceptable when Auth0 issues and we only verify. RS256 is asymmetric: Auth0 signs with a private key it never shares, and we verify with the public key, which cannot mint tokens. Trust is distributed without distributing forgery power.</p>
+
+    <h3>Q4. How would you mitigate the algorithm-confusion attack?</h3>
+    <p><strong>Model answer:</strong> Never trust the token header's <code>alg</code>. Pass an explicit <code>algorithms=["RS256"]</code> allow-list to <code>jwt.decode</code>. This prevents both <code>alg=none</code> and the RS256→HS256 trick where an attacker signs an HS256 token using the public key as the secret.</p>
+
+    <h3>Q5. 401 vs 403 — when each?</h3>
+    <p><strong>Model answer:</strong> 401 Unauthorized when authentication fails — no token, malformed, expired, bad signature, wrong issuer/audience. 403 Forbidden when authentication <em>succeeds</em> but the token lacks the required scope/permission for that action.</p>
+
+    <h3>Q6. What is the JWKS endpoint and what does it contain?</h3>
+    <p><strong>Model answer:</strong> <code>/.well-known/jwks.json</code> publishes the tenant's set of <em>public</em> signing keys, each with a <code>kid</code> and the RSA parameters (<code>n</code>, <code>e</code>). The verifier matches the token's header <code>kid</code> to a key to check the signature. It never contains private keys.</p>
+
+    <h3>Q7. How do you handle Auth0 rotating its signing keys?</h3>
+    <p><strong>Model answer:</strong> Tokens carry the <code>kid</code> of the key that signed them. When a token's <code>kid</code> is not in the cache, <code>PyJWKClient</code> refetches the JWKS once and finds the new key. Old tokens remain verifiable as long as their key is still published. No code change or downtime is required for rotation.</p>
+
+    <h3>Q8. Can a JWT be revoked before it expires?</h3>
+    <p><strong>Model answer:</strong> Not natively — a signed JWT is valid until <code>exp</code>. Mitigations: keep lifetimes short, and for high-risk operations consult a fast denylist/introspection. Long-lived JWTs trade revocation for scalability; pick lifetimes accordingly.</p>
+  </section>
+
+  <!-- ============================================================= 14 -->
+  <section id="certification">
+    <h2>14. Certification Tips</h2>
+    <ul>
+      <li><strong>Know the resource-server role.</strong> The cert frequently asks who validates tokens (the API/RS) versus who issues them (Auth0/AS). Don't confuse the API with the client.</li>
+      <li><strong>Access token vs ID token.</strong> APIs validate <em>access</em> tokens (audience = API). ID tokens (audience = client) are for the client, not the API. A common trap question.</li>
+      <li><strong>Audience drives token format.</strong> Requesting an API audience yields a JWT; no audience yields an opaque token good only for <code>/userinfo</code>. Memorize this cause/effect.</li>
+      <li><strong>RBAC settings.</strong> Enabling "Add Permissions in the Access Token" puts a <code>permissions</code> array in the token; "RBAC" must be on for the API. Know where in the Auth0 dashboard these live (Applications → APIs → your API → RBAC Settings).</li>
+      <li><strong>Scopes vs permissions.</strong> Scopes are requested by the client; granted permissions reflect what RBAC actually allows. The cert tests whether you know a requested scope can be <em>denied</em>.</li>
+      <li><strong>Always RS256 for SPA/native/M2M.</strong> The cert expects asymmetric signing as the default and HS256 as the exception.</li>
+      <li><strong>Issuer format</strong> includes the trailing slash and the <code>https://</code> scheme — exact-match questions appear.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================= 15 -->
+  <section id="handson">
+    <h2>15. Hands-On Exercises</h2>
+    <ol>
+      <li><strong>Decode (don't verify) a token.</strong> Paste a real Auth0 access token at jwt.io or run <code>python -c "import jwt,sys; print(jwt.decode(sys.argv[1], options={'verify_signature': False}))" &lt;TOKEN&gt;</code>. Identify <code>iss</code>, <code>aud</code>, <code>exp</code>, <code>scope</code>. Confirm the header's <code>kid</code> appears in your tenant's JWKS.</li>
+      <li><strong>Break the audience.</strong> Temporarily set <code>AUTH0_API_AUDIENCE</code> to a wrong value, hit <code>/api/private</code>, and confirm you get 401 "Invalid audience". Restore it.</li>
+      <li><strong>Break the issuer.</strong> Remove the trailing slash from <code>issuer</code> and observe every request fail with "Invalid issuer". This cements the trailing-slash lesson.</li>
+      <li><strong>Force an opaque token.</strong> Request a token <em>without</em> the audience param and watch the verifier complain about "not enough segments". Explain why.</li>
+      <li><strong>Add a new scope.</strong> Create <code>create:items</code> in your Auth0 API, add a <code>POST /api/items</code> route guarded by <code>require_scope("create:items")</code>, and verify a token lacking it returns 403.</li>
+      <li><strong>Cache proof.</strong> Add a log line inside the JWKS fetch path and confirm it fires once across many requests, demonstrating the cache.</li>
+    </ol>
+  </section>
+
+  <!-- ============================================================= 16 -->
+  <section id="assignment">
+    <h2>16. Assignment</h2>
+    <p>Build and document a small but complete secured API:</p>
+    <ol>
+      <li>Create an Auth0 API with identifier <code>https://tasks.myapp.com</code> and define scopes <code>read:tasks</code>, <code>create:tasks</code>, <code>delete:tasks</code>. Enable RBAC and "Add Permissions in the Access Token".</li>
+      <li>Implement endpoints: <code>GET /tasks</code> (read), <code>POST /tasks</code> (create), <code>DELETE /tasks/{id}</code> (delete), each guarded by the matching scope, plus a public <code>GET /health</code>.</li>
+      <li>Use <code>PyJWKClient</code> with a single shared instance and full <code>iss</code>/<code>aud</code>/<code>exp</code> validation.</li>
+      <li>Configure Swagger to obtain tokens via Auth0 (PKCE) and screenshot a successful authorized call.</li>
+      <li>Write pytest cases for: valid token happy path, expired token (401), wrong audience (401), and missing scope (403). Mock or mint tokens as needed.</li>
+      <li>Write a one-page README explaining the five validation checks and your 401-vs-403 decisions.</li>
+    </ol>
+    <div class="callout tip"><span class="tag">Tip</span><p>For tests without a live Auth0 round-trip, generate an RSA keypair locally, sign test JWTs with the private key, and point a test <code>PyJWKClient</code> (or a monkeypatched signing key) at the matching public key. This lets you assert every failure path deterministically.</p></div>
+  </section>
+
+  <!-- ============================================================= 17 -->
+  <section id="miniproject">
+    <h2>17. Mini Project — A Multi-Tenant Notes API with Ownership</h2>
+    <p>Combine authentication, authorization, <em>and</em> data-level access control — the trio real APIs need.</p>
+    <pre><code class="language-python"># notes.py
+from fastapi import FastAPI, Depends, HTTPException, status
+from pydantic import BaseModel
+from auth import verify_jwt, require_scope
+
+app = FastAPI(title="Notes API")
+
+class Note(BaseModel):
+    id: int
+    owner: str        # the "sub" of the user who created it
+    text: str
+
+DB: dict[int, Note] = {}
+_next_id = 1
+
+@app.post("/notes", status_code=201)
+def create_note(text: str, claims: dict = Depends(require_scope("create:notes"))):
+    global _next_id
+    note = Note(id=_next_id, owner=claims["sub"], text=text)
+    DB[_next_id] = note
+    _next_id += 1
+    return note
+
+@app.get("/notes")
+def my_notes(claims: dict = Depends(require_scope("read:notes"))):
+    # Authorization is not enough — also enforce OWNERSHIP at the data layer.
+    return [n for n in DB.values() if n.owner == claims["sub"]]
+
+@app.delete("/notes/{note_id}", status_code=204)
+def delete_note(note_id: int, claims: dict = Depends(require_scope("delete:notes"))):
+    note = DB.get(note_id)
+    if note is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Not found")
+    if note.owner != claims["sub"]:
+        # Valid token, valid scope — but not YOUR note.
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Not your note")
+    del DB[note_id]</code></pre>
+    <p><strong>The lesson:</strong> scopes answer "may this <em>kind</em> of action happen?"; ownership answers "may this caller act on <em>this specific</em> object?" Production APIs need both. A user with <code>delete:notes</code> still must not delete another user's note — that is an <em>object-level</em> (IDOR) check the token alone cannot make.</p>
+    <div class="callout danger"><span class="tag">Danger</span><p>Skipping the ownership check is the #1 vulnerability in real APIs: <strong>Broken Object Level Authorization (BOLA/IDOR)</strong>, top of the OWASP API Security list. A correct scope does not imply a right to a specific record.</p></div>
+  </section>
+
+  <!-- ============================================================= 18 -->
+  <section id="quiz">
+    <h2>18. Quiz — Test Yourself (25 questions)</h2>
+    <ol>
+      <li>What OAuth 2.0 role does a FastAPI API play when it validates Auth0 tokens?</li>
+      <li>Name the three segments of a JWT and what each contains.</li>
+      <li>Why is the JWT payload <em>not</em> a place to store secrets?</li>
+      <li>Why does Auth0 use RS256 rather than HS256 for API access tokens?</li>
+      <li>What field in the JWT header selects which JWKS key to use?</li>
+      <li>What URL hosts a tenant's public keys?</li>
+      <li>List the five things a correct verifier checks.</li>
+      <li>What does the <code>aud</code> claim protect against?</li>
+      <li>Why must <code>issuer</code> include a trailing slash for Auth0?</li>
+      <li>What does <code>PyJWKClient</code> cache, and how many network calls in steady state?</li>
+      <li>What goes wrong if you create a new <code>PyJWKClient</code> per request?</li>
+      <li>Which package extra gives <code>PyJWT</code> RS256 support?</li>
+      <li>What status code for an expired token? For a valid token missing a scope?</li>
+      <li>How does passing <code>algorithms=["RS256"]</code> stop the <code>alg=none</code> attack?</li>
+      <li>Describe the RS256→HS256 confusion attack in one sentence.</li>
+      <li>Why does requesting an API <code>audience</code> change the token format?</li>
+      <li>What is an opaque token good for, and why can't your verifier decode it?</li>
+      <li>Where do Auth0 RBAC permissions appear in a token, and what setting enables them?</li>
+      <li>Difference between a requested scope and a granted permission?</li>
+      <li>How does the system survive Auth0 rotating its signing keys with no downtime?</li>
+      <li>Can a JWT be revoked before <code>exp</code>? What do you do if you need fast revocation?</li>
+      <li>Why is calling <code>jwt.decode(..., verify_signature=False)</code> in an auth path dangerous?</li>
+      <li>What is a FastAPI "dependency", and why use one for auth?</li>
+      <li>What is BOLA/IDOR and why don't scopes prevent it?</li>
+      <li>Which security scheme makes Swagger show a lock icon and Authorize button?</li>
+    </ol>
+
+    <details>
+      <summary>Show answer key</summary>
+      <ol>
+        <li><strong>Resource Server</strong> — it validates tokens and serves protected resources.</li>
+        <li><strong>Header</strong> (alg, kid, typ), <strong>Payload</strong> (claims: iss, aud, sub, exp, scope), <strong>Signature</strong> (RSA-SHA256 over header.payload).</li>
+        <li>Header and payload are only Base64URL-encoded, not encrypted — anyone can read them.</li>
+        <li>RS256 is asymmetric: Auth0 signs with a private key, the API verifies with a public key that <em>cannot</em> forge tokens. HS256's shared secret would let any verifier also forge.</li>
+        <li>The <code>kid</code> (key id) in the header.</li>
+        <li><code>https://YOUR_TENANT/.well-known/jwks.json</code></li>
+        <li>Signature, issuer, audience, expiry (exp/nbf), and scope/permissions for the action.</li>
+        <li>Cross-API replay — a token minted for a different API in the same tenant being used against yours.</li>
+        <li>Auth0's <code>iss</code> claim ends with <code>/</code>; an exact string comparison fails without it.</li>
+        <li>It caches the JWKS (kid→public key map); roughly one network call per process lifetime (plus on key rotation).</li>
+        <li>You discard the cache, re-fetch JWKS every request, add latency, and risk Auth0 rate limits.</li>
+        <li><code>PyJWT[crypto]</code> (it installs the <code>cryptography</code> package).</li>
+        <li>Expired token → <strong>401</strong>; valid token missing scope → <strong>403</strong>.</li>
+        <li>The explicit allow-list rejects any token whose <code>alg</code> isn't RS256, including <code>none</code>; the header can't dictate the algorithm.</li>
+        <li>The attacker signs an HS256 token using the RSA <em>public</em> key as the HMAC secret, fooling a verifier that trusts the header's <code>alg</code>.</li>
+        <li>Without an API audience Auth0 returns an opaque token; supplying the API identifier forces a JWT meant for that API.</li>
+        <li>It's a reference token usable only by calling Auth0's <code>/userinfo</code>; it has no signed claims your API can verify locally.</li>
+        <li>In the <code>permissions</code> array; enable "RBAC" and "Add Permissions in the Access Token" on the API.</li>
+        <li>A scope is what the client <em>asks</em> for; a permission is what RBAC actually <em>grants</em> — a requested scope can be denied.</li>
+        <li>Tokens carry their signing key's <code>kid</code>; on an unknown <code>kid</code> the client refetches JWKS and finds the new key; old tokens stay valid while their key is published.</li>
+        <li>Not natively — it's valid until <code>exp</code>. For fast revocation use very short lifetimes and/or a denylist/introspection check on sensitive operations.</li>
+        <li>It trusts a token without proving authenticity — a full authentication bypass.</li>
+        <li>A reusable function FastAPI injects into routes; centralizing auth in one dependency keeps it consistent, testable, and self-documenting in OpenAPI.</li>
+        <li>Broken Object Level Authorization — accessing another user's object by id. Scopes grant an action <em>type</em>, not rights to a <em>specific</em> record; you must check ownership separately.</li>
+        <li>An <code>HTTPBearer</code> (or OAuth2) security scheme, which FastAPI emits into the OpenAPI document.</li>
+      </ol>
+    </details>
+  </section>
+
+  <!-- ============================================================= 19 -->
+  <section id="cheatsheet">
+    <h2>19. Cheat Sheet</h2>
+
+    <h3>19.1 The verifier in one screen</h3>
+    <pre><code class="language-python">_jwks = PyJWKClient("https://TENANT/.well-known/jwks.json")  # once, module scope
+
+def verify(creds = Depends(HTTPBearer())):
+    key = _jwks.get_signing_key_from_jwt(creds.credentials)   # cached
+    return jwt.decode(
+        creds.credentials, key.key,
+        algorithms=["RS256"],                # RS256 only
+        audience="https://api.myapp.com",     # your API id
+        issuer="https://TENANT/",             # trailing slash!
+        options={"require": ["exp","iat","iss","aud"]},
+    )</code></pre>
+
+    <h3>19.2 curl recipes</h3>
+    <pre><code class="language-bash"># 1) Get an M2M token (client credentials)
+curl --request POST \
+  --url https://TENANT/oauth/token \
+  --header 'content-type: application/json' \
+  --data '{
+    "client_id":"CID","client_secret":"CSECRET",
+    "audience":"https://api.myapp.com",
+    "grant_type":"client_credentials"
+  }'
+
+# 2) Call a protected route
+TOKEN="eyJhbGci..."
+curl http://localhost:8000/api/private \
+  -H "Authorization: Bearer $TOKEN"
+
+# 3) Expect 401 (no token) / 403 (valid token, wrong scope)
+curl -i http://localhost:8000/api/items                       # 403/401
+curl -i http://localhost:8000/api/items -H "Authorization: Bearer $TOKEN"</code></pre>
+
+    <h3>19.3 Postman setup</h3>
+    <table>
+      <thead><tr><th>Step</th><th>Action</th></tr></thead>
+      <tbody>
+        <tr><td>1</td><td>Request → <strong>Authorization</strong> tab → Type = <strong>OAuth 2.0</strong>.</td></tr>
+        <tr><td>2</td><td>Grant Type: <em>Authorization Code (With PKCE)</em> for user tokens, or <em>Client Credentials</em> for M2M.</td></tr>
+        <tr><td>3</td><td>Auth URL <code>https://TENANT/authorize</code>, Token URL <code>https://TENANT/oauth/token</code>.</td></tr>
+        <tr><td>4</td><td>Add an <code>audience=https://api.myapp.com</code> param so Auth0 returns a JWT.</td></tr>
+        <tr><td>5</td><td>Scope: <code>openid profile read:items delete:items</code>.</td></tr>
+        <tr><td>6</td><td>Click <em>Get New Access Token</em> → <em>Use Token</em> → Send.</td></tr>
+      </tbody>
+    </table>
+
+    <h3>19.4 Status-code map</h3>
+    <table>
+      <thead><tr><th>Situation</th><th>Code</th></tr></thead>
+      <tbody>
+        <tr><td>No / malformed / expired / forged token</td><td>401</td></tr>
+        <tr><td>Wrong issuer or audience</td><td>401</td></tr>
+        <tr><td>Valid token, missing required scope</td><td>403</td></tr>
+        <tr><td>Valid token + scope, but not your object</td><td>403</td></tr>
+        <tr><td>Everything passes</td><td>200 / 201 / 204</td></tr>
+      </tbody>
+    </table>
+  </section>
+
+  <!-- ============================================================= 20 -->
+  <section id="takeaways">
+    <h2>20. Key Takeaways</h2>
+    <ul>
+      <li><strong>Your API is a Resource Server.</strong> Its job is to verify Auth0-issued access tokens locally and authorize each request — never to issue tokens or authenticate users.</li>
+      <li><strong>Verification, not lookup.</strong> RS256 + JWKS lets you trust tokens by cryptographic inspection, with no per-request call to Auth0. That is the source of scalability and resilience.</li>
+      <li><strong>Five checks, all mandatory:</strong> signature, issuer, audience, expiry, and scope. Skipping any is a real vulnerability; audience and issuer are the most-forgotten.</li>
+      <li><strong>Cache the keys, share one client.</strong> <code>PyJWKClient</code> turns auth into microseconds of CPU. A fresh client per request is the classic performance and rate-limit mistake.</li>
+      <li><strong>Authentication ≠ authorization.</strong> A valid token (401 gate) still needs the right scope (403 gate) — and for specific records, an ownership check the token cannot make.</li>
+      <li><strong>Hard-code the algorithm allow-list.</strong> <code>algorithms=["RS256"]</code> closes the <code>alg=none</code> and algorithm-confusion attacks in one line.</li>
+      <li><strong>FastAPI dependencies make it clean.</strong> <code>verify_jwt</code> and <code>require_scope</code> are reusable, testable, and self-documenting — they put a lock icon and Authorize button right in Swagger.</li>
+      <li><strong>Force a JWT with the audience param;</strong> an opaque token means the client forgot to request your API. That single param resolves the most common "not enough segments" error.</li>
+    </ul>
+    <div class="callout key"><span class="tag">Key</span><p>If you remember one sentence from this chapter: <em>a resource server trusts a token by verifying its RS256 signature against cached public keys and checking iss/aud/exp, then authorizes by scope and ownership — all locally, all stateless.</em> Master that and you can secure any framework, not just FastAPI.</p></div>
+  </section>
+
+  <nav class="pager">
+    <a class="prev" href="chapter-21.html">← Previous</a>
+    <a class="next" href="chapter-23.html">Next →</a>
+  </nav>
+</main>
+<footer class="site-footer">Master Auth0 End-to-End · Chapter 22 of 32</footer>
+</body>
+</html>

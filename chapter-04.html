@@ -1,0 +1,702 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 4 — OAuth 2.0 Foundations | Master Auth0</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">🔐 Master Auth0</a>
+  <nav class="topnav">
+    <a href="chapter-03.html">← Prev</a>
+    <a href="index.html">Contents</a>
+    <a href="chapter-05.html">Next →</a>
+  </nav>
+</header>
+<main class="container">
+  <div class="chapter-head">
+    <span class="phase">Phase 2 · OAuth 2.0 Masterclass</span>
+    <h1>Chapter 4 — OAuth 2.0 Foundations</h1>
+    <p class="lead">Almost every "Log in with Google", "Connect your GitHub", and "Allow this app to read your calendar" button on the internet runs on one protocol: OAuth 2.0. Auth0 itself is, at its core, a hosted, hardened OAuth 2.0 / OpenID Connect server. If OAuth is fuzzy, every later chapter — flows, tokens, rules, APIs, fine-grained authorization — will feel like memorization. This chapter builds OAuth from absolute first principles: the problem it solves, the four roles, the two endpoints, the two channels, the two token types, scopes and consent, and the single most misunderstood fact in the whole field — <strong>OAuth 2.0 is an authorization framework, not an authentication protocol.</strong> By the end you will be able to draw the entire dance from memory and explain every arrow.</p>
+  </div>
+
+  <!-- 1 -->
+  <section id="theory">
+    <h2>1. Theory — First Principles</h2>
+    <p>Before OAuth, there was a genuinely terrible pattern called the <strong>password anti-pattern</strong>. Imagine a printing service called <em>PrintMyPics</em> wants to grab the photos in your Google account so it can mail you a calendar. In ~2006 the only way to do this was for PrintMyPics to ask you for your Google <em>username and password</em>, then log in <em>as you</em> and scrape your photos.</p>
+    <p>Stop and feel how bad that is. You handed a third party your <strong>master credential</strong>. With it they can read your email, change your password, delete your account, impersonate you everywhere Google reaches. There is no way to give them "just photos". There is no way to revoke <em>only</em> PrintMyPics without changing your password and breaking every other app. There is no expiry. There is no audit trail of who did what. The credential is reusable forever and grants unlimited power.</p>
+    <p>OAuth 2.0 (RFC 6749, 2012) exists to solve exactly one problem, and the name tells you what it is:</p>
+    <div class="callout key"><span class="tag">Key</span><p><strong>Delegated authorization.</strong> OAuth lets a user (the <em>resource owner</em>) grant a third-party application (the <em>client</em>) <em>limited, revocable, scoped</em> access to resources held on another service — <em>without</em> ever sharing the user's password with that application.</p></div>
+    <p>Every design decision in OAuth flows from breaking down the password anti-pattern into requirements:</p>
+    <table>
+      <thead><tr><th>Problem with sharing passwords</th><th>OAuth requirement</th><th>OAuth mechanism</th></tr></thead>
+      <tbody>
+        <tr><td>App gets unlimited power</td><td>Access must be <strong>scoped</strong></td><td><code>scope</code> parameter + consent screen</td></tr>
+        <tr><td>App keeps access forever</td><td>Access must <strong>expire</strong></td><td>Short-lived <strong>access tokens</strong></td></tr>
+        <tr><td>Can't revoke one app</td><td>Access must be <strong>revocable</strong> per app</td><td>Token revocation; per-client grants</td></tr>
+        <tr><td>App can do everything you can</td><td>App acts with <strong>its own identity</strong>, not yours</td><td><code>client_id</code> / <code>client_secret</code></td></tr>
+        <tr><td>Password leaks = total compromise</td><td>The high-value secret must <strong>never touch the client</strong></td><td>Redirect to the authorization server</td></tr>
+      </tbody>
+    </table>
+    <p>The genius move is <strong>indirection</strong>: instead of the user giving the password to the app, the user authenticates <em>directly</em> at the service that holds the resources, and that service hands the app a <em>token</em> — a narrow, time-boxed, app-specific "valet key". The password never leaves the service. The token is all the app ever sees.</p>
+  </section>
+
+  <!-- 2 -->
+  <section id="story">
+    <h2>2. Story-Based Explanation</h2>
+    <p>Meet <strong>Maya</strong>. She uses a cloud photo service, <em>PixVault</em>, where all her photos live. She discovers <em>FrameIt</em>, an app that prints physical photo books. FrameIt needs to read Maya's photos.</p>
+    <p><strong>The bad old way:</strong> FrameIt shows a form: "Enter your PixVault email and password." Maya types them in. FrameIt now <em>is</em> Maya at PixVault. It could delete her albums or read her private ones. Maya is uneasy, and rightly so.</p>
+    <p><strong>The OAuth way:</strong> Maya clicks "Connect PixVault". FrameIt does <em>not</em> ask for her password. Instead it <strong>redirects her browser to PixVault itself</strong>. On a real PixVault page (Maya checks the URL bar — it really is <code>pixvault.com</code>), she logs in <em>to PixVault, with PixVault</em>. PixVault then shows a consent screen:</p>
+    <blockquote>"FrameIt wants to: <strong>View your photos (read-only)</strong>. It will NOT be able to delete photos or see your account settings. [Allow] [Deny]"</blockquote>
+    <p>Maya clicks <strong>Allow</strong>. PixVault sends her browser back to FrameIt with a one-time <strong>authorization code</strong>. FrameIt's <em>server</em> quietly swaps that code (plus its own secret) for an <strong>access token</strong> at PixVault's token endpoint. From now on, FrameIt calls PixVault's API with that token: <code>GET /photos</code> with header <code>Authorization: Bearer abc123…</code>. PixVault sees a token that says "read photos only, expires in 1 hour, issued to FrameIt for Maya" and returns exactly that.</p>
+    <p>Three weeks later Maya is done. She goes to PixVault → Settings → Connected Apps → FrameIt → <strong>Revoke</strong>. FrameIt is cut off instantly. Maya never changed her password. She never gave it away. <em>That</em> is delegated authorization.</p>
+    <div class="callout note"><span class="tag">Note</span><p>Notice who talked to whom. Maya ↔ PixVault for the password. FrameIt ↔ PixVault for the token. FrameIt <em>never</em> learned Maya's password. The trust boundaries stayed clean. This separation is the entire point.</p></div>
+  </section>
+
+  <!-- 3 -->
+  <section id="diagrams">
+    <h2>3. ASCII Diagrams</h2>
+    <p>First, the four roles and how they relate:</p>
+    <pre class="diagram">
+                 ┌───────────────────────────────────────────────┐
+                 │                  RESOURCE OWNER                 │
+                 │                 (the human, Maya)               │
+                 │              owns the photos / data             │
+                 └───────────────┬───────────────────────────────┘
+                                 │ uses (in a browser/device)
+                                 ▼
+   ┌───────────────────────┐         delegated access via TOKEN
+   │       CLIENT          │◀───────────────────────────────────┐
+   │  (FrameIt app)        │                                     │
+   │ wants the resources   │                                     │
+   └─────────┬─────────────┘                                     │
+             │ 1. redirect user to authorize                     │
+             ▼                                                    │
+   ┌───────────────────────┐   2. issues code + tokens   ┌───────┴───────────┐
+   │ AUTHORIZATION SERVER  │────────────────────────────▶│  RESOURCE SERVER  │
+   │   (PixVault's AS;     │   trusts tokens it minted   │  (PixVault API)   │
+   │   in our case Auth0)  │                             │ holds the photos  │
+   └───────────────────────┘                             └───────────────────┘
+    </pre>
+    <p>Now the canonical <strong>Authorization Code</strong> flow end-to-end (the flow you will use 90% of the time). Notice which lines are the <em>front channel</em> (through the browser) and which are the <em>back channel</em> (server-to-server):</p>
+    <pre class="diagram">
+  Resource          User-Agent          Client            Authorization      Resource
+   Owner             (Browser)          (FrameIt           Server (AS)        Server
+   (Maya)                                server)            = Auth0           (API)
+     │                  │                   │                   │                │
+     │  clicks "Connect"│                   │                   │                │
+     │─────────────────▶│                   │                   │                │
+     │                  │  GET /authorize?  │                   │                │
+     │                  │  client_id&scope& │                   │                │
+     │                  │  redirect_uri&... │                   │                │
+     │                  │══════════ FRONT CHANNEL ═════════════▶│                │
+     │   login + CONSENT screen rendered BY the AS              │                │
+     │◀════════════════════════════════════════════════════════│                │
+     │  enters password │ (to the AS, NOT the client!)          │                │
+     │═════════════════════════════════════════════════════════▶                │
+     │                  │   302 redirect to redirect_uri        │                │
+     │                  │   ?code=AUTH_CODE&state=xyz           │                │
+     │                  │◀══════════ FRONT CHANNEL ═════════════│                │
+     │                  │  GET redirect_uri?code=AUTH_CODE      │                │
+     │                  │──────────────────▶│                   │                │
+     │                  │                   │ POST /oauth/token │                │
+     │                  │                   │ code + client_id  │                │
+     │                  │                   │ + client_secret   │                │
+     │                  │                   │──── BACK CHANNEL ─▶                │
+     │                  │                   │  { access_token,  │                │
+     │                  │                   │    refresh_token }│                │
+     │                  │                   │◀── BACK CHANNEL ──│                │
+     │                  │                   │  GET /photos      │                │
+     │                  │                   │  Authorization:   │                │
+     │                  │                   │  Bearer <token>   │                │
+     │                  │                   │───────────────────────── BACK ────▶│
+     │                  │                   │   200 OK  [photos]                  │
+     │                  │                   │◀──────────────────────────────────│
+     │                  │   render photos   │                   │                │
+     │◀─────────────────│◀──────────────────│                   │                │
+    </pre>
+    <div class="callout tip"><span class="tag">Tip</span><p><code>═══</code> double lines = <strong>front channel</strong> (data rides through the browser via redirects, visible in the URL). <code>───</code> single lines = <strong>back channel</strong> (direct HTTPS server-to-server, invisible to the browser). The high-value items — <code>client_secret</code> and tokens — only ever travel on the back channel. That is not an accident; it is the whole security model.</p></div>
+  </section>
+
+  <!-- 4 -->
+  <section id="analogy">
+    <h2>4. Real-World Analogy — The Hotel &amp; the Valet</h2>
+    <p>You drive a luxury car to a hotel. Two kinds of keys exist:</p>
+    <ul>
+      <li><strong>Your master key fob</strong> opens everything: ignition, trunk, glovebox, and it programs new keys. This is your <strong>password</strong>. You never hand it to a stranger.</li>
+      <li>The <strong>valet key</strong> starts the engine and opens the door — but <em>not</em> the trunk or glovebox, and it stops working after the valet shift ends. This is an <strong>access token</strong>: scoped (drive, not trunk), and time-boxed.</li>
+    </ul>
+    <p>Map it to OAuth:</p>
+    <table>
+      <thead><tr><th>Hotel world</th><th>OAuth world</th></tr></thead>
+      <tbody>
+        <tr><td>You (the car owner)</td><td>Resource owner</td></tr>
+        <tr><td>The valet</td><td>Client application</td></tr>
+        <tr><td>The valet desk that issues keys</td><td>Authorization server</td></tr>
+        <tr><td>The car (and its locks)</td><td>Resource server / API</td></tr>
+        <tr><td>Master fob</td><td>Password (never shared)</td></tr>
+        <tr><td>Valet key (limited, expiring)</td><td>Access token (scoped, short-lived)</td></tr>
+        <tr><td>"Drive + door, no trunk"</td><td>Scopes</td></tr>
+        <tr><td>"Get me a fresh key tomorrow"</td><td>Refresh token</td></tr>
+        <tr><td>Telling the desk "cancel that valet's key"</td><td>Token revocation</td></tr>
+      </tbody>
+    </table>
+    <p>Crucially, the <strong>valet desk</strong> — not the valet — decides what the key can do. In OAuth, the <strong>authorization server</strong>, not the client, decides what's in the token. The client just presents what it was given.</p>
+  </section>
+
+  <!-- 5 -->
+  <section id="internals">
+    <h2>5. Internal Working — What Each Piece Actually Does</h2>
+    <h3>The four roles, precisely</h3>
+    <table>
+      <thead><tr><th>Role</th><th>Definition (RFC 6749)</th><th>Concrete example</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Resource Owner</strong></td><td>The entity that can grant access to a protected resource. Usually the end user.</td><td>Maya, the human</td></tr>
+        <tr><td><strong>Client</strong></td><td>The application requesting access on behalf of the resource owner.</td><td>FrameIt (web/mobile/SPA)</td></tr>
+        <tr><td><strong>Authorization Server (AS)</strong></td><td>Authenticates the resource owner and issues access tokens after getting authorization.</td><td>Auth0 (<code>your-tenant.auth0.com</code>)</td></tr>
+        <tr><td><strong>Resource Server (RS)</strong></td><td>The API hosting protected resources; accepts and validates access tokens.</td><td>Your <code>/api/photos</code> backend</td></tr>
+      </tbody>
+    </table>
+    <div class="callout note"><span class="tag">Note</span><p>In Auth0 terms: the <strong>Authorization Server</strong> is your Auth0 <em>tenant</em>. The <strong>Resource Server</strong> is an Auth0 <em>API</em> (identified by an <code>audience</code>). The <strong>Client</strong> is an Auth0 <em>Application</em> (with a <code>client_id</code>). Memorize this mapping — it appears in every dashboard screen.</p></div>
+
+    <h3>The two endpoints</h3>
+    <p>An OAuth authorization server exposes (among others) <strong>two</strong> core HTTP endpoints. Knowing which is which is fundamental:</p>
+    <table>
+      <thead><tr><th> </th><th>Authorization Endpoint</th><th>Token Endpoint</th></tr></thead>
+      <tbody>
+        <tr><td>Path (Auth0)</td><td><code>/authorize</code></td><td><code>/oauth/token</code></td></tr>
+        <tr><td>Channel</td><td>Front channel (browser redirect)</td><td>Back channel (server POST)</td></tr>
+        <tr><td>Who interacts</td><td>The <em>user</em> (via browser)</td><td>The <em>client</em> (server-to-server)</td></tr>
+        <tr><td>HTTP method</td><td>GET (redirect)</td><td>POST (form-encoded)</td></tr>
+        <tr><td>Purpose</td><td>Authenticate user, get consent, return a <strong>code</strong></td><td>Exchange code (or refresh token) for <strong>tokens</strong></td></tr>
+        <tr><td>Returns</td><td><code>authorization_code</code> in URL</td><td><code>access_token</code>, <code>refresh_token</code>, <code>id_token</code> in JSON</td></tr>
+      </tbody>
+    </table>
+
+    <h3>Front channel vs back channel</h3>
+    <p>The <strong>front channel</strong> is any communication that passes <em>through the user's browser</em> — typically via HTTP redirects, with parameters in the URL query string. It is observable: the user can see it, browser history records it, and a malicious browser extension could read it. Therefore <strong>nothing irreversible or high-value travels in the front channel</strong> — only a short-lived, one-time <em>authorization code</em>.</p>
+    <p>The <strong>back channel</strong> is a direct, server-to-server HTTPS call. The browser is not involved and cannot see it. This is where the <code>client_secret</code> is presented and where actual <em>tokens</em> are returned. Confidential clients can keep a secret precisely because they have a back channel a browser can't snoop.</p>
+
+    <h3>What's inside a token</h3>
+    <p>An <strong>access token</strong> can be one of two physical formats:</p>
+    <ul>
+      <li><strong>Opaque token</strong> — a random, meaningless string (e.g. <code>2YotnFZFEjr1zCsicMWpAA</code>). The resource server can't read it; it must call the AS's <strong>introspection</strong> endpoint to learn what it means. Easy to revoke (just delete the server-side record), but adds a network hop on every API call.</li>
+      <li><strong>JWT (JSON Web Token)</strong> — a self-describing, cryptographically signed token whose payload (claims) the resource server can validate <em>locally</em> using the AS's public key — no network call needed. Fast and stateless, but harder to revoke before expiry.</li>
+    </ul>
+    <p>Auth0 issues <strong>JWT access tokens when you request an API <code>audience</code></strong>, and opaque access tokens when you only request <code>/userinfo</code> (i.e. no audience). This distinction trips up nearly every beginner — we'll return to it.</p>
+  </section>
+
+  <!-- 6 -->
+  <section id="walkthrough">
+    <h2>6. Code Walkthrough — Reading the Wire</h2>
+    <p>Let's read every byte of a real Authorization Code flow against Auth0. Start with the front-channel redirect the client builds:</p>
+    <pre><code class="language-text">GET https://YOUR_TENANT.auth0.com/authorize?
+    response_type=code
+  &amp;client_id=AbC123ClientId
+  &amp;redirect_uri=https%3A%2F%2Fframeit.example.com%2Fcallback
+  &amp;scope=openid%20profile%20read%3Aphotos
+  &amp;audience=https%3A%2F%2Fapi.pixvault.com
+  &amp;state=xyz789-random-csrf-token
+  &amp;code_challenge=E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM
+  &amp;code_challenge_method=S256</code></pre>
+    <p>Line by line:</p>
+    <ul>
+      <li><code>response_type=code</code> — "I want an authorization code" (Authorization Code grant).</li>
+      <li><code>client_id</code> — public identifier of the FrameIt application. Not secret.</li>
+      <li><code>redirect_uri</code> — where to send the browser back. <strong>Must</strong> exactly match a pre-registered URL (prevents code theft).</li>
+      <li><code>scope</code> — the permissions requested. <code>openid</code> opts into OIDC; <code>read:photos</code> is a custom API scope.</li>
+      <li><code>audience</code> — Auth0-specific: which API (resource server) the access token is for. This is what makes Auth0 mint a <em>JWT</em> access token.</li>
+      <li><code>state</code> — opaque anti-CSRF value the client generates and later verifies. Non-negotiable.</li>
+      <li><code>code_challenge</code> / <code>method</code> — PKCE (RFC 7636). Binds the code to this client instance; covered fully in Chapter 5.</li>
+    </ul>
+    <p>After login + consent, the AS redirects the browser back:</p>
+    <pre><code class="language-text">HTTP/1.1 302 Found
+Location: https://frameit.example.com/callback?code=SplxlOBeZQQYbYS6WxSbIA&amp;state=xyz789-random-csrf-token</code></pre>
+    <p>The client verifies <code>state</code> matches, then exchanges the code on the <strong>back channel</strong>:</p>
+    <pre><code class="language-bash">curl --request POST \
+  --url 'https://YOUR_TENANT.auth0.com/oauth/token' \
+  --header 'content-type: application/x-www-form-urlencoded' \
+  --data grant_type=authorization_code \
+  --data 'client_id=AbC123ClientId' \
+  --data 'client_secret=THE_SUPER_SECRET_VALUE' \
+  --data code=SplxlOBeZQQYbYS6WxSbIA \
+  --data 'redirect_uri=https://frameit.example.com/callback' \
+  --data code_verifier=dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk</code></pre>
+    <p>The token endpoint responds:</p>
+    <pre><code class="language-json">{
+  "access_token": "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCIsImtpZCI6Ii4uLiJ9.eyJpc3MiOiJodHRwczovL1lPVVJfVEVOQU5ULmF1dGgwLmNvbS8iLCJzdWIiOiJhdXRoMHwxMjMiLCJhdWQiOiJodHRwczovL2FwaS5waXh2YXVsdC5jb20iLCJzY29wZSI6InJlYWQ6cGhvdG9zIn0...",
+  "refresh_token": "v1.MnD8s...opaque...Qk",
+  "id_token": "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "scope": "openid profile read:photos",
+  "expires_in": 86400,
+  "token_type": "Bearer"
+}</code></pre>
+    <p>Decode the <code>access_token</code> payload (the middle segment, base64url) and you'd see:</p>
+    <pre><code class="language-json">{
+  "iss": "https://YOUR_TENANT.auth0.com/",
+  "sub": "auth0|123",
+  "aud": "https://api.pixvault.com",
+  "iat": 1718755200,
+  "exp": 1718841600,
+  "scope": "read:photos",
+  "azp": "AbC123ClientId"
+}</code></pre>
+    <div class="callout warn"><span class="tag">Warn</span><p>See three tokens? <code>access_token</code> is for calling the <strong>API</strong> (audience <code>api.pixvault.com</code>). <code>id_token</code> is for the <strong>client</strong> to learn <em>who the user is</em> (that's OIDC, Chapter 6) — never send it to an API. <code>refresh_token</code> is for getting new access tokens later. Mixing these up is the #1 beginner mistake.</p></div>
+  </section>
+
+  <!-- 7 -->
+  <section id="practical">
+    <h2>7. Practical Implementation</h2>
+    <p>Here are minimal, runnable implementations of the same flow across stacks. They all do the same thing: redirect to <code>/authorize</code>, handle the callback, exchange the code, call the API.</p>
+
+    <h3>Node.js (Express) — confidential client, manual flow</h3>
+    <pre><code class="language-javascript">import express from "express";
+import crypto from "crypto";
+
+const app = express();
+const AS = "https://YOUR_TENANT.auth0.com";
+const CLIENT_ID = process.env.CLIENT_ID;
+const CLIENT_SECRET = process.env.CLIENT_SECRET;   // back channel only
+const REDIRECT_URI = "http://localhost:3000/callback";
+const AUDIENCE = "https://api.pixvault.com";
+const sessions = {};
+
+// 1) Kick off: build the front-channel redirect
+app.get("/login", (req, res) =&gt; {
+  const state = crypto.randomBytes(16).toString("hex");
+  sessions[state] = true;                            // remember it to verify later
+  const url = new URL(`${AS}/authorize`);
+  url.search = new URLSearchParams({
+    response_type: "code",
+    client_id: CLIENT_ID,
+    redirect_uri: REDIRECT_URI,
+    scope: "openid profile read:photos",
+    audience: AUDIENCE,
+    state,
+  }).toString();
+  res.redirect(url.toString());
+});
+
+// 2) Callback: verify state, exchange code on the BACK channel
+app.get("/callback", async (req, res) =&gt; {
+  const { code, state } = req.query;
+  if (!sessions[state]) return res.status(403).send("Invalid state (possible CSRF)");
+  delete sessions[state];
+
+  const tokenRes = await fetch(`${AS}/oauth/token`, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "authorization_code",
+      client_id: CLIENT_ID,
+      client_secret: CLIENT_SECRET,
+      code,
+      redirect_uri: REDIRECT_URI,
+    }),
+  });
+  const tokens = await tokenRes.json();
+
+  // 3) Use the access token to call the resource server
+  const api = await fetch(`${AUDIENCE}/photos`, {
+    headers: { Authorization: `Bearer ${tokens.access_token}` },
+  });
+  res.json(await api.json());
+});
+
+app.listen(3000, () =&gt; console.log("http://localhost:3000/login"));</code></pre>
+
+    <h3>FastAPI (Python) — resource server validating a JWT access token</h3>
+    <pre><code class="language-python">from fastapi import FastAPI, Depends, HTTPException
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+import jwt                       # pip install pyjwt[crypto]
+from jwt import PyJWKClient
+
+app = FastAPI()
+DOMAIN = "YOUR_TENANT.auth0.com"
+AUDIENCE = "https://api.pixvault.com"
+ISSUER = f"https://{DOMAIN}/"
+jwks = PyJWKClient(f"https://{DOMAIN}/.well-known/jwks.json")
+bearer = HTTPBearer()
+
+def require_scope(scope: str):
+    def checker(cred: HTTPAuthorizationCredentials = Depends(bearer)):
+        token = cred.credentials
+        key = jwks.get_signing_key_from_jwt(token).key
+        try:
+            claims = jwt.decode(
+                token, key, algorithms=["RS256"],
+                audience=AUDIENCE, issuer=ISSUER,   # validate aud + iss
+            )
+        except jwt.PyJWTError as e:
+            raise HTTPException(401, f"Invalid token: {e}")
+        if scope not in claims.get("scope", "").split():
+            raise HTTPException(403, "Insufficient scope")
+        return claims
+    return checker
+
+@app.get("/photos")
+def list_photos(claims=Depends(require_scope("read:photos"))):
+    return {"owner": claims["sub"], "photos": ["a.jpg", "b.jpg"]}</code></pre>
+
+    <h3>React (SPA) — public client, never holds a secret</h3>
+    <pre><code class="language-jsx">// npm i @auth0/auth0-react   — the SDK uses Authorization Code + PKCE under the hood
+import { Auth0Provider, useAuth0 } from "@auth0/auth0-react";
+
+function Photos() {
+  const { loginWithRedirect, getAccessTokenSilently, isAuthenticated } = useAuth0();
+  async function load() {
+    const token = await getAccessTokenSilently();   // SDK handles code+PKCE+refresh
+    const r = await fetch("https://api.pixvault.com/photos", {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    console.log(await r.json());
+  }
+  return isAuthenticated
+    ? &lt;button onClick={load}&gt;Load my photos&lt;/button&gt;
+    : &lt;button onClick={() =&gt; loginWithRedirect()}&gt;Connect PixVault&lt;/button&gt;;
+}
+
+export default function App() {
+  return (
+    &lt;Auth0Provider
+      domain="YOUR_TENANT.auth0.com"
+      clientId="PUBLIC_SPA_CLIENT_ID"
+      authorizationParams={{
+        redirect_uri: window.location.origin,
+        audience: "https://api.pixvault.com",
+        scope: "openid profile read:photos",
+      }}&gt;
+      &lt;Photos /&gt;
+    &lt;/Auth0Provider&gt;
+  );
+}</code></pre>
+
+    <h3>Spring Boot — resource server with one config block</h3>
+    <pre><code class="language-java">// application.yml
+// spring.security.oauth2.resourceserver.jwt.issuer-uri: https://YOUR_TENANT.auth0.com/
+@Configuration
+@EnableWebSecurity
+public class SecurityConfig {
+  @Bean
+  SecurityFilterChain filter(HttpSecurity http) throws Exception {
+    http
+      .authorizeHttpRequests(a -&gt; a
+        .requestMatchers("/photos").hasAuthority("SCOPE_read:photos")
+        .anyRequest().authenticated())
+      .oauth2ResourceServer(o -&gt; o.jwt(jwt -&gt; {}));  // validates RS256 via JWKS
+    return http.build();
+  }
+}
+
+@RestController
+class PhotoController {
+  @GetMapping("/photos")
+  List&lt;String&gt; photos(@AuthenticationPrincipal Jwt jwt) {
+    return List.of("a.jpg", "b.jpg"); // jwt.getSubject() == the user
+  }
+}</code></pre>
+
+    <h3>Postman</h3>
+    <p>In a request → <strong>Authorization</strong> tab → Type <strong>OAuth 2.0</strong> → <em>Get New Access Token</em>. Set Grant Type = <code>Authorization Code (With PKCE)</code>, Auth URL = <code>https://YOUR_TENANT.auth0.com/authorize</code>, Token URL = <code>https://YOUR_TENANT.auth0.com/oauth/token</code>, add <code>audience</code> and <code>scope</code> as extra params. Postman opens a browser for login + consent, captures the token, and lets you attach it to requests automatically.</p>
+  </section>
+
+  <!-- 8 -->
+  <section id="architecture">
+    <h2>8. Production Architecture</h2>
+    <p>A real OAuth deployment separates concerns cleanly. Here is a typical production topology with Auth0 as the AS:</p>
+    <pre class="diagram">
+                         ┌──────────────────────────────────────┐
+   ┌──────────┐  HTTPS   │            AUTH0 (managed AS)         │
+   │ Browser  │◀────────▶│  /authorize  /oauth/token  /jwks.json│
+   │  (SPA)   │  redirect│  Universal Login · MFA · Rules        │
+   └────┬─────┘          └───────────────┬──────────────────────┘
+        │ Bearer JWT                     │ signs tokens with private key
+        │ (access token)                 │ publishes PUBLIC key at JWKS
+        ▼                                ▼  (cached by every RS)
+   ┌──────────────┐      ┌───────────────────────────────────────────────┐
+   │  API Gateway │─────▶│   Resource Servers (your microservices)        │
+   │ (rate limit, │      │  ┌──────────┐  ┌──────────┐  ┌──────────┐     │
+   │  WAF, mTLS)  │      │  │ photos   │  │ billing  │  │ orders   │ ... │
+   └──────────────┘      │  │ aud:..api│  │ aud:..api│  │ aud:..api│     │
+                         │  validate JWT locally via cached JWKS public key│
+                         └───────────────────────────────────────────────┘
+    </pre>
+    <p>Key architectural decisions:</p>
+    <ul>
+      <li><strong>Stateless validation.</strong> Each service validates JWTs locally using the AS's public key (fetched once from <code>/.well-known/jwks.json</code> and cached). No per-request call to Auth0 — that's what makes JWT scale to millions of req/s.</li>
+      <li><strong>One audience per logical API.</strong> Tokens minted for <code>billing</code> shouldn't be accepted by <code>photos</code>. The <code>aud</code> claim enforces this — a token is bound to one resource server.</li>
+      <li><strong>Refresh tokens in the back end (BFF pattern).</strong> For SPAs, the safest production pattern is a <em>Backend-for-Frontend</em> that holds tokens in a secure, http-only cookie session rather than browser storage. Covered in later chapters.</li>
+      <li><strong>Key rotation.</strong> Auth0 rotates signing keys; because clients fetch JWKS dynamically and keys are identified by <code>kid</code>, rotation is seamless. Never hard-code a public key.</li>
+    </ul>
+  </section>
+
+  <!-- 9 -->
+  <section id="security">
+    <h2>9. Security Analysis</h2>
+    <h3>Public vs confidential clients — the central security distinction</h3>
+    <table>
+      <thead><tr><th> </th><th>Confidential client</th><th>Public client</th></tr></thead>
+      <tbody>
+        <tr><td>Can it keep a secret?</td><td><strong>Yes</strong> — runs on a server you control</td><td><strong>No</strong> — code ships to the user (browser/mobile)</td></tr>
+        <tr><td>Examples</td><td>Spring Boot / Node API, traditional web app with a backend</td><td>SPA (React/Angular), native mobile, desktop app</td></tr>
+        <tr><td>Authenticates with</td><td><code>client_id</code> + <code>client_secret</code></td><td><code>client_id</code> only + <strong>PKCE</strong></td></tr>
+        <tr><td>Why</td><td>A server can hide a secret in env vars / vault</td><td>Anyone can open DevTools / decompile the app and read it</td></tr>
+      </tbody>
+    </table>
+    <div class="callout danger"><span class="tag">Danger</span><p>Never embed a <code>client_secret</code> in a SPA, mobile app, or any code distributed to users. It is trivially extractable. Public clients use <strong>PKCE</strong> (Proof Key for Code Exchange) instead — a per-request, dynamically generated proof that replaces the static secret. If a tutorial tells you to put a secret in a React app, close it.</p></div>
+
+    <h3>What the threats are, and how OAuth answers them</h3>
+    <table>
+      <thead><tr><th>Threat</th><th>Mitigation in OAuth 2.0</th></tr></thead>
+      <tbody>
+        <tr><td>Stolen credentials reused everywhere</td><td>Password never leaves the AS; clients only get scoped tokens</td></tr>
+        <tr><td>Authorization code intercepted in the browser</td><td>Code is one-time-use, short-lived, and bound to <code>redirect_uri</code> + PKCE</td></tr>
+        <tr><td>CSRF on the redirect (login fixation)</td><td><code>state</code> parameter, verified on return</td></tr>
+        <tr><td>Open redirect / token leak to attacker URL</td><td>Exact-match, pre-registered <code>redirect_uri</code> allowlist</td></tr>
+        <tr><td>Access token replay forever</td><td>Short <code>exp</code>; refresh tokens with rotation</td></tr>
+        <tr><td>Token used against the wrong API</td><td><code>aud</code> claim validated by each resource server</td></tr>
+        <tr><td>Forged tokens</td><td>RS256 signature verified against AS public key (JWKS)</td></tr>
+      </tbody>
+    </table>
+    <div class="callout warn"><span class="tag">Warn</span><p>The legacy <strong>Implicit</strong> grant (<code>response_type=token</code>) returned the access token directly in the URL fragment via the front channel. It is now <strong>deprecated</strong> (OAuth 2.1) because tokens leaked into browser history, logs, and referrers. Always use <strong>Authorization Code + PKCE</strong> — even for SPAs.</p></div>
+  </section>
+
+  <!-- 10 -->
+  <section id="performance">
+    <h2>10. Performance Considerations</h2>
+    <ul>
+      <li><strong>JWT vs opaque — the latency trade-off.</strong> A JWT is validated locally (a signature check, microseconds). An opaque token requires a network round-trip to the AS's <code>/introspect</code> endpoint <em>on every API call</em>. For high-traffic APIs, JWTs win decisively; reserve opaque + introspection for cases where instant revocation outweighs latency.</li>
+      <li><strong>Cache the JWKS.</strong> Fetch <code>/.well-known/jwks.json</code> once and cache it (respecting cache headers, typically hours). Re-fetch only when you see an unknown <code>kid</code>. Fetching JWKS per request would add a network call back in and defeat the point.</li>
+      <li><strong>Right-size token lifetimes.</strong> Short access-token TTL (e.g. 15–60 min) limits replay window but increases refresh traffic. Long TTL reduces refresh load but widens the blast radius of a leak. Tune per sensitivity.</li>
+      <li><strong>Keep tokens small.</strong> Every byte of a JWT rides on <em>every</em> request header. Stuffing large arrays of permissions or profile data into a token bloats requests and can hit header-size limits (8 KB on many servers). Put coarse scopes in the token; fetch fine-grained data from a service.</li>
+      <li><strong>Refresh-token rotation has a cost.</strong> Rotation issues a new refresh token each use — more writes at the AS, but vastly better security. The trade-off almost always favors rotation.</li>
+    </ul>
+  </section>
+
+  <!-- 11 -->
+  <section id="mistakes">
+    <h2>11. Common Mistakes</h2>
+    <div class="callout danger"><span class="tag">Danger</span><p><strong>Treating OAuth as authentication.</strong> "I got an access token, so the user is logged in." No — an access token says nothing reliable about <em>who</em> the user is. Use an <strong>ID token</strong> (OIDC) for identity. This deserves its own section (#20-ish below) — and the next chapter.</p></div>
+    <ul>
+      <li><strong>Putting <code>client_secret</code> in front-end code.</strong> Already covered, but it's so common it bears repeating. Public clients use PKCE, full stop.</li>
+      <li><strong>Skipping the <code>state</code> parameter.</strong> Without it your callback is open to CSRF. Always generate, store, and verify it.</li>
+      <li><strong>Sending the <code>id_token</code> to your API</strong> as the bearer credential. APIs must consume <strong>access tokens</strong> (with <code>aud</code> = your API). ID tokens have <code>aud</code> = your client and may be rejected — or worse, naively accepted.</li>
+      <li><strong>Not validating <code>aud</code> and <code>iss</code></strong> on the resource server. A signature check alone is insufficient: a valid token for a <em>different</em> API or tenant would pass. Validate issuer, audience, expiry, and signature.</li>
+      <li><strong>Forgetting the <code>audience</code> param with Auth0</strong> and then wondering why the access token is opaque and your API can't decode it. No audience → <code>/userinfo</code>-only opaque token.</li>
+      <li><strong>Requesting more scopes than needed.</strong> Over-scoping scares users at consent and widens damage if leaked. Request least privilege.</li>
+      <li><strong>Storing access tokens in <code>localStorage</code></strong> where any XSS can steal them. Prefer in-memory + http-only cookie (BFF) patterns.</li>
+    </ul>
+  </section>
+
+  <!-- 12 -->
+  <section id="best-practices">
+    <h2>12. Best Practices</h2>
+    <div class="callout tip"><span class="tag">Tip</span><p>Memorize this as your default OAuth posture for 2026.</p></div>
+    <ul>
+      <li>Use <strong>Authorization Code + PKCE</strong> for everything interactive (web, SPA, mobile). It is the OAuth 2.1 baseline.</li>
+      <li>Use <strong>Client Credentials</strong> grant for machine-to-machine (no user present) — covered in Chapter 5.</li>
+      <li>Always send and verify <strong><code>state</code></strong> (CSRF) and, for OIDC, <code>nonce</code> (replay).</li>
+      <li>Pre-register <strong>exact</strong> <code>redirect_uri</code> values; no wildcards.</li>
+      <li>Request the <strong>minimum scopes</strong> needed; request more later via incremental authorization.</li>
+      <li>Validate tokens fully on the RS: <strong>signature, <code>iss</code>, <code>aud</code>, <code>exp</code>, <code>nbf</code></strong>, and required scopes.</li>
+      <li>Keep secrets in a <strong>vault / secret manager</strong>, never in code or front-end bundles.</li>
+      <li>Prefer <strong>short access tokens + rotating refresh tokens</strong>.</li>
+      <li>Always use <strong>HTTPS</strong> everywhere; OAuth's security assumes TLS.</li>
+      <li>Use the <strong>SDK</strong> (Auth0 libraries) rather than hand-rolling the flow in production — they get PKCE, state, nonce, and refresh right.</li>
+    </ul>
+  </section>
+
+  <!-- 13 -->
+  <section id="interview">
+    <h2>13. Interview Questions (with model answers)</h2>
+    <h3>Q1. What problem does OAuth 2.0 solve?</h3>
+    <p><strong>Model answer:</strong> Delegated authorization. It lets a user grant a third-party app limited, revocable, scoped access to their resources on another service <em>without</em> sharing their password. It replaces the password anti-pattern by issuing scoped, expiring tokens instead.</p>
+    <h3>Q2. Name the four OAuth roles.</h3>
+    <p><strong>Model answer:</strong> Resource owner (user), client (the app), authorization server (issues tokens, e.g. Auth0), resource server (the API holding protected data).</p>
+    <h3>Q3. Front channel vs back channel — why does it matter?</h3>
+    <p><strong>Model answer:</strong> The front channel passes through the browser via redirects (URL-visible, snoopable), so only a one-time authorization code travels there. The back channel is direct server-to-server HTTPS where the <code>client_secret</code> and actual tokens are exchanged, invisible to the browser. The separation keeps high-value secrets off the channel an attacker can observe.</p>
+    <h3>Q4. Why is OAuth 2.0 not authentication?</h3>
+    <p><strong>Model answer:</strong> An access token proves the app was <em>authorized</em> to access a resource; it doesn't reliably prove <em>who</em> the user is. The token's audience is the API, not the client. Using token possession as "logged in" leads to the confused-deputy / "OAuth login" pitfall. Authentication needs OIDC's ID token, which is explicitly about identity, audience-bound to the client, and contains a verified <code>sub</code>.</p>
+    <h3>Q5. Public vs confidential client?</h3>
+    <p><strong>Model answer:</strong> A confidential client runs on a server and can safely keep a <code>client_secret</code>; a public client (SPA/mobile) ships to users and cannot, so it uses PKCE instead of a secret.</p>
+    <h3>Q6. Opaque vs JWT access tokens — trade-offs?</h3>
+    <p><strong>Model answer:</strong> JWTs are self-contained and validated locally (fast, stateless, scales) but hard to revoke before expiry. Opaque tokens are meaningless strings requiring introspection (network hop per call) but are trivially revocable server-side. Choose JWT for performance, opaque when instant revocation is essential.</p>
+    <h3>Q7. What's the <code>state</code> parameter for?</h3>
+    <p><strong>Model answer:</strong> CSRF protection on the redirect. The client generates a random value, sends it on <code>/authorize</code>, and verifies it matches on the callback — ensuring the response corresponds to a request this client actually initiated.</p>
+    <h3>Q8. Why was the Implicit grant deprecated?</h3>
+    <p><strong>Model answer:</strong> It returned the access token directly in the URL fragment through the front channel, exposing it to browser history, logs, and referrer leakage, with no client authentication. Authorization Code + PKCE supersedes it for all client types.</p>
+    <h3>Q9. In Auth0, why might your access token be opaque instead of a JWT?</h3>
+    <p><strong>Model answer:</strong> Because no <code>audience</code> (API identifier) was requested. Without an audience, Auth0 issues an opaque token usable only against <code>/userinfo</code>. Add the <code>audience</code> param to get a JWT for your API.</p>
+    <h3>Q10. How does a resource server validate a JWT without calling the AS?</h3>
+    <p><strong>Model answer:</strong> It fetches the AS's public signing keys once from <code>/.well-known/jwks.json</code> (cached), selects the key by <code>kid</code>, verifies the RS256 signature, then checks <code>iss</code>, <code>aud</code>, <code>exp</code>, and required scopes — all locally.</p>
+  </section>
+
+  <!-- 14 -->
+  <section id="certification">
+    <h2>14. Certification Tips</h2>
+    <div class="callout note"><span class="tag">Note</span><p>The Auth0 Certified Developer / Professional exams lean heavily on these foundations. High-yield facts:</p></div>
+    <ul>
+      <li>Know the <strong>four roles</strong> and the Auth0 mapping: tenant = AS, Application = client, API = resource server.</li>
+      <li>Know the <strong>two endpoints</strong>: <code>/authorize</code> (front, GET, code) and <code>/oauth/token</code> (back, POST, tokens).</li>
+      <li>Know which grant to pick: interactive → <strong>Authorization Code + PKCE</strong>; M2M → <strong>Client Credentials</strong>; never Implicit / ROPC.</li>
+      <li>Remember: <strong>access token → API</strong>, <strong>ID token → client</strong>, <strong>refresh token → get new tokens</strong>. Audiences differ.</li>
+      <li>Remember the <strong><code>audience</code> ⇒ JWT</strong>, <strong>no audience ⇒ opaque</strong> rule — Auth0 loves to test this.</li>
+      <li>OAuth = authorization; OIDC = authentication layer on top. The exam will phrase a question to tempt you into calling OAuth "login".</li>
+      <li>PKCE is <strong>required</strong> for public clients and <strong>recommended for all</strong> in OAuth 2.1.</li>
+      <li>Exact-match redirect URIs; <code>state</code> for CSRF; HTTPS mandatory.</li>
+    </ul>
+  </section>
+
+  <!-- 15 -->
+  <section id="exercises">
+    <h2>15. Hands-On Exercises</h2>
+    <ol>
+      <li><strong>Read a real authorize URL.</strong> Sign in to any "Login with Google/GitHub" site, and before clicking, copy the URL the button points to. Identify <code>client_id</code>, <code>scope</code>, <code>redirect_uri</code>, <code>state</code>, <code>response_type</code>. Write down what each does.</li>
+      <li><strong>Decode a JWT.</strong> Take any JWT you obtain (e.g. via Auth0's "Try it" or jwt.io) and identify <code>iss</code>, <code>sub</code>, <code>aud</code>, <code>exp</code>, <code>scope</code>. Then change one character in the signature and observe validation fail.</li>
+      <li><strong>Trace the channels.</strong> Open browser DevTools → Network. Perform an OAuth login somewhere and label each request/redirect as front channel or back channel. Find where the code appears and confirm the token is <em>not</em> in any browser-visible request.</li>
+      <li><strong>Break it on purpose.</strong> In the Node example, comment out the <code>state</code> check and explain to a peer exactly what attack you just enabled.</li>
+      <li><strong>Audience experiment.</strong> Using Postman against an Auth0 tenant, request a token <em>without</em> <code>audience</code>, then <em>with</em> it. Compare: is the token opaque or a JWT? Decode and explain.</li>
+    </ol>
+  </section>
+
+  <!-- 16 -->
+  <section id="assignment">
+    <h2>16. Assignment</h2>
+    <p>Build a minimal but complete Authorization Code (+ PKCE if SPA) flow against a free Auth0 tenant, end to end:</p>
+    <ol>
+      <li>Create an Auth0 <strong>API</strong> (resource server) with a scope <code>read:photos</code> and an <strong>Application</strong> (client).</li>
+      <li>Implement a client (any stack from §7) that redirects to <code>/authorize</code>, handles the callback, and exchanges the code at <code>/oauth/token</code>.</li>
+      <li>Implement a resource server (FastAPI or Spring Boot) that validates the JWT (signature, <code>iss</code>, <code>aud</code>, <code>exp</code>) and enforces the <code>read:photos</code> scope.</li>
+      <li>Call the protected <code>/photos</code> endpoint with the access token and return data only when the scope is present.</li>
+      <li><strong>Deliverable:</strong> a short README that (a) labels every request as front or back channel, (b) shows the decoded access-token claims, and (c) explains why a <code>client_secret</code> is/ isn't used in your chosen client type.</li>
+    </ol>
+  </section>
+
+  <!-- 17 -->
+  <section id="mini-project">
+    <h2>17. Mini Project — "Valet" Photo Delegation Demo</h2>
+    <p>Create a two-app demo that <em>demonstrates delegated authorization</em> to a non-technical viewer:</p>
+    <ul>
+      <li><strong>App A "PixVault" (resource server):</strong> A FastAPI/Spring service with <code>GET /photos</code> protected by <code>read:photos</code> and <code>DELETE /photos/{id}</code> protected by <code>delete:photos</code>.</li>
+      <li><strong>App B "FrameIt" (client):</strong> A React SPA that logs in via Auth0 requesting <strong>only</strong> <code>read:photos</code>.</li>
+      <li><strong>The demonstration:</strong> Show that FrameIt can list photos but, when it tries <code>DELETE</code>, the resource server returns <strong>403 insufficient scope</strong> — because the token was never granted delete power. Then go to Auth0 → revoke FrameIt's grant and show the next API call fails.</li>
+      <li><strong>Stretch goal:</strong> Add a second client requesting both scopes and show the difference on the consent screen and in token claims. Capture screenshots of the consent dialog for your portfolio.</li>
+    </ul>
+    <div class="callout tip"><span class="tag">Tip</span><p>This project is interview gold: it lets you <em>show</em>, not just say, that you understand scopes, consent, audience, and revocation. Put it on GitHub with the channel-labeled diagram from §3.</p></div>
+  </section>
+
+  <!-- 18 -->
+  <section id="quiz">
+    <h2>18. Quiz (20+ Questions)</h2>
+    <ol>
+      <li>What single problem does OAuth 2.0 exist to solve?</li>
+      <li>Name the four OAuth roles.</li>
+      <li>Which role issues access tokens?</li>
+      <li>Which role hosts the protected resources?</li>
+      <li>What is the "password anti-pattern" and why is it bad?</li>
+      <li>What travels on the front channel that must <em>not</em> be the access token itself?</li>
+      <li>What two high-value items travel only on the back channel?</li>
+      <li>Path and HTTP method of the authorization endpoint? Of the token endpoint?</li>
+      <li>What does <code>response_type=code</code> request?</li>
+      <li>What is the <code>state</code> parameter for?</li>
+      <li>What is the <code>redirect_uri</code> rule that prevents code theft?</li>
+      <li>Define a confidential client and a public client.</li>
+      <li>What does a public client use <em>instead</em> of a <code>client_secret</code>?</li>
+      <li>Opaque token vs JWT: which is validated locally, which needs introspection?</li>
+      <li>In Auth0, what makes the access token a JWT rather than opaque?</li>
+      <li>Which token is meant for the API? Which for the client's notion of identity?</li>
+      <li>What four things must a resource server validate on a JWT?</li>
+      <li>Why is the Implicit grant deprecated?</li>
+      <li>What are scopes, and who shows them to the user?</li>
+      <li>What is consent and who renders the consent screen?</li>
+      <li>Why is OAuth 2.0 <em>not</em> an authentication protocol?</li>
+      <li>What is a refresh token used for?</li>
+      <li>Where is the AS public key published, and how is the right key selected?</li>
+      <li>Why must you never put <code>client_secret</code> in a React app?</li>
+      <li>What does the <code>aud</code> claim prevent?</li>
+    </ol>
+    <details>
+      <summary>Show answer key</summary>
+      <ol>
+        <li><strong>Delegated authorization</strong> — granting scoped, revocable access without sharing the password.</li>
+        <li>Resource owner, client, authorization server, resource server.</li>
+        <li>The <strong>authorization server</strong> (e.g. Auth0).</li>
+        <li>The <strong>resource server</strong> (the API).</li>
+        <li>Giving a third-party app your actual username/password — unlimited, non-revocable, non-scoped, non-expiring access. Total compromise risk.</li>
+        <li>A one-time <strong>authorization code</strong> (never the access token).</li>
+        <li>The <code>client_secret</code> and the actual <strong>tokens</strong> (access/refresh).</li>
+        <li>Authorization: <code>/authorize</code>, <strong>GET</strong> (redirect). Token: <code>/oauth/token</code>, <strong>POST</strong>.</li>
+        <li>The Authorization Code grant — return an authorization code.</li>
+        <li><strong>CSRF protection</strong> on the redirect; client generates and verifies it.</li>
+        <li>It must <strong>exactly match a pre-registered</strong> redirect URI (allowlist, no wildcards).</li>
+        <li>Confidential: server-side, can keep a secret. Public: ships to users (SPA/mobile/desktop), cannot keep a secret.</li>
+        <li><strong>PKCE</strong> (Proof Key for Code Exchange).</li>
+        <li>JWT = validated <strong>locally</strong>; opaque = needs <strong>introspection</strong> (network call).</li>
+        <li>Requesting an <strong><code>audience</code></strong> (an API identifier). No audience ⇒ opaque.</li>
+        <li>API ⇒ <strong>access token</strong>; identity ⇒ <strong>ID token</strong> (OIDC).</li>
+        <li><strong>Signature, <code>iss</code>, <code>aud</code>, <code>exp</code></strong> (plus scopes / <code>nbf</code>).</li>
+        <li>It exposed tokens in the URL fragment (history/logs/referrer leakage) with no client auth; replaced by Code + PKCE.</li>
+        <li>Scopes = named, granular permissions being requested; the <strong>authorization server</strong> shows them at consent.</li>
+        <li>Consent = the user's explicit grant of the requested scopes; rendered by the <strong>authorization server</strong>.</li>
+        <li>An access token proves <em>authorization to a resource</em>, not <em>who the user is</em>; its audience is the API, not the client. Identity needs OIDC.</li>
+        <li>To obtain new access tokens after the current one expires, without re-prompting the user.</li>
+        <li>At <code>/.well-known/jwks.json</code>; the right key is selected by the token header's <strong><code>kid</code></strong>.</li>
+        <li>Anyone can read the shipped code (DevTools/decompile); the secret would be trivially extracted.</li>
+        <li>It binds a token to a specific resource server, so a token for API X can't be used against API Y.</li>
+      </ol>
+    </details>
+  </section>
+
+  <!-- 19 -->
+  <section id="cheatsheet">
+    <h2>19. Cheat Sheet</h2>
+    <pre class="diagram">
+OAUTH 2.0 ONE-PAGER
+───────────────────────────────────────────────────────────────
+ROLES        owner(user) · client(app) · AS(issues tokens) · RS(API)
+AUTH0 MAP    tenant=AS · Application=client · API=RS(audience)
+ENDPOINTS    /authorize  GET  front  -> code
+             /oauth/token POST back  -> access/id/refresh tokens
+CHANNELS     front = browser redirect (URL-visible) -> ONLY a code
+             back  = server->server HTTPS          -> secret + tokens
+TOKENS       access -> call the API   (aud = API)
+             id     -> who is user    (aud = client; OIDC)
+             refresh-> get new access tokens
+FORMATS      JWT    = self-contained, verify locally (fast)
+             opaque = random string, needs /introspect
+AUTH0 RULE   audience present  -> JWT access token
+             audience absent   -> opaque (/userinfo only)
+CLIENTS      confidential = server, keeps client_secret
+             public       = SPA/mobile, NO secret, uses PKCE
+GRANT 2026   interactive -> Authorization Code + PKCE
+             machine     -> Client Credentials
+             (NEVER Implicit / ROPC)
+MUST-DO      state(CSRF) · exact redirect_uri · HTTPS
+RS VALIDATE  signature(RS256 via JWKS) + iss + aud + exp + scope
+KEY FACTS    OAuth = AUTHORIZATION, not authentication (OIDC adds that)
+             never put client_secret in front-end code
+───────────────────────────────────────────────────────────────
+    </pre>
+  </section>
+
+  <!-- 20 -->
+  <section id="takeaways">
+    <h2>20. Key Takeaways</h2>
+    <div class="callout key"><span class="tag">Key</span><p><strong>OAuth 2.0 solves delegated authorization:</strong> scoped, revocable, expiring access to your data by a third party — <em>without</em> sharing your password.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p><strong>Four roles, two endpoints, two channels.</strong> Owner / client / AS / RS. <code>/authorize</code> (front, code) and <code>/oauth/token</code> (back, tokens). Secrets and tokens live only on the back channel.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p><strong>Three tokens, three jobs.</strong> Access token → call the API. ID token → tell the client who the user is. Refresh token → get new access tokens. Never confuse their audiences.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p><strong>Public vs confidential is about secrets.</strong> Server-side apps keep a <code>client_secret</code>; browser/mobile apps can't, so they use PKCE. Never ship a secret to users.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p><strong>JWT vs opaque is a trade-off.</strong> JWT = local, fast, stateless, harder to revoke. Opaque = introspection, slower, instantly revocable. With Auth0, an <code>audience</code> gives you a JWT.</p></div>
+    <div class="callout danger"><span class="tag">Danger</span><p><strong>OAuth 2.0 is NOT authentication.</strong> An access token proves <em>authorization</em>, not <em>identity</em>. To know <em>who</em> the user is, you need OpenID Connect's ID token — which is exactly where Chapter 6 goes. First, Chapter 5 takes you through every OAuth grant type and PKCE in depth.</p></div>
+  </section>
+
+  <nav class="pager">
+    <a class="prev" href="chapter-03.html">← Previous</a>
+    <a class="next" href="chapter-05.html">Next →</a>
+  </nav>
+</main>
+<footer class="site-footer">Master Auth0 End-to-End · Chapter 4 of 32</footer>
+</body>
+</html>

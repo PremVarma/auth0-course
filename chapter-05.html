@@ -1,0 +1,770 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 5 — Authorization Code Flow and PKCE | Master Auth0</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">🔐 Master Auth0</a>
+  <nav class="topnav">
+    <a href="chapter-04.html">← Prev</a>
+    <a href="index.html">Contents</a>
+    <a href="chapter-06.html">Next →</a>
+  </nav>
+</header>
+<main class="container">
+  <div class="chapter-head">
+    <span class="phase">Phase 2 · OAuth 2.0 Masterclass</span>
+    <h1>Chapter 5 — Authorization Code Flow and PKCE</h1>
+    <p class="lead">The Authorization Code flow is the single most important grant in OAuth 2.0 — it is the flow that powers "Log in with Google," every Auth0-protected web app, every mobile login, and most of the secure enterprise integrations you will ever build. In this chapter we rebuild it from first principles: why a "code" exists at all, how the browser redirect dance works, why the <code>state</code> parameter stops CSRF, and how PKCE (Proof Key for Code Exchange) closed a dangerous interception hole so that even apps that cannot keep a secret — single-page apps and mobile apps — can use this flow safely. By the end you will be able to draw the full sequence diagram from memory, run it by hand with curl and Postman, and implement it correctly in Node, React, Next.js, Spring Boot, and FastAPI.</p>
+  </div>
+
+  <!-- ============================================================ 1 THEORY -->
+  <section id="theory">
+    <h2>1. Theory — First Principles: Why a "Code" at All?</h2>
+    <p>OAuth 2.0 is a <strong>delegated authorization</strong> framework. Its core job is to let a <em>client</em> (your application) obtain an <em>access token</em> so it can call an <em>API</em> (a resource server) on behalf of a <em>user</em>, without the user ever handing their password to the client. The <strong>Authorization Code grant</strong> is the canonical way to do this when a human is sitting in front of a browser.</p>
+
+    <p>Start from the problem. We have four parties:</p>
+    <table>
+      <thead><tr><th>Role (OAuth term)</th><th>Who it is</th><th>What it must NOT see</th></tr></thead>
+      <tbody>
+        <tr><td>Resource Owner</td><td>The end user (a human)</td><td>—</td></tr>
+        <tr><td>Client</td><td>Your app (web/SPA/mobile/server)</td><td>The user's password</td></tr>
+        <tr><td>Authorization Server</td><td>Auth0 (issues tokens)</td><td>—</td></tr>
+        <tr><td>Resource Server</td><td>Your API</td><td>The user's password</td></tr>
+      </tbody>
+    </table>
+
+    <p>The naive design would be: the user logs in at Auth0, and Auth0 immediately sends the access token back to the client. But <em>how</em> does it send it back? The only transport available after a browser login is an HTTP redirect — and redirect URLs are visible in the browser address bar, in server logs, in the <code>Referer</code> header, and in browser history. Putting a long-lived, bearer access token in a redirect URL is like writing your house key on a postcard. This is exactly the weakness of the now-deprecated <strong>Implicit flow</strong>.</p>
+
+    <p>The Authorization Code flow solves this with <strong>indirection</strong>: instead of returning the valuable token through the insecure front channel (the browser redirect), Auth0 returns a short-lived, single-use <strong>authorization code</strong>. The code is useless on its own. The client then exchanges that code for tokens over a <strong>back channel</strong> — a direct, server-to-server, TLS-protected HTTPS POST that no browser, log, or attacker on the redirect path can read. This separation of "front channel" (browser, untrusted) and "back channel" (server-to-server, trusted) is the central idea of the whole flow.</p>
+
+    <div class="callout key"><span class="tag">Key</span><p>The authorization code is a <strong>one-time, short-lived bearer of intent</strong>, not a credential. Its only purpose is to be redeemed — exactly once, within ~30–60 seconds — for the real tokens over a secure back channel.</p></div>
+
+    <p><strong>Front channel vs. back channel</strong> is worth memorizing:</p>
+    <ul>
+      <li><strong>Front channel</strong>: data travels <em>through the user-agent</em> (the browser) via redirects and query strings. Fast and works without server-side cooperation, but everything is visible to the user and to anything sitting on the redirect path. Used to deliver the <code>code</code>.</li>
+      <li><strong>Back channel</strong>: a direct HTTPS call from the client's backend to Auth0's <code>/oauth/token</code> endpoint. Invisible to the browser. Used to deliver the <code>client_secret</code> and receive the tokens.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================ 2 STORY -->
+  <section id="story">
+    <h2>2. Story-Based Explanation — The Coat-Check Ticket</h2>
+    <p>Imagine a fancy hotel. You (the <strong>user</strong>) arrive with a valuable coat (your <strong>identity and permissions</strong>). A valet (the <strong>client app</strong>) wants to fetch your car later, but you would never hand the valet the actual car keys to keep.</p>
+
+    <p>So the hotel desk (<strong>Auth0</strong>) does something clever. After you prove who you are at the desk, they don't hand the valet the keys. They hand the valet a <strong>numbered ticket</strong> (the <strong>authorization code</strong>). Anyone could glance at that ticket number, but it is worthless by itself — you cannot drive a car with a paper number.</p>
+
+    <p>When the valet actually needs the car, they walk to a <strong>private back office</strong> (the back channel), show the ticket <em>plus their own staff badge</em> (the <strong>client_secret</strong>), and only then does the hotel produce the keys (the <strong>tokens</strong>). The ticket is torn up immediately — it can never be used again.</p>
+
+    <p>Now the twist that gives us PKCE. Some valets are <strong>freelancers with no staff badge</strong> — a phone app or a browser SPA cannot keep a secret, because anyone can decompile the app or read the JavaScript. For these badge-less valets, an attacker who steals the ticket could walk into the back office and claim the keys. PKCE fixes this: when the freelance valet first gets the ticket, they whisper a <strong>secret password</strong> (the <code>code_verifier</code>) and hand over only a <strong>scrambled fingerprint of it</strong> (the <code>code_challenge</code>) to the desk. Later, to redeem the ticket, they must say the original password out loud. A thief who copied the ticket never heard the password, so the scrambled fingerprint won't match, and the desk refuses. The badge problem is solved without ever needing a badge.</p>
+
+    <div class="callout note"><span class="tag">Note</span><p>Hold this analogy in your head for the rest of the chapter: <strong>ticket = code</strong>, <strong>back office = token endpoint</strong>, <strong>staff badge = client_secret</strong>, <strong>whispered password = code_verifier</strong>, <strong>scrambled fingerprint = code_challenge</strong>.</p></div>
+  </section>
+
+  <!-- ============================================================ 3 ASCII DIAGRAMS -->
+  <section id="diagrams">
+    <h2>3. ASCII Diagrams — The Whole Flow on One Screen</h2>
+
+    <h3>3.1 The classic Authorization Code flow (confidential client)</h3>
+<pre class="diagram">
+ USER            BROWSER             CLIENT BACKEND        AUTH0 (Auth Server)        YOUR API
+  |                 |                      |                       |                      |
+  | clicks "Login"  |                      |                       |                      |
+  |---------------->|                      |                       |                      |
+  |                 |  GET /authorize?     |                       |                      |
+  |                 |   client_id&         |                       |                      |
+  |                 |   redirect_uri&      |                       |                      |
+  |                 |   scope&state=xyz    |                       |                      |
+  |                 |--------------------- FRONT CHANNEL --------->|                      |
+  |                 |                      |                       | shows login page     |
+  |<---------------------------- login + consent prompt -----------|                      |
+  | enters creds    |                      |                       |                      |
+  |---------------------------- credentials ---------------------->| (validates user)     |
+  |                 |   302 redirect to    |                       |                      |
+  |                 |   redirect_uri?      |                       |                      |
+  |                 |   code=AUTH_CODE&    |                       |                      |
+  |                 |   state=xyz          |                       |                      |
+  |                 |<------------------ FRONT CHANNEL ------------|                      |
+  |                 |  GET /callback?code  |                       |                      |
+  |                 |--------------------->| verify state==xyz     |                      |
+  |                 |                      |  POST /oauth/token    |                      |
+  |                 |                      |  grant_type=          |                      |
+  |                 |                      |  authorization_code   |                      |
+  |                 |                      |  code + client_id     |                      |
+  |                 |                      |  + client_secret      |                      |
+  |                 |                      |==== BACK CHANNEL ====>| (validates code +    |
+  |                 |                      |                       |  secret, burns code) |
+  |                 |                      |  200 { access_token,  |                      |
+  |                 |                      |       id_token,       |                      |
+  |                 |                      |       refresh_token } |                      |
+  |                 |                      |&lt;===== BACK CHANNEL ===|                      |
+  |                 |  set session cookie  |                       |                      |
+  |&lt;----------------|  app is logged in    |                       |                      |
+  |                 |                      |  Authorization:       |                      |
+  |                 |                      |  Bearer access_token  |                      |
+  |                 |                      |------------------------------------------->  | validates JWT
+  |                 |                      |&lt;----------------------------- 200 data -------|
+</pre>
+
+    <h3>3.2 Authorization Code + PKCE (public client: SPA / mobile)</h3>
+<pre class="diagram">
+   PUBLIC CLIENT (SPA / mobile — NO client_secret)            AUTH0
+        |                                                       |
+   (1)  | verifier = random 43-128 chars                        |
+        | challenge = BASE64URL( SHA-256( verifier ) )          |
+        | method    = S256                                      |
+        |                                                       |
+   (2)  | GET /authorize?response_type=code                     |
+        |   &amp;code_challenge=CHALLENGE                            |
+        |   &amp;code_challenge_method=S256                          |
+        |   &amp;state=xyz &amp;redirect_uri=...                         |
+        |------------------------------------------------------>| stores CHALLENGE
+        |                          (user logs in + consents)    |  bound to the code
+        |                                                       |
+   (3)  | 302 redirect_uri?code=AUTH_CODE&amp;state=xyz             |
+        |&lt;------------------------------------------------------|
+        |                                                       |
+   (4)  | POST /oauth/token                                     |
+        |   grant_type=authorization_code                       |
+        |   code=AUTH_CODE                                       |
+        |   code_verifier=VERIFIER   &lt;--- the original secret   |
+        |   client_id=... redirect_uri=...                      |
+        |------------------------------------------------------>| recompute
+        |                                                       | SHA256(VERIFIER)
+        |                                                       | == stored CHALLENGE ?
+        |   200 { access_token, id_token, refresh_token }       |   yes -> issue tokens
+        |&lt;------------------------------------------------------|   no  -> 400 reject
+</pre>
+
+    <h3>3.3 Why PKCE matters — the interception attack it blocks</h3>
+<pre class="diagram">
+  WITHOUT PKCE (public client):
+     legit app --/authorize--> Auth0 --redirect code--> [OS hands URL to wrong app]
+                                                              |
+                                          MALICIOUS APP grabs the code
+                                                              |
+                              POST /oauth/token (code, client_id)  --> Auth0 --> TOKENS! ✗
+                              (client_id is public, no secret needed -> attacker wins)
+
+  WITH PKCE:
+     MALICIOUS APP grabs the code, but never saw the verifier
+                              POST /oauth/token (code, client_id, code_verifier=???)
+                                                              |
+                              Auth0: SHA256(wrong) != stored challenge --> 400 ✓ BLOCKED
+</pre>
+  </section>
+
+  <!-- ============================================================ 4 ANALOGY -->
+  <section id="analogy">
+    <h2>4. Real-World Analogy — Wiring Money vs. Mailing Cash</h2>
+    <p>Think about how banks move money. You would never mail an envelope of cash (that is the <strong>Implicit flow</strong> — the token flies through the open browser). Instead the sending bank gives you a <strong>reference number</strong> (the <strong>authorization code</strong>) and the actual money moves bank-to-bank over a secured wire (the <strong>back channel</strong> token exchange). The reference number alone can't be spent.</p>
+    <p>PKCE is the <strong>one-time PIN</strong> your bank texts you. The reference number plus the PIN proves it is really you completing the transfer. Someone who shoulder-surfed the reference number on your screen still can't move the money, because they never received the PIN on your phone. The <code>code_verifier</code> is that PIN: generated fresh, known only to the legitimate client, and required to complete the exchange.</p>
+    <div class="callout tip"><span class="tag">Tip</span><p>The <code>state</code> parameter is a different safeguard: it is the <strong>tracking number you wrote down before you started</strong>. When the confirmation comes back, you check that the tracking number matches what you sent. If it doesn't, someone forged the response — you reject it. That is CSRF protection.</p></div>
+  </section>
+
+  <!-- ============================================================ 5 INTERNAL WORKING -->
+  <section id="internal">
+    <h2>5. Internal Working — Endpoint by Endpoint, Parameter by Parameter</h2>
+
+    <h3>5.1 The <code>/authorize</code> request (front channel)</h3>
+    <p>This is a plain browser navigation (an HTTP GET). Auth0's authorization endpoint for a tenant <code>dev-xyz.us.auth0.com</code> is <code>https://dev-xyz.us.auth0.com/authorize</code>. The query parameters:</p>
+    <table>
+      <thead><tr><th>Parameter</th><th>Required?</th><th>Meaning</th></tr></thead>
+      <tbody>
+        <tr><td><code>response_type=code</code></td><td>Yes</td><td>Asks for the Authorization Code grant (vs. <code>token</code> = implicit).</td></tr>
+        <tr><td><code>client_id</code></td><td>Yes</td><td>Public identifier of your Auth0 Application.</td></tr>
+        <tr><td><code>redirect_uri</code></td><td>Yes</td><td>Where Auth0 sends the code. Must <strong>exactly</strong> match a registered callback.</td></tr>
+        <tr><td><code>scope</code></td><td>Yes</td><td>What you want, e.g. <code>openid profile email offline_access</code>. <code>openid</code> triggers OIDC and an <code>id_token</code>; <code>offline_access</code> requests a refresh token.</td></tr>
+        <tr><td><code>audience</code></td><td>Auth0-specific</td><td>The API identifier you want an access token <em>for</em>. Without it you may get an opaque token instead of a JWT for your API.</td></tr>
+        <tr><td><code>state</code></td><td>Yes (practically)</td><td>Opaque random value echoed back; binds the response to this browser session (CSRF defense).</td></tr>
+        <tr><td><code>nonce</code></td><td>OIDC</td><td>Random value embedded in the <code>id_token</code> to prevent replay of ID tokens.</td></tr>
+        <tr><td><code>code_challenge</code></td><td>PKCE</td><td>BASE64URL(SHA-256(verifier)).</td></tr>
+        <tr><td><code>code_challenge_method</code></td><td>PKCE</td><td>Always <code>S256</code> for production (never <code>plain</code>).</td></tr>
+      </tbody>
+    </table>
+
+    <h3>5.2 What Auth0 does with the code</h3>
+    <p>When Auth0 generates the code, it stores server-side a small record bound to it: the <code>client_id</code>, the exact <code>redirect_uri</code>, the granted scopes, the user's identity, the <code>nonce</code>, and — if PKCE was used — the <code>code_challenge</code> and method. The code itself is an opaque, high-entropy string. It typically expires in about <strong>30–60 seconds</strong> and is marked single-use the moment it is redeemed.</p>
+
+    <h3>5.3 The <code>/oauth/token</code> exchange (back channel)</h3>
+    <p>A <code>POST</code> with <code>Content-Type: application/x-www-form-urlencoded</code>. Auth0 performs these checks <em>in order</em>:</p>
+    <ol>
+      <li>Does the code exist and is it unexpired and unused? (else <code>invalid_grant</code>)</li>
+      <li>Does the supplied <code>redirect_uri</code> exactly match the one used at <code>/authorize</code>? (binding check)</li>
+      <li>For confidential clients: is the <code>client_secret</code> (or private-key-JWT) valid?</li>
+      <li>For PKCE: does <code>BASE64URL(SHA-256(code_verifier))</code> equal the stored <code>code_challenge</code>?</li>
+      <li>All pass → issue <code>access_token</code> (+ <code>id_token</code> if <code>openid</code>, + <code>refresh_token</code> if <code>offline_access</code>), and <strong>burn the code</strong>.</li>
+    </ol>
+
+    <h3>5.4 How the PKCE math actually works (S256)</h3>
+<pre><code class="language-text">code_verifier  : a cryptographically random string, 43-128 chars,
+                 from the set [A-Z a-z 0-9 - . _ ~]  (unreserved URL chars)
+
+code_challenge : BASE64URL-ENCODE( SHA-256( ASCII(code_verifier) ) )
+                 (BASE64URL = base64 with '+'->'-', '/'->'_', no '=' padding)
+
+Verification at token endpoint:
+   BASE64URL( SHA-256( received_verifier ) )  ==  stored_challenge ?</code></pre>
+    <p>SHA-256 is a one-way hash: given the challenge you cannot reverse it to find the verifier. So even if the attacker captures the <code>/authorize</code> request (and thus the challenge) <em>and</em> the code, they still cannot produce a verifier that hashes to the challenge. That is the entire security argument.</p>
+  </section>
+
+  <!-- ============================================================ 6 CODE WALKTHROUGH -->
+  <section id="walkthrough">
+    <h2>6. Code Walkthrough — Generating PKCE Values</h2>
+    <p>Before any framework, do it by hand so the magic disappears.</p>
+
+    <h4>Node.js — generate verifier + challenge</h4>
+<pre><code class="language-javascript">import crypto from "node:crypto";
+
+// 1) verifier: 32 random bytes -> base64url is 43 chars (within 43-128 limit)
+function base64url(buf) {
+  return buf.toString("base64")
+    .replace(/\+/g, "-")
+    .replace(/\//g, "_")
+    .replace(/=+$/, "");
+}
+
+const codeVerifier  = base64url(crypto.randomBytes(32));
+const codeChallenge = base64url(
+  crypto.createHash("sha256").update(codeVerifier).digest()
+);
+const state = base64url(crypto.randomBytes(16));  // CSRF token
+const nonce = base64url(crypto.randomBytes(16));  // OIDC replay guard
+
+console.log({ codeVerifier, codeChallenge, state, nonce });
+// Store codeVerifier + state + nonce in the user's session BEFORE redirecting.</code></pre>
+
+    <h4>Python (FastAPI) — same primitives</h4>
+<pre><code class="language-python">import secrets, hashlib, base64
+
+def b64url(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).rstrip(b"=").decode()
+
+code_verifier  = b64url(secrets.token_bytes(32))           # 43 chars
+code_challenge = b64url(hashlib.sha256(code_verifier.encode()).digest())
+state          = secrets.token_urlsafe(16)
+nonce          = secrets.token_urlsafe(16)</code></pre>
+
+    <h4>Java (Spring Boot) — same primitives</h4>
+<pre><code class="language-java">import java.security.MessageDigest;
+import java.security.SecureRandom;
+import java.util.Base64;
+
+SecureRandom rng = new SecureRandom();
+byte[] v = new byte[32];
+rng.nextBytes(v);
+String codeVerifier = Base64.getUrlEncoder().withoutPadding().encodeToString(v);
+
+byte[] digest = MessageDigest.getInstance("SHA-256")
+        .digest(codeVerifier.getBytes(java.nio.charset.StandardCharsets.US_ASCII));
+String codeChallenge = Base64.getUrlEncoder().withoutPadding().encodeToString(digest);</code></pre>
+
+    <div class="callout warn"><span class="tag">Warn</span><p>Use a <strong>cryptographically secure</strong> RNG (<code>crypto.randomBytes</code>, <code>secrets</code>, <code>SecureRandom</code>) — never <code>Math.random()</code>, <code>random.random()</code>, or <code>java.util.Random</code>. Predictable verifiers defeat the entire point of PKCE.</p></div>
+  </section>
+
+  <!-- ============================================================ 7 PRACTICAL IMPLEMENTATION -->
+  <section id="practical">
+    <h2>7. Practical Implementation — Five Stacks</h2>
+
+    <h3>7.1 curl — the flow by hand</h3>
+    <p>Step 1: build the authorize URL and open it in a browser (front channel). After login Auth0 redirects to your callback with <code>?code=...&amp;state=...</code>.</p>
+<pre><code class="language-bash"># --- Step 1: authorize URL (paste into a browser) ---
+AUTH0_DOMAIN="dev-xyz.us.auth0.com"
+CLIENT_ID="abc123"
+REDIRECT_URI="http://localhost:3000/callback"
+AUDIENCE="https://api.myapp.com"
+
+# (compute these with the Node/Python snippet from section 6)
+CODE_CHALLENGE="E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+STATE="random-state-xyz"
+
+echo "https://$AUTH0_DOMAIN/authorize?\
+response_type=code&\
+client_id=$CLIENT_ID&\
+redirect_uri=$REDIRECT_URI&\
+scope=openid%20profile%20email%20offline_access&\
+audience=$AUDIENCE&\
+state=$STATE&\
+code_challenge=$CODE_CHALLENGE&\
+code_challenge_method=S256"</code></pre>
+
+    <p>Step 2: take the <code>code</code> from the redirect and exchange it (back channel). Public client uses <code>code_verifier</code>; confidential client adds <code>client_secret</code>.</p>
+<pre><code class="language-bash"># --- Step 2: exchange the code for tokens ---
+curl --request POST \
+  --url "https://$AUTH0_DOMAIN/oauth/token" \
+  --header "content-type: application/x-www-form-urlencoded" \
+  --data "grant_type=authorization_code" \
+  --data "client_id=$CLIENT_ID" \
+  --data "code_verifier=THE_ORIGINAL_VERIFIER" \
+  --data "code=PASTE_AUTH_CODE_HERE" \
+  --data "redirect_uri=$REDIRECT_URI"
+# Confidential client instead/also sends:  --data "client_secret=YOUR_SECRET"
+
+# Response:
+# { "access_token":"eyJ...", "id_token":"eyJ...",
+#   "refresh_token":"v1.M...", "token_type":"Bearer", "expires_in":86400 }</code></pre>
+
+    <h3>7.2 Node.js (Express) — confidential client, manual exchange</h3>
+<pre><code class="language-javascript">import express from "express";
+import crypto from "node:crypto";
+import session from "express-session";
+
+const app = express();
+app.use(session({ secret: "change-me", resave: false, saveUninitialized: true }));
+
+const DOMAIN = "dev-xyz.us.auth0.com";
+const CLIENT_ID = process.env.CLIENT_ID;
+const CLIENT_SECRET = process.env.CLIENT_SECRET;
+const REDIRECT_URI = "http://localhost:3000/callback";
+const b64url = b => b.toString("base64").replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/,"");
+
+app.get("/login", (req, res) => {
+  const verifier  = b64url(crypto.randomBytes(32));
+  const challenge = b64url(crypto.createHash("sha256").update(verifier).digest());
+  const state = b64url(crypto.randomBytes(16));
+  // persist server-side, tied to THIS session
+  req.session.verifier = verifier;
+  req.session.state = state;
+
+  const url = new URL(`https://${DOMAIN}/authorize`);
+  url.search = new URLSearchParams({
+    response_type: "code",
+    client_id: CLIENT_ID,
+    redirect_uri: REDIRECT_URI,
+    scope: "openid profile email offline_access",
+    audience: "https://api.myapp.com",
+    state,
+    code_challenge: challenge,
+    code_challenge_method: "S256",
+  }).toString();
+  res.redirect(url.toString());
+});
+
+app.get("/callback", async (req, res) => {
+  const { code, state } = req.query;
+  if (state !== req.session.state) return res.status(403).send("Bad state (CSRF?)");
+
+  const r = await fetch(`https://${DOMAIN}/oauth/token`, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      grant_type: "authorization_code",
+      client_id: CLIENT_ID,
+      client_secret: CLIENT_SECRET,        // confidential client
+      code,
+      code_verifier: req.session.verifier, // PKCE proof (good even for confidential)
+      redirect_uri: REDIRECT_URI,
+    }),
+  });
+  const tokens = await r.json();
+  if (tokens.error) return res.status(400).json(tokens);
+
+  req.session.tokens = tokens;             // keep tokens server-side, NOT in browser JS
+  delete req.session.verifier; delete req.session.state;
+  res.send("Logged in! Tokens stored server-side.");
+});
+
+app.listen(3000);</code></pre>
+
+    <h3>7.3 React SPA — public client (use the SDK, do not roll your own)</h3>
+<pre><code class="language-jsx">// main.jsx — @auth0/auth0-react handles PKCE + state + token storage for you
+import { Auth0Provider } from "@auth0/auth0-react";
+import { createRoot } from "react-dom/client";
+import App from "./App";
+
+createRoot(document.getElementById("root")).render(
+  &lt;Auth0Provider
+    domain="dev-xyz.us.auth0.com"
+    clientId="SPA_CLIENT_ID"
+    authorizationParams={{
+      redirect_uri: window.location.origin + "/callback",
+      audience: "https://api.myapp.com",
+      scope: "openid profile email",
+    }}
+    useRefreshTokens={true}            // refresh-token rotation for SPAs
+    cacheLocation="memory"&gt;            // safest: in-memory, not localStorage
+    &lt;App /&gt;
+  &lt;/Auth0Provider&gt;
+);</code></pre>
+<pre><code class="language-jsx">// App.jsx
+import { useAuth0 } from "@auth0/auth0-react";
+
+export default function App() {
+  const { loginWithRedirect, logout, user, isAuthenticated, getAccessTokenSilently } = useAuth0();
+  if (!isAuthenticated) return &lt;button onClick={() =&gt; loginWithRedirect()}&gt;Log in&lt;/button&gt;;
+
+  async function callApi() {
+    const token = await getAccessTokenSilently();
+    const res = await fetch("https://api.myapp.com/me", {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    console.log(await res.json());
+  }
+  return (
+    &lt;&gt;
+      &lt;p&gt;Hi {user.name}&lt;/p&gt;
+      &lt;button onClick={callApi}&gt;Call API&lt;/button&gt;
+      &lt;button onClick={() =&gt; logout()}&gt;Log out&lt;/button&gt;
+    &lt;/&gt;
+  );
+}</code></pre>
+
+    <h3>7.4 Next.js (App Router) — server-side session, confidential</h3>
+<pre><code class="language-javascript">// app/api/auth/[auth0]/route.js  (using @auth0/nextjs-auth0 v3+)
+import { handleAuth, handleLogin } from "@auth0/nextjs-auth0";
+
+export const GET = handleAuth({
+  login: handleLogin({
+    authorizationParams: {
+      audience: "https://api.myapp.com",
+      scope: "openid profile email offline_access",
+    },
+  }),
+});
+// The SDK runs Auth Code + PKCE on the server, sets an encrypted HttpOnly
+// session cookie, and never exposes tokens to client JavaScript.</code></pre>
+
+    <h3>7.5 Java Spring Boot — Spring Security OAuth2 client</h3>
+<pre><code class="language-yaml"># application.yml — Spring Security does Auth Code + PKCE automatically
+spring:
+  security:
+    oauth2:
+      client:
+        registration:
+          auth0:
+            client-id: ${CLIENT_ID}
+            client-secret: ${CLIENT_SECRET}
+            authorization-grant-type: authorization_code
+            scope: openid,profile,email
+            redirect-uri: "{baseUrl}/login/oauth2/code/auth0"
+        provider:
+          auth0:
+            issuer-uri: https://dev-xyz.us.auth0.com/</code></pre>
+<pre><code class="language-java">@Configuration
+@EnableWebSecurity
+public class SecurityConfig {
+  @Bean
+  SecurityFilterChain chain(HttpSecurity http) throws Exception {
+    http.authorizeHttpRequests(a -&gt; a.anyRequest().authenticated())
+        .oauth2Login(org.springframework.security.config.Customizer.withDefaults());
+    return http; // Spring auto-enables PKCE for public clients; manages state internally
+  }
+}</code></pre>
+
+    <h3>7.6 FastAPI — Authlib client</h3>
+<pre><code class="language-python">from authlib.integrations.starlette_client import OAuth
+from fastapi import FastAPI, Request
+from starlette.middleware.sessions import SessionMiddleware
+
+app = FastAPI()
+app.add_middleware(SessionMiddleware, secret_key="change-me")
+oauth = OAuth()
+oauth.register(
+    name="auth0",
+    client_id="...", client_secret="...",
+    server_metadata_url="https://dev-xyz.us.auth0.com/.well-known/openid-configuration",
+    client_kwargs={"scope": "openid profile email", "code_challenge_method": "S256"},
+)
+
+@app.get("/login")
+async def login(request: Request):
+    redirect_uri = request.url_for("callback")
+    return await oauth.auth0.authorize_redirect(request, redirect_uri)  # sets state+PKCE
+
+@app.get("/callback")
+async def callback(request: Request):
+    token = await oauth.auth0.authorize_access_token(request)  # verifies state, exchanges code
+    request.session["user"] = token["userinfo"]
+    return token["userinfo"]</code></pre>
+  </section>
+
+  <!-- ============================================================ 8 PRODUCTION ARCH -->
+  <section id="architecture">
+    <h2>8. Production Architecture — Where Tokens Should Live</h2>
+    <p>The biggest architectural decision is <strong>token storage</strong>, and it follows directly from client type.</p>
+<pre class="diagram">
+  PATTERN A — "Backend for Frontend" (BFF)  [RECOMMENDED for web]
+  ----------------------------------------------------------------
+   Browser  --cookie(HttpOnly,Secure,SameSite)-->  Your Server  --Bearer-->  API
+                                                       |
+                                                  holds tokens
+                                                  (never sent to browser JS)
+   Auth Code + PKCE runs on the server. XSS cannot read an HttpOnly cookie.
+
+  PATTERN B — Pure SPA  [only if no backend]
+  ----------------------------------------------------------------
+   Browser (Auth0 SPA SDK) holds access token in MEMORY
+        + refresh-token rotation, short token lifetimes
+   Auth Code + PKCE runs in the browser. Acceptable, but XSS = total compromise.
+
+  PATTERN C — Native / Mobile
+  ----------------------------------------------------------------
+   App uses system browser (ASWebAuthenticationSession / Custom Tabs)
+        + Auth Code + PKCE + claimed https redirect (App Links / Universal Links)
+   Tokens in OS secure storage (Keychain / Keystore).
+</pre>
+    <div class="callout key"><span class="tag">Key</span><p>In 2026 the consensus best practice for web apps is the <strong>BFF pattern</strong>: run the flow server-side, store tokens server-side, and give the browser only an encrypted <code>HttpOnly</code> session cookie. SPAs that hold tokens in JavaScript are a fallback, not the goal.</p></div>
+  </section>
+
+  <!-- ============================================================ 9 SECURITY ANALYSIS -->
+  <section id="security">
+    <h2>9. Security Analysis — Threats and Mitigations</h2>
+    <table>
+      <thead><tr><th>Threat</th><th>How it works</th><th>Mitigation in this flow</th></tr></thead>
+      <tbody>
+        <tr><td>Token leakage in URL</td><td>Tokens in redirect appear in logs/history/Referer</td><td>Return a <em>code</em>, not a token; exchange over back channel</td></tr>
+        <tr><td>Authorization code interception</td><td>Malicious app on a device claims the redirect and steals the code</td><td><strong>PKCE</strong> — attacker lacks the <code>code_verifier</code></td></tr>
+        <tr><td>CSRF / login fixation</td><td>Attacker tricks victim's browser into completing attacker's auth</td><td><strong>state</strong> bound to the session and verified on return</td></tr>
+        <tr><td>ID token replay</td><td>Reuse of a captured <code>id_token</code></td><td><strong>nonce</strong> embedded and validated</td></tr>
+        <tr><td>Open redirect / token theft</td><td>Attacker registers or injects a rogue <code>redirect_uri</code></td><td>Exact-match allowlist of registered callbacks; redirect_uri rechecked at token endpoint</td></tr>
+        <tr><td>Code replay</td><td>Reusing a stolen code</td><td>Codes are single-use and short-lived; reuse triggers <code>invalid_grant</code></td></tr>
+        <tr><td>Secret exfiltration (SPA/mobile)</td><td>Decompiling app reveals embedded secret</td><td>Public clients hold <strong>no secret</strong>; PKCE replaces it</td></tr>
+        <tr><td>XSS stealing tokens</td><td>Injected JS reads tokens</td><td>BFF + <code>HttpOnly</code> cookies; if SPA, in-memory storage + CSP</td></tr>
+      </tbody>
+    </table>
+    <div class="callout danger"><span class="tag">Danger</span><p>PKCE protects the <strong>code exchange</strong>; it does <strong>not</strong> protect tokens after they are issued. If your SPA stores an access token in <code>localStorage</code> and you have an XSS bug, the attacker reads the token directly — PKCE never enters the picture. Defense in depth (CSP, BFF, short lifetimes, refresh rotation) is still required.</p></div>
+  </section>
+
+  <!-- ============================================================ 10 PERFORMANCE -->
+  <section id="performance">
+    <h2>10. Performance Considerations</h2>
+    <ul>
+      <li><strong>Extra round trip:</strong> Auth Code adds one back-channel POST vs. Implicit. This happens once per login, costs tens of milliseconds, and is irrelevant compared to the security gain. Never optimize it away.</li>
+      <li><strong>PKCE hashing cost:</strong> a single SHA-256 over ≤128 bytes — microseconds. Negligible.</li>
+      <li><strong>JWKS caching:</strong> your API validates the access-token signature using Auth0's public keys from <code>/.well-known/jwks.json</code>. <em>Cache them</em> (most SDKs do, ~10 min) so you don't fetch keys on every request — that is the real hot path, not the login.</li>
+      <li><strong>Silent token renewal:</strong> SPAs renew via refresh-token rotation (<code>getAccessTokenSilently</code>) rather than full redirects, avoiding page reloads.</li>
+      <li><strong>Session affinity:</strong> if you store the <code>code_verifier</code>/<code>state</code> in server session, ensure your load balancer uses sticky sessions or a shared session store (Redis), or the callback may hit a node that doesn't have the verifier.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================ 11 COMMON MISTAKES -->
+  <section id="mistakes">
+    <h2>11. Common Mistakes</h2>
+    <ol>
+      <li><strong>redirect_uri mismatch.</strong> A trailing slash, <code>http</code> vs <code>https</code>, or a different port breaks the exact match. Auth0 returns <code>Callback URL mismatch</code>. Register the exact URI in the Application settings.</li>
+      <li><strong>Not validating <code>state</code>.</strong> Generating it but not comparing it on return leaves you open to CSRF. Compare and reject mismatches.</li>
+      <li><strong>Reusing one <code>code_verifier</code> for every login.</strong> It must be fresh per request; a static verifier is no better than no PKCE.</li>
+      <li><strong>Using <code>code_challenge_method=plain</code>.</strong> Sends the verifier in cleartext at <code>/authorize</code>. Always use <code>S256</code>.</li>
+      <li><strong>Putting <code>client_secret</code> in a SPA or mobile app.</strong> It will be extracted. SPAs/mobile are public clients — PKCE only.</li>
+      <li><strong>Storing tokens in <code>localStorage</code> "because it's easy."</strong> Readable by any XSS. Prefer memory or HttpOnly cookies via a BFF.</li>
+      <li><strong>Forgetting <code>audience</code>.</strong> Without it Auth0 may issue an opaque access token your API cannot validate as a JWT.</li>
+      <li><strong>Trying to redeem a code twice.</strong> Codes are single-use; the second attempt fails (and Auth0 may revoke the issued tokens as an anomaly).</li>
+      <li><strong>Letting the verifier/state get lost between requests</strong> (e.g., stateless server with no sticky sessions). The callback then can't find them.</li>
+    </ol>
+  </section>
+
+  <!-- ============================================================ 12 BEST PRACTICES -->
+  <section id="best-practices">
+    <h2>12. Best Practices</h2>
+    <ul>
+      <li>Use <strong>Authorization Code + PKCE for every client type</strong> — confidential clients too. PKCE adds defense in depth at zero cost (OAuth 2.1 makes this the default).</li>
+      <li>Always <code>S256</code>, never <code>plain</code>.</li>
+      <li>Generate <code>state</code>, <code>nonce</code>, and <code>code_verifier</code> with a CSPRNG; bind them to the session; verify on return; then discard.</li>
+      <li>Register an <strong>exact</strong> allowlist of redirect URIs; no wildcards in the path.</li>
+      <li>Prefer the <strong>BFF pattern</strong> for web; tokens stay server-side behind HttpOnly cookies.</li>
+      <li>For SPAs: in-memory tokens, short access-token TTLs, refresh-token rotation, a strict Content-Security-Policy.</li>
+      <li>For mobile: system browser (not embedded WebView), claimed https redirects (App Links/Universal Links), tokens in OS secure storage.</li>
+      <li>Use an <strong>official Auth0 SDK</strong> rather than hand-rolling — it gets PKCE, state, nonce, and renewal right.</li>
+      <li>Request the <strong>least scopes</strong> needed; add <code>offline_access</code> only when you truly need refresh tokens.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================ 13 INTERVIEW -->
+  <section id="interview">
+    <h2>13. Interview Questions (with Model Answers)</h2>
+
+    <h4>Q1. Why does the Authorization Code flow return a code instead of a token directly?</h4>
+    <p><strong>A.</strong> Because the response travels through the browser (front channel), where URLs leak into history, logs, and the Referer header. A code is short-lived and single-use, useless without a back-channel exchange, so leaking it is far less damaging than leaking a long-lived access token. The real tokens move over a direct server-to-server TLS call.</p>
+
+    <h4>Q2. What problem does PKCE solve, and for whom?</h4>
+    <p><strong>A.</strong> The authorization-code interception attack on public clients (SPAs, mobile) that cannot hold a secret. A malicious app could claim the redirect, grab the code, and — since the <code>client_id</code> is public — redeem it. PKCE binds the code to a per-request secret (<code>code_verifier</code>) that the attacker never saw, so the exchange fails for them.</p>
+
+    <h4>Q3. Walk me through S256.</h4>
+    <p><strong>A.</strong> The client generates a random <code>code_verifier</code>, computes <code>code_challenge = BASE64URL(SHA-256(verifier))</code>, sends the challenge + method at <code>/authorize</code>. At <code>/oauth/token</code> it sends the original verifier; the server re-hashes it and checks it equals the stored challenge. SHA-256 is one-way, so the challenge can't be reversed to forge a verifier.</p>
+
+    <h4>Q4. How does <code>state</code> differ from <code>nonce</code>?</h4>
+    <p><strong>A.</strong> <code>state</code> is an OAuth CSRF defense for the authorization <em>response</em> — a random value you send and verify on return to ensure the callback belongs to the session that started it. <code>nonce</code> is an OIDC defense embedded inside the <code>id_token</code> to prevent ID-token replay. State protects the round trip; nonce protects the ID token.</p>
+
+    <h4>Q5. Is PKCE a replacement for the client secret?</h4>
+    <p><strong>A.</strong> For public clients, yes — it provides proof of possession without a stored secret. For confidential clients, no — you still send the secret (or use private-key-JWT); PKCE is added on top as defense in depth. OAuth 2.1 recommends PKCE for all clients.</p>
+
+    <h4>Q6. Why is the Implicit flow deprecated?</h4>
+    <p><strong>A.</strong> It returned the access token directly in the redirect fragment, exposing it to leakage and offering no way to safely deliver refresh tokens. Auth Code + PKCE gives SPAs the same browser-only capability with far better security, so Implicit is removed in OAuth 2.1.</p>
+
+    <h4>Q7. Where should an SPA store its access token?</h4>
+    <p><strong>A.</strong> Ideally nowhere reachable by JavaScript: use a BFF with HttpOnly cookies. If pure SPA, in memory with refresh-token rotation and a strict CSP. Avoid <code>localStorage</code>/<code>sessionStorage</code> because XSS can read them.</p>
+
+    <h4>Q8. What stops an attacker who steals the code from also stealing tokens, even with a confidential client?</h4>
+    <p><strong>A.</strong> The token endpoint also requires the <code>client_secret</code> (server-only) and rechecks the <code>redirect_uri</code>; with PKCE it also requires the verifier. Multiple independent factors must all match, and the code is single-use and short-lived.</p>
+  </section>
+
+  <!-- ============================================================ 14 CERT TIPS -->
+  <section id="cert-tips">
+    <h2>14. Certification Tips</h2>
+    <ul>
+      <li>Memorize the parameter sets: <code>/authorize</code> uses <code>response_type=code</code>, <code>client_id</code>, <code>redirect_uri</code>, <code>scope</code>, <code>state</code>, <code>code_challenge</code>, <code>code_challenge_method</code>; <code>/oauth/token</code> uses <code>grant_type=authorization_code</code>, <code>code</code>, <code>redirect_uri</code>, <code>code_verifier</code>, and (confidential) <code>client_secret</code>.</li>
+      <li>The exam loves the mapping <strong>client type → flow</strong>: Regular Web App = Auth Code (confidential); SPA = Auth Code + PKCE (public); Native = Auth Code + PKCE (public); M2M = Client Credentials.</li>
+      <li>Know that Auth0 calls registered callbacks <strong>"Allowed Callback URLs"</strong> and they must match exactly.</li>
+      <li>Remember <code>audience</code> is the Auth0-specific parameter that makes Auth0 issue a JWT access token for your API.</li>
+      <li>Be ready to identify <code>S256</code> vs <code>plain</code> and why <code>plain</code> is discouraged.</li>
+      <li>Know the error codes: <code>invalid_grant</code> (bad/expired/used code or PKCE mismatch), <code>access_denied</code> (user declined), callback URL mismatch.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================ 15 HANDS-ON -->
+  <section id="hands-on">
+    <h2>15. Hands-On Exercises</h2>
+    <ol>
+      <li><strong>Generate PKCE values</strong> with the Node snippet, then verify by hand: independently compute <code>BASE64URL(SHA-256(verifier))</code> with <code>openssl</code> and confirm it matches your challenge.<br>
+<pre><code class="language-bash">printf '%s' "$VERIFIER" | openssl dgst -binary -sha256 | openssl base64 \
+  | tr '+/' '-_' | tr -d '='</code></pre></li>
+      <li><strong>Run the flow in a browser:</strong> create a free Auth0 SPA application, set the callback to <code>http://localhost:3000/callback</code>, paste your authorize URL, log in, and capture the <code>code</code> from the redirect.</li>
+      <li><strong>Exchange the code</strong> with the curl POST from section 7.1. Inspect the returned <code>access_token</code> and <code>id_token</code> on jwt.io.</li>
+      <li><strong>Break it on purpose:</strong> re-run the curl exchange with the <em>same</em> code — observe <code>invalid_grant</code>. Then tamper with one character of the <code>code_verifier</code> — observe the PKCE failure.</li>
+      <li><strong>State test:</strong> change the returned <code>state</code> before your callback compares it and confirm your app rejects the request.</li>
+    </ol>
+  </section>
+
+  <!-- ============================================================ 16 ASSIGNMENT -->
+  <section id="assignment">
+    <h2>16. Assignment</h2>
+    <p>Build a minimal but correct login in <strong>two</strong> stacks of your choice (one confidential, one public):</p>
+    <ol>
+      <li>Implement <code>/login</code> that generates a fresh <code>state</code> + <code>code_verifier</code>/<code>code_challenge</code>, stores them in session, and redirects to <code>/authorize</code> with <code>S256</code>.</li>
+      <li>Implement <code>/callback</code> that verifies <code>state</code>, exchanges the code at <code>/oauth/token</code>, and stores tokens server-side.</li>
+      <li>Add a protected route that calls a sample API with <code>Authorization: Bearer</code>.</li>
+      <li>Write a one-page security note: list every parameter you sent, what attack it defends against, and where your tokens live.</li>
+      <li><strong>Deliverable:</strong> working code + the security note + a screenshot of a decoded ID token.</li>
+    </ol>
+  </section>
+
+  <!-- ============================================================ 17 MINI PROJECT -->
+  <section id="mini-project">
+    <h2>17. Mini Project — A "PKCE Inspector" CLI</h2>
+    <p>Build a small command-line tool that makes the flow tangible and reusable for debugging.</p>
+    <ol>
+      <li>Command <code>pkce gen</code>: prints a fresh <code>code_verifier</code>, <code>code_challenge</code>, <code>state</code>, and a ready-to-open <code>/authorize</code> URL (read domain/client_id/redirect/audience from env or flags).</li>
+      <li>Command <code>pkce exchange --code &lt;CODE&gt; --verifier &lt;V&gt;</code>: performs the back-channel POST and pretty-prints the token response, decoding the JWT header + payload locally.</li>
+      <li>Command <code>pkce verify --verifier &lt;V&gt; --challenge &lt;C&gt;</code>: recomputes the challenge and reports MATCH / MISMATCH, demonstrating the server-side check.</li>
+      <li><strong>Stretch:</strong> spin up a tiny local HTTP listener on the redirect port so the tool captures the <code>code</code> automatically instead of copy/paste.</li>
+    </ol>
+    <div class="callout tip"><span class="tag">Tip</span><p>This CLI doubles as a real-world debugging aid: when a teammate's login breaks, <code>pkce verify</code> instantly tells you whether the verifier/challenge pair is the culprit.</p></div>
+  </section>
+
+  <!-- ============================================================ 18 QUIZ -->
+  <section id="quiz">
+    <h2>18. Quiz — 22 Questions</h2>
+    <ol>
+      <li>What grant type value does the Authorization Code flow use at the token endpoint?</li>
+      <li>Which channel (front or back) carries the authorization code?</li>
+      <li>Which channel carries the client_secret?</li>
+      <li>Roughly how long is an authorization code valid, and how many times can it be used?</li>
+      <li>What does the <code>state</code> parameter protect against?</li>
+      <li>What does the <code>nonce</code> parameter protect against?</li>
+      <li>Write the formula for <code>code_challenge</code> under S256.</li>
+      <li>Why is <code>code_challenge_method=plain</code> discouraged?</li>
+      <li>What attack does PKCE specifically prevent?</li>
+      <li>Why can't an attacker who captured the code <em>and</em> the challenge still pass PKCE?</li>
+      <li>Which client types are "public" and therefore must not embed a client_secret?</li>
+      <li>What is the minimum and maximum length of a <code>code_verifier</code>?</li>
+      <li>Which character set is allowed in a <code>code_verifier</code>?</li>
+      <li>What Auth0-specific parameter makes Auth0 issue a JWT access token for your API?</li>
+      <li>What error do you get when you reuse an authorization code?</li>
+      <li>True/False: PKCE protects tokens after they are issued.</li>
+      <li>Why is the Implicit flow deprecated?</li>
+      <li>Where should a pure SPA store its access token, and why not localStorage?</li>
+      <li>What is the BFF pattern and what is its main security advantage?</li>
+      <li>Why must <code>redirect_uri</code> be sent at both <code>/authorize</code> and <code>/oauth/token</code>?</li>
+      <li>Which scope value requests a refresh token from Auth0?</li>
+      <li>For a confidential client, do you still benefit from adding PKCE? Why?</li>
+    </ol>
+    <details>
+      <summary>Show answer key</summary>
+      <ol>
+        <li><code>authorization_code</code>.</li>
+        <li>Front channel (browser redirect query string).</li>
+        <li>Back channel (server-to-server POST to <code>/oauth/token</code>).</li>
+        <li>About 30–60 seconds; single-use (exactly once).</li>
+        <li>CSRF / authorization-response forgery — it binds the response to the session that initiated it.</li>
+        <li>ID-token replay — it ties the <code>id_token</code> to this specific request.</li>
+        <li><code>code_challenge = BASE64URL(SHA-256(ASCII(code_verifier)))</code>.</li>
+        <li>It sends the verifier in cleartext at <code>/authorize</code>, so anyone who sees that request can replay the exchange; S256 only exposes a one-way hash.</li>
+        <li>Authorization-code interception on public clients.</li>
+        <li>SHA-256 is one-way; the verifier can't be derived from the challenge, and only the legit client knows the verifier.</li>
+        <li>Single-page apps (SPAs) and native/mobile apps.</li>
+        <li>43 to 128 characters.</li>
+        <li>Unreserved URL characters: <code>A-Z a-z 0-9 - . _ ~</code>.</li>
+        <li><code>audience</code>.</li>
+        <li><code>invalid_grant</code> (and Auth0 may revoke tokens issued from the reused code).</li>
+        <li>False — it only protects the code exchange; post-issuance protection needs HttpOnly cookies/BFF, CSP, short TTLs.</li>
+        <li>It exposed access tokens directly in the redirect fragment with no safe refresh mechanism; Auth Code + PKCE supersedes it (removed in OAuth 2.1).</li>
+        <li>In memory (with refresh-token rotation); <code>localStorage</code> is readable by any XSS-injected script.</li>
+        <li>Backend-for-Frontend: the flow and tokens live on a server; the browser holds only an encrypted HttpOnly cookie, so XSS can't read tokens.</li>
+        <li>It is a binding/anti-injection check — the value at the token endpoint must match the one used to obtain the code.</li>
+        <li><code>offline_access</code>.</li>
+        <li>Yes — defense in depth; it guards the code even if the secret leaks, and OAuth 2.1 makes PKCE the default for all clients.</li>
+      </ol>
+    </details>
+  </section>
+
+  <!-- ============================================================ 19 CHEAT SHEET -->
+  <section id="cheat-sheet">
+    <h2>19. Cheat Sheet</h2>
+<pre><code class="language-text">AUTHORIZE  GET https://TENANT/authorize
+  response_type=code
+  client_id=...        redirect_uri=...(exact match)
+  scope=openid profile email offline_access
+  audience=https://api.myapp.com
+  state=RANDOM         (verify on return)
+  nonce=RANDOM         (OIDC, check in id_token)
+  code_challenge=BASE64URL(SHA256(verifier))
+  code_challenge_method=S256
+
+TOKEN      POST https://TENANT/oauth/token   (x-www-form-urlencoded)
+  grant_type=authorization_code
+  code=AUTH_CODE       redirect_uri=...(same as above)
+  code_verifier=ORIGINAL_RANDOM        (public + recommended for all)
+  client_id=...        client_secret=... (confidential only)
+
+PKCE       verifier  : 43-128 chars [A-Za-z0-9-._~], CSPRNG
+           challenge : base64url(sha256(verifier)), method S256
+
+CLIENT TYPE -> FLOW
+  Regular Web App   = Auth Code (confidential)      [secret + PKCE]
+  SPA               = Auth Code + PKCE (public)     [no secret]
+  Native / Mobile   = Auth Code + PKCE (public)     [no secret, system browser]
+  Machine-to-Machine= Client Credentials            [secret, no user]
+
+ERRORS
+  invalid_grant   = bad/expired/reused code OR PKCE mismatch
+  access_denied   = user declined consent
+  callback mismatch = redirect_uri not in Allowed Callback URLs
+
+STORAGE
+  Web  -> BFF + HttpOnly Secure SameSite cookie  (BEST)
+  SPA  -> in-memory + refresh rotation + CSP
+  Mobile -> OS Keychain / Keystore</code></pre>
+  </section>
+
+  <!-- ============================================================ 20 KEY TAKEAWAYS -->
+  <section id="takeaways">
+    <h2>20. Key Takeaways</h2>
+    <div class="callout key"><span class="tag">Key</span><p><strong>The code is a one-time ticket, not a credential.</strong> Front channel delivers the code; back channel exchanges it for tokens. This split is the heart of the Authorization Code flow.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p><strong>PKCE replaces the client secret for apps that can't keep one.</strong> A fresh per-request <code>code_verifier</code>, sent only at the back-channel exchange and verified against the SHA-256 <code>code_challenge</code>, defeats code interception. Always use <code>S256</code>.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p><strong>state stops CSRF, nonce stops ID-token replay, exact redirect_uri matching stops open-redirect token theft.</strong> Each parameter closes a specific hole — none is optional.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p><strong>Use Auth Code + PKCE for every client type</strong> (OAuth 2.1 default), prefer the BFF pattern for web apps, keep tokens out of JavaScript, request least scopes, and let an official Auth0 SDK handle the moving parts.</p></div>
+    <div class="callout note"><span class="tag">Next</span><p>In Chapter 6 we go deeper into what comes <em>out</em> of this flow — access tokens, ID tokens, refresh tokens, their claims, lifetimes, validation, and rotation.</p></div>
+  </section>
+
+  <nav class="pager">
+    <a class="prev" href="chapter-04.html">← Previous</a>
+    <a class="next" href="chapter-06.html">Next →</a>
+  </nav>
+</main>
+<footer class="site-footer">Master Auth0 End-to-End · Chapter 5 of 32</footer>
+</body>
+</html>

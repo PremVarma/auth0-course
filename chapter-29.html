@@ -1,0 +1,756 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 29 — Certification Preparation | Master Auth0</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">🔐 Master Auth0</a>
+  <nav class="topnav">
+    <a href="chapter-28.html">← Prev</a>
+    <a href="index.html">Contents</a>
+    <a href="chapter-30.html">Next →</a>
+  </nav>
+</header>
+<main class="container">
+  <div class="chapter-head">
+    <span class="phase">Phase 11 · Certification Prep</span>
+    <h1>Chapter 29 — Certification Preparation</h1>
+    <p class="lead">You have spent twenty-eight chapters building real systems — flows, tokens, tenants, Actions, RBAC, SAML, deployment pipelines. The certification exam is a different animal: it is not asking "can you build it?" but "do you know <em>which</em> setting, in <em>which</em> place, for <em>which</em> reason?" That distinction is the entire game. Multiple-choice exams reward precise vocabulary, knowing the <em>default</em> behavior, and recognizing why three plausible-sounding answers are subtly wrong. This chapter turns your hands-on knowledge into exam points: we map every domain and its weighting, drill the high-frequency concepts, expose the traps the question-writers love, give you a graded question bank, a full timed mock exam with explained answers, and a repeatable self-evaluation loop so you walk in calm and walk out certified.</p>
+  </div>
+
+  <!-- ============================================================= 1 -->
+  <section id="theory">
+    <h2>1. Theory — First Principles of How a Certification Exam Is Built</h2>
+
+    <p>Before memorizing a single fact, understand <em>how a professional certification is engineered</em>, because that tells you exactly where the points are. Every credible IT certification (Auth0's included) is built from a <strong>blueprint</strong> — a published document that splits the body of knowledge into <strong>domains</strong>, assigns each domain a <strong>weighting</strong> (the percentage of questions drawn from it), and lists <strong>objectives</strong> (the specific skills a question may test). The exam is then assembled by sampling questions proportionally from those domains.</p>
+
+    <p>This has three consequences you must internalize:</p>
+    <ol>
+      <li><strong>Weighting is your study budget.</strong> If "Configure and Implement Auth0" is 35% of the exam and "Troubleshooting" is 10%, you should not spend equal time on each. Study time should be roughly proportional to weighting × your current weakness.</li>
+      <li><strong>Objectives are the question seeds.</strong> Each objective ("configure a custom database connection", "explain refresh token rotation") is a template the writers expand into 1–4 questions. If you can confidently <em>do and explain</em> every objective, you have covered the testable surface.</li>
+      <li><strong>Questions are validated for difficulty and discrimination.</strong> Exam writers pilot questions and discard ones that everyone gets right (no signal) or that confuse strong candidates (bad distractor). The questions that survive are the ones where a <em>plausible wrong answer</em> separates people who memorized buzzwords from people who understand mechanisms. This is why "understand <em>why</em>" beats "memorize <em>what</em>."</li>
+    </ol>
+
+    <h3>The two Auth0 credentials</h3>
+    <p>As of 2026 Okta/Auth0 offers two role-based certifications. Know which one you are sitting:</p>
+    <table>
+      <thead><tr><th>Credential</th><th>Audience</th><th>Focus</th><th>Format (typical)</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Auth0 Certified Developer</strong></td><td>Engineers integrating Auth0 into apps/APIs</td><td>SDKs, flows, tokens, Actions, app config, APIs</td><td>~60 multiple-choice/multiple-select, ~90 min, online proctored</td></tr>
+        <tr><td><strong>Auth0 Certified Administrator</strong> (a.k.a. Solutions/Platform admin track)</td><td>Architects/admins running tenants</td><td>Tenant settings, connections, security policy, monitoring, lifecycle, migration</td><td>~60 multiple-choice/multiple-select, ~90 min, online proctored</td></tr>
+      </tbody>
+    </table>
+    <div class="callout warn"><span class="tag">Warn</span><p>Exact question counts, pass marks, and time limits change between exam revisions. Always re-confirm on the official Okta/Auth0 certification portal before booking. Treat the numbers in this chapter as representative planning figures, not contractual guarantees. The <em>concepts</em>, however, are stable.</p></div>
+
+    <div class="callout key"><span class="tag">Key</span><p>A certification exam is a <strong>sampling instrument</strong> over a published blueprint. Your job is not to "know Auth0" in the abstract — it is to be reliably correct on a random sample of objectives. Study the blueprint first; it is literally the answer key to "what will they ask?"</p></div>
+  </section>
+
+  <!-- ============================================================= 2 -->
+  <section id="story">
+    <h2>2. Story-Based Explanation — Two Candidates, One Exam</h2>
+    <p>Meet <strong>Priya</strong> and <strong>Dev</strong>. Both have a year of Auth0 experience. Both book the Certified Developer exam for the same Friday.</p>
+
+    <p><strong>Dev</strong> "just studies the docs." He reads top to bottom, watches videos, feels confident. On exam day he hits this question: <em>"A SPA needs to call your API and must NOT store long-lived credentials in the browser. Which grant + feature combination is correct?"</em> Dev knows Authorization Code with PKCE is for SPAs — but the question offers two answers containing PKCE, one <em>with</em> refresh token rotation and one <em>without</em>. He picks the first one he sees. Wrong. He never internalized <em>why</em> rotation matters specifically for public clients that lack a secret. He scores 68%. Pass mark is 70%. He retakes in 30 days.</p>
+
+    <p><strong>Priya</strong> studies differently. She printed the blueprint, turned each objective into a flashcard phrased as a question, and for every fact she asked "what is the <em>default</em>, and what breaks if I change it?" When she saw the SPA question she immediately reasoned: <em>public client → no secret → refresh tokens are bearer secrets → therefore rotation + reuse detection is mandatory to limit blast radius.</em> She picked the rotation answer with confidence in eight seconds and moved on, banking time for harder questions. She scored 88%.</p>
+
+    <p>Same knowledge base. Different <em>encoding</em>. Priya encoded for retrieval under exam conditions: cause→effect, default→consequence, and trap-recognition. Dev encoded for recognition while reading, which collapses under multiple plausible options. <strong>This chapter teaches you to study like Priya.</strong></p>
+
+    <div class="callout note"><span class="tag">Note</span><p>The single biggest score difference between candidates of equal experience is whether they practiced <em>retrieval under uncertainty</em> (mock questions) versus <em>passive review</em> (re-reading). Re-reading feels productive and is nearly worthless past the first pass. Testing yourself is the study.</p></div>
+  </section>
+
+  <!-- ============================================================= 3 -->
+  <section id="diagrams">
+    <h2>3. ASCII Diagrams — The Exam Domain Map and Study Loop</h2>
+
+    <h3>3.1 Representative Auth0 Certified Developer domain map &amp; weighting</h3>
+    <pre class="diagram">
+   AUTH0 CERTIFIED DEVELOPER — DOMAIN WEIGHTING (representative)
+   ════════════════════════════════════════════════════════════
+   Domain                                    Weight   Study bars
+   ──────────────────────────────────────── ──────   ──────────────────
+   1. Foundational identity & OAuth2/OIDC     ~20%    ██████████
+   2. Configure & implement Auth0 (apps,APIs) ~30%    ███████████████
+   3. Customize & extend (Actions, branding)  ~20%    ██████████
+   4. Secure (tokens, MFA, attack protection) ~20%    ██████████
+   5. Troubleshoot & operate (logs, debug)    ~10%    █████
+   ──────────────────────────────────────── ──────   ──────────────────
+   Each █ ≈ 2% of the exam. Spend time ∝ weight × weakness.
+    </pre>
+
+    <h3>3.2 Representative Auth0 Certified Administrator domain map</h3>
+    <pre class="diagram">
+   AUTH0 CERTIFIED ADMINISTRATOR — DOMAIN WEIGHTING (representative)
+   ════════════════════════════════════════════════════════════════
+   1. Tenant architecture & environments      ~20%   ██████████
+   2. Connections & identity sources          ~20%   ██████████
+   3. Users, roles, RBAC & lifecycle          ~20%   ██████████
+   4. Security, MFA, attack protection, policy ~25%  ████████████▌
+   5. Monitoring, logs, migration, support    ~15%   ███████▌
+    </pre>
+
+    <h3>3.3 The certification study loop (spaced + tested)</h3>
+    <pre class="diagram">
+        ┌──────────────────────────────────────────────────────┐
+        │                                                        │
+        ▼                                                        │
+   ┌─────────┐   ┌──────────┐   ┌───────────┐   ┌────────────┐  │
+   │ 1. MAP  │──▶│ 2. LEARN │──▶│ 3. RECALL │──▶│ 4. SCORE   │──┘
+   │ blueprint│   │ a domain │   │ flashcards│   │ + log gaps │
+   └─────────┘   └──────────┘   │ + practice│   └─────┬──────┘
+                                 └───────────┘         │
+                                                       ▼
+                          ┌────────────────────────────────────┐
+                          │ 5. WEAK-DOMAIN DRILL (re-enter loop) │
+                          │    until mock score ≥ target + 10%   │
+                          └────────────────────────────────────┘
+    </pre>
+
+    <h3>3.4 Decision tree: "which OAuth flow?" (the most-tested decision)</h3>
+    <pre class="diagram">
+                 Is there a human at a browser?
+                 ┌─────────────┴─────────────┐
+                yes                           no
+                 │                             │
+        Can it keep a secret?         Machine-to-machine?
+        ┌────────┴────────┐                    │
+       no (SPA/mobile)   yes (web app w/ srv)  ▼
+        │                 │            Client Credentials
+        ▼                 ▼            (no user, no refresh token)
+   Auth Code + PKCE   Auth Code
+   (+ rotating RT)    (+ RT, secret)
+        │
+   (Device code if no browser keyboard, e.g. TV/CLI)
+    </pre>
+    <div class="callout tip"><span class="tag">Tip</span><p>Diagram 3.4 alone answers a surprising fraction of flow questions. Burn it into memory: <em>browser? → secret? → that's your grant.</em> ROPG (password grant) is the trap "always wrong unless legacy first-party" answer — see §11.</p></div>
+  </section>
+
+  <!-- ============================================================= 4 -->
+  <section id="analogy">
+    <h2>4. Real-World Analogy — Training for a Driving Test, Not Just Driving</h2>
+    <p>You can be a perfectly safe everyday driver and still fail a driving test, because the test probes specific, examinable behaviors: mirror-signal-maneuver in that order, exact stopping distance at a sign, parallel parking within a window. Conversely, you can pass the test and still be a mediocre driver. The test is a <em>proxy</em> measured under <em>artificial, standardized conditions</em>.</p>
+
+    <p>The Auth0 exam is identical. Production gives you Google, Stack Overflow, time to experiment, and teammates. The exam gives you 90 seconds, four options, no internet, and a writer who deliberately included the "looks right but isn't" choice. So you train two things you'd never consciously train on the job:</p>
+    <ul>
+      <li><strong>The defaults.</strong> In production you'd just look up whether refresh token rotation is on by default. The exam demands you <em>know</em> it. Defaults are the driving-test equivalent of "exact stopping distance."</li>
+      <li><strong>Procedural ordering.</strong> "What is the correct sequence to migrate users with a custom database without forcing password resets?" — like mirror-signal-maneuver, the <em>order</em> is the answer (import with password hashes / lazy migration script, then verify, then disable the legacy DB).</li>
+    </ul>
+    <p>And like a driving test, the cure for nerves is <strong>mock conditions</strong>: take timed practice exams until the format is boring. Boredom is the goal — it means the novelty (which causes mistakes) is gone.</p>
+
+    <div class="callout key"><span class="tag">Key</span><p>Treat the exam as a separate skill from the job. Being good at Auth0 is necessary but not sufficient. The added skills are: knowing defaults cold, reciting procedural order, and recognizing engineered distractors fast.</p></div>
+  </section>
+
+  <!-- ============================================================= 5 -->
+  <section id="internal">
+    <h2>5. Internal Working — Anatomy of a Multiple-Choice Question</h2>
+    <p>To beat a question you must see how it's built. Every well-formed item has four parts:</p>
+    <pre class="diagram">
+   ┌────────────────────────────────────────────────────────────┐
+   │ STEM        : the scenario + the actual question            │
+   │  "A SPA must call an API; you must not persist long-lived   │
+   │   credentials in the browser. Which approach is correct?"   │
+   ├────────────────────────────────────────────────────────────┤
+   │ KEY         : the one correct answer                        │
+   │  "Authorization Code + PKCE with rotating refresh tokens"   │
+   ├────────────────────────────────────────────────────────────┤
+   │ DISTRACTORS : wrong but plausible (the dangerous part)      │
+   │  D1 Implicit flow            (deprecated → trap on 'old'    │
+   │  D2 Auth Code + PKCE, no RT       knowledge)                │
+   │  D3 Client Credentials       (no user → category error)    │
+   ├────────────────────────────────────────────────────────────┤
+   │ CUES        : qualifier words that decide the answer        │
+   │  "SPA", "must not persist", "long-lived" → public client,  │
+   │   bearer-token risk → rotation. Underline these on sight.  │
+   └────────────────────────────────────────────────────────────┘
+    </pre>
+
+    <h3>How distractors are manufactured (so you can spot them)</h3>
+    <table>
+      <thead><tr><th>Distractor type</th><th>How it's made</th><th>How to defuse</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Deprecated-truth</strong></td><td>Once correct, now wrong (Implicit flow, ROPG)</td><td>Ask "is this still recommended in 2026?"</td></tr>
+        <tr><td><strong>Right-tool-wrong-job</strong></td><td>Valid feature, wrong scenario (Client Credentials for a user login)</td><td>Re-read the stem: is there a user? a browser?</td></tr>
+        <tr><td><strong>Almost-right</strong></td><td>Correct minus one critical qualifier (PKCE but no rotation)</td><td>Match every cue word in the stem to the answer</td></tr>
+        <tr><td><strong>Plausible-vocabulary</strong></td><td>Real Auth0 terms in a wrong combination ("use a Rule on the M2M token")</td><td>Verify the feature actually applies to that token type</td></tr>
+        <tr><td><strong>Absolute-language</strong></td><td>"always / never / all" — usually false in security</td><td>One counterexample kills an absolute</td></tr>
+      </tbody>
+    </table>
+    <div class="callout note"><span class="tag">Note</span><p>"Multiple <strong>select</strong>" (choose 2 or 3) questions are graded all-or-nothing on most exams — partial credit is rare. Read the instruction "(Choose two)" as a hard constraint and count your selections before submitting.</p></div>
+  </section>
+
+  <!-- ============================================================= 6 -->
+  <section id="walkthrough">
+    <h2>6. Code Walkthrough — A Personal Quiz Engine to Drill Yourself</h2>
+    <p>The most effective revision tool is one you build, because building the data model forces you to phrase every objective as a testable question. Here is a tiny, runnable <strong>FastAPI</strong> quiz API plus a <strong>React</strong> front end. Reuse it to load your own question bank (the §18 quiz is a ready dataset).</p>
+
+    <h4>FastAPI backend — serves questions, grades, tracks weak domains</h4>
+    <pre><code class="language-python"># quiz_api.py  —  run: uvicorn quiz_api:app --reload
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+app = FastAPI(title="Auth0 Cert Drill")
+app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+# Each question is tagged with the exam DOMAIN so we can score per-domain.
+QUESTIONS = [
+    {"id": 1, "domain": "OAuth/OIDC",
+     "q": "A SPA must call your API without persisting long-lived credentials. Which flow?",
+     "choices": ["Implicit", "Auth Code + PKCE + rotating refresh tokens",
+                 "Client Credentials", "ROPG (password grant)"],
+     "answer": 1,
+     "why": "Public client (no secret) + bearer-refresh-token risk => PKCE with rotation."},
+    {"id": 2, "domain": "Tokens",
+     "q": "Which token is intended ONLY for the client and must NOT be sent to a resource API?",
+     "choices": ["Access token", "ID token", "Refresh token", "SAML assertion"],
+     "answer": 1,
+     "why": "ID token = proof of authentication for the CLIENT; APIs validate ACCESS tokens."},
+]
+
+class Submission(BaseModel):
+    answers: dict[int, int]      # {question_id: chosen_index}
+
+@app.get("/questions")
+def list_questions():
+    # Never leak the answer key to the browser before grading.
+    return [{k: v for k, v in q.items() if k not in ("answer", "why")} for q in QUESTIONS]
+
+@app.post("/grade")
+def grade(sub: Submission):
+    by_domain: dict[str, dict] = {}
+    correct = 0
+    review = []
+    for q in QUESTIONS:
+        d = by_domain.setdefault(q["domain"], {"correct": 0, "total": 0})
+        d["total"] += 1
+        chosen = sub.answers.get(q["id"])
+        if chosen == q["answer"]:
+            correct += 1
+            d["correct"] += 1
+        else:
+            review.append({"id": q["id"], "q": q["q"],
+                           "correct": q["choices"][q["answer"]], "why": q["why"]})
+    pct = round(100 * correct / len(QUESTIONS))
+    weak = sorted(by_domain.items(), key=lambda kv: kv[1]["correct"] / kv[1]["total"])
+    return {"score_pct": pct, "weakest_domain": weak[0][0] if weak else None,
+            "per_domain": by_domain, "review": review}
+</code></pre>
+
+    <h4>React front end — renders, submits, shows your weak domain</h4>
+    <pre><code class="language-jsx">// QuizApp.jsx
+import { useEffect, useState } from "react";
+const API = "http://localhost:8000";
+
+export default function QuizApp() {
+  const [questions, setQuestions] = useState([]);
+  const [answers, setAnswers] = useState({});
+  const [result, setResult] = useState(null);
+
+  useEffect(() =&gt; { fetch(`${API}/questions`).then(r =&gt; r.json()).then(setQuestions); }, []);
+
+  const submit = async () =&gt; {
+    const res = await fetch(`${API}/grade`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ answers }),
+    });
+    setResult(await res.json());
+  };
+
+  if (result) return (
+    &lt;div&gt;
+      &lt;h2&gt;Score: {result.score_pct}%&lt;/h2&gt;
+      &lt;p&gt;Focus next on: &lt;strong&gt;{result.weakest_domain}&lt;/strong&gt;&lt;/p&gt;
+      &lt;ul&gt;{result.review.map(r =&gt; (
+        &lt;li key={r.id}&gt;{r.q} → &lt;b&gt;{r.correct}&lt;/b&gt; — {r.why}&lt;/li&gt;
+      ))}&lt;/ul&gt;
+    &lt;/div&gt;
+  );
+
+  return (
+    &lt;div&gt;
+      {questions.map(q =&gt; (
+        &lt;fieldset key={q.id}&gt;
+          &lt;legend&gt;[{q.domain}] {q.q}&lt;/legend&gt;
+          {q.choices.map((c, i) =&gt; (
+            &lt;label key={i} style={{ display: "block" }}&gt;
+              &lt;input type="radio" name={`q${q.id}`}
+                onChange={() =&gt; setAnswers(a =&gt; ({ ...a, [q.id]: i }))} /&gt; {c}
+            &lt;/label&gt;
+          ))}
+        &lt;/fieldset&gt;
+      ))}
+      &lt;button onClick={submit}&gt;Grade me&lt;/button&gt;
+    &lt;/div&gt;
+  );
+}
+</code></pre>
+
+    <p><strong>Why this design teaches:</strong> the <code>domain</code> tag forces every question into a blueprint bucket, the <code>why</code> field forces you to articulate the mechanism (not just the answer), and <code>weakest_domain</code> implements the §7 feedback loop automatically — the engine tells you where to study next.</p>
+  </section>
+
+  <!-- ============================================================= 7 -->
+  <section id="practical">
+    <h2>7. Practical Implementation — Building Your Personalized Revision Plan</h2>
+    <p>Here is the concrete, repeatable procedure. It is the §3.3 loop made into a checklist.</p>
+    <ol>
+      <li><strong>Download the official blueprint</strong> from the Okta/Auth0 certification page. Copy every objective into a spreadsheet, one row per objective, with a "domain" column and a "confidence 1–5" column.</li>
+      <li><strong>Cold-rate yourself</strong> on each objective <em>before</em> studying. Honest 1–5. This is your baseline diagnostic and prevents wasting time on what you already know.</li>
+      <li><strong>Sort by (weight × (5 − confidence)).</strong> This single formula ranks objectives by exam-impact-per-hour. Study top-down.</li>
+      <li><strong>For each objective do the loop:</strong> learn → write a flashcard phrased as a question → after 1 day recall it → after 3 days recall again (spaced repetition). Re-rate confidence.</li>
+      <li><strong>Take a timed mock</strong> (the §18 set, or your quiz engine) at the end of each week. Record per-domain scores.</li>
+      <li><strong>Re-sort and repeat</strong> until your <em>mock</em> score is comfortably above the pass mark (aim pass + 15% buffer, because real-exam nerves cost points).</li>
+    </ol>
+
+    <h4>A two-week plan (representative — scale to your timeline)</h4>
+    <pre class="diagram">
+   WEEK 1                              WEEK 2
+   ──────────────────────────         ──────────────────────────
+   D1  Diagnostic + blueprint         D8   Mistake review (week-1 misses)
+   D2  OAuth/OIDC + flows (§3.4)      D9   Customize/Extend (Actions)
+   D3  Tokens (ID vs access vs RT)    D10  Troubleshoot/logs/monitoring
+   D4  Configure apps & APIs          D11  Full timed mock #1
+   D5  Connections & identity src     D12  Targeted drill on weakest 2 domains
+   D6  Security/MFA/attack protect    D13  Full timed mock #2 (must be pass+15%)
+   D7  Mock #0 + log gaps             D14  Light review, sleep, logistics check
+    </pre>
+    <div class="callout tip"><span class="tag">Tip</span><p>Spaced repetition beats cramming because memory consolidates between sessions. Two 45-minute sessions on different days beat one 90-minute block. The day before the exam should be <em>light</em> — over-cramming raises anxiety and lowers recall.</p></div>
+  </section>
+
+  <!-- ============================================================= 8 -->
+  <section id="architecture">
+    <h2>8. Production Architecture — The Mental Model the Exam Assumes</h2>
+    <p>Many questions are scenario-based: "Company X needs Y, what do you configure?" To answer fast, hold this canonical Auth0 reference architecture in your head. Almost every scenario is a variation of it.</p>
+    <pre class="diagram">
+                         ┌──────────────────────────────────────┐
+                         │            AUTH0 TENANT               │
+                         │   (one per environment: dev/stg/prod) │
+   ┌────────┐  OIDC      │  ┌──────────────┐   ┌──────────────┐  │
+   │  SPA   │───────────▶│  │ Applications │   │     APIs     │  │
+   └────────┘  Auth Code │  │ (clients)    │   │ (resource    │  │
+   ┌────────┐  +PKCE     │  │  - SPA       │   │  servers,    │  │
+   │ Web App│───────────▶│  │  - Regular   │   │  audiences)  │  │
+   └────────┘            │  │  - M2M       │   └──────────────┘  │
+   ┌────────┐  Client    │  └──────┬───────┘                     │
+   │  M2M   │───Creds────▶│         │ login routes through ───┐   │
+   └────────┘            │         ▼                         ▼   │
+                         │  ┌──────────────┐   ┌──────────────┐  │
+                         │  │ Connections  │   │   ACTIONS    │  │
+                         │  │ - DB         │   │ (pipeline:   │  │
+                         │  │ - Social     │   │  pre/post    │  │
+                         │  │ - Enterprise │   │  login, M2M, │  │
+                         │  │   (SAML/OIDC)│   │  pre-reg...) │  │
+                         │  └──────┬───────┘   └──────────────┘  │
+                         │         ▼                             │
+                         │  ┌──────────────┐  RBAC: roles→perms  │
+                         │  │  User store  │◀─────────────────── │
+                         │  └──────────────┘  +MFA +Attack Prot. │
+                         └──────────────────────────────────────┘
+    </pre>
+    <p><strong>Reading scenario questions through this map:</strong> "isolate two subsidiaries" → <em>Organizations</em>. "employees use corporate IdP" → <em>Enterprise Connection</em>. "add a claim to the token" → <em>Action (post-login)</em>. "machine job calls API" → <em>M2M app + Client Credentials</em>. "separate test from live" → <em>separate tenants</em>. Mapping the scenario onto this picture is half the answer.</p>
+    <div class="callout key"><span class="tag">Key</span><p>Memorize the <strong>noun list</strong>: Tenant, Application, API (audience), Connection, User, Role, Permission, Action, Organization, MFA, Attack Protection. Every developer/admin question is "which noun, configured how?" Knowing the nouns and their relationships lets you decode any scenario.</p></div>
+  </section>
+
+  <!-- ============================================================= 9 -->
+  <section id="security">
+    <h2>9. Security Analysis — The Concepts the Exam Tests Hardest</h2>
+    <p>Security is the most heavily and most precisely tested area, because it's where wrong answers are dangerous in real life. Master these mechanisms <em>and their reasons</em>:</p>
+
+    <h3>9.1 Token validation (asked almost every exam)</h3>
+    <ul>
+      <li><strong>Access token</strong>: validated by the <em>API/resource server</em>. Check signature (against the tenant JWKS at <code>/.well-known/jwks.json</code>), <code>iss</code>, <code>aud</code> (must equal your API identifier), <code>exp</code>, and required <code>scope</code>/permissions.</li>
+      <li><strong>ID token</strong>: validated by the <em>client</em> only. Check <code>aud</code> = your client_id, <code>iss</code>, <code>exp</code>, and <code>nonce</code> (replay protection for the login). <strong>Never send an ID token to an API as authorization.</strong></li>
+      <li><strong>Why RS256 over HS256</strong>: RS256 is asymmetric — Auth0 signs with a private key, anyone verifies with the public key from JWKS. HS256 uses a shared secret, which every verifier must hold, multiplying leak risk. The exam expects RS256 as the default/recommended choice.</li>
+    </ul>
+
+    <h3>9.2 Refresh token rotation &amp; reuse detection</h3>
+    <p>For public clients (SPA/mobile) refresh tokens are bearer secrets with no client secret to protect them. <strong>Rotation</strong> issues a new refresh token on every use and invalidates the old one; <strong>reuse detection</strong> notices if an old (already-rotated) token is presented — a sign of theft — and revokes the whole token family. Know the cause→effect chain.</p>
+
+    <h3>9.3 PKCE</h3>
+    <p>Proof Key for Code Exchange stops authorization-code interception on public clients: the client sends a hashed <code>code_challenge</code> up front and the raw <code>code_verifier</code> at token exchange. An attacker who steals the code can't redeem it without the verifier. Mandatory for SPAs/native; recommended everywhere.</p>
+
+    <h3>9.4 Attack protection features (know the names &amp; what each defends)</h3>
+    <table>
+      <thead><tr><th>Feature</th><th>Defends against</th><th>One-line mechanism</th></tr></thead>
+      <tbody>
+        <tr><td>Bot Detection / CAPTCHA</td><td>Automated abuse, scripted login</td><td>Challenge suspicious traffic</td></tr>
+        <tr><td>Suspicious IP Throttling</td><td>Credential stuffing from an IP</td><td>Rate-limit/blocks high-velocity IPs</td></tr>
+        <tr><td>Brute-Force Protection</td><td>Many attempts on one account</td><td>Locks account / blocks after N fails</td></tr>
+        <tr><td>Breached Password Detection</td><td>Use of known-leaked credentials</td><td>Checks against breach datasets</td></tr>
+        <tr><td>Adaptive MFA</td><td>Risky logins</td><td>Step-up MFA based on risk signals</td></tr>
+      </tbody>
+    </table>
+    <pre><code class="language-bash"># curl: validate that an access token is accepted by your API (smoke test)
+# Get a token via Client Credentials (M2M), then hit a protected endpoint.
+curl --request POST \
+  --url "https://YOUR_DOMAIN/oauth/token" \
+  --header "content-type: application/json" \
+  --data '{"client_id":"M2M_ID","client_secret":"M2M_SECRET","audience":"https://api.example.com","grant_type":"client_credentials"}'
+
+# Use the returned access_token:
+curl --url "https://api.example.com/private" \
+  --header "authorization: Bearer ACCESS_TOKEN_HERE"
+</code></pre>
+    <div class="callout danger"><span class="tag">Danger</span><p>The most punished security mistake on the exam (and in real life): treating the <strong>ID token as an API credential</strong>, or skipping <code>aud</code>/<code>iss</code> validation. If an answer says "the API validates the ID token," it is almost certainly the trap.</p></div>
+  </section>
+
+  <!-- ============================================================= 10 -->
+  <section id="performance">
+    <h2>10. Performance Considerations — Exam-Day Time Management</h2>
+    <p>"Performance" for an exam is throughput: maximize correct answers per minute under a fixed clock. With ~60 questions in ~90 minutes you have ~90 seconds each. Manage it like a system under load.</p>
+    <pre class="diagram">
+   TIME BUDGET (90 min, ~60 Q)         THREE-PASS STRATEGY
+   ───────────────────────────         ──────────────────────────────
+   Pass 1  ~50 min  answer the         PASS 1: answer everything you
+            knowns, FLAG the hards             know in &lt;60s; FLAG the rest
+   Pass 2  ~30 min  return to flags    PASS 2: spend remaining time on
+   Pass 3  ~10 min  verify "select-N", flagged; eliminate distractors
+            never leave blanks         PASS 3: sanity-check, fill blanks
+    </pre>
+    <ul>
+      <li><strong>Never leave a blank.</strong> A wrong answer and a blank score the same (zero) — there is no penalty for guessing, so an educated guess strictly dominates.</li>
+      <li><strong>Eliminate to improve odds.</strong> Killing two distractors turns a 25% guess into a 50% guess. Absolutes ("always/never"), category errors, and deprecated tech are first to cut.</li>
+      <li><strong>Don't anchor on the long answer.</strong> Length is not correctness; writers pad distractors with real vocabulary to look authoritative.</li>
+      <li><strong>Watch the clock at the 1/3 mark.</strong> If you're behind pace, start flagging more aggressively rather than sinking time into one item.</li>
+    </ul>
+    <div class="callout tip"><span class="tag">Tip</span><p>For a "best answer" question where two options look correct, pick the one that satisfies <em>every</em> cue word in the stem. The "more complete / more secure / officially recommended" option is usually the key, because Auth0's exam favors current best practice over merely-functional answers.</p></div>
+  </section>
+
+  <!-- ============================================================= 11 -->
+  <section id="mistakes">
+    <h2>11. Common Mistakes — Traps and Why the Wrong Answers Are Wrong</h2>
+    <table>
+      <thead><tr><th>Trap</th><th>Why it looks right</th><th>Why it's wrong</th></tr></thead>
+      <tbody>
+        <tr><td>Picking <strong>Implicit flow</strong> for a SPA</td><td>Historically the "SPA flow"</td><td>Deprecated; tokens in URL/redirect leak. Use Auth Code + PKCE.</td></tr>
+        <tr><td>Using <strong>ROPG / password grant</strong></td><td>"Simple, app collects username/password"</td><td>Exposes credentials to the app, no MFA/redirect flows. Discouraged; only legacy first-party. Almost always the trap.</td></tr>
+        <tr><td><strong>Client Credentials</strong> for a user login</td><td>It returns an access token</td><td>No user identity involved — it's machine-to-machine. Category error.</td></tr>
+        <tr><td>Validating the <strong>ID token</strong> at the API</td><td>It's a JWT with user info</td><td>ID token's audience is the <em>client</em>. APIs validate <em>access</em> tokens.</td></tr>
+        <tr><td>Putting business logic in <strong>Rules</strong> on a new build</td><td>Tutorials mention Rules</td><td>Rules/Hooks are legacy; <strong>Actions</strong> are the current extensibility model.</td></tr>
+        <tr><td>One tenant for <strong>dev + prod</strong></td><td>"Simpler to manage"</td><td>No isolation; risky config changes hit prod. Use separate tenants per environment.</td></tr>
+        <tr><td>HS256 token signing by default</td><td>"Symmetric is simpler"</td><td>RS256 (asymmetric) is the recommended default; public-key verification, no shared secret sprawl.</td></tr>
+        <tr><td>Storing tokens in <code>localStorage</code> "because it's easy"</td><td>Works in demos</td><td>XSS-exposed; prefer in-memory + rotating refresh tokens (or secure cookies via BFF).</td></tr>
+        <tr><td>Confusing <strong>scopes</strong> with <strong>RBAC permissions</strong></td><td>Both gate access</td><td>Scopes are requested by the client; permissions come from roles assigned to the user and are enforced server-side.</td></tr>
+        <tr><td>Answering with an <strong>absolute</strong> ("MFA is always required")</td><td>Sounds secure</td><td>Configurable/conditional (Adaptive MFA). Absolutes are usually false.</td></tr>
+      </tbody>
+    </table>
+    <div class="callout warn"><span class="tag">Warn</span><p>The two most lucrative trap-killers: (1) "Is there a user and a browser?" disambiguates almost every flow question. (2) "Is this feature current in 2026, or deprecated?" kills Implicit, ROPG, Rules/Hooks distractors instantly.</p></div>
+  </section>
+
+  <!-- ============================================================= 12 -->
+  <section id="bestpractices">
+    <h2>12. Best Practices — How Certified Engineers Study and Answer</h2>
+    <ul>
+      <li><strong>Study from the blueprint, not from vibes.</strong> Every study hour should map to a numbered objective.</li>
+      <li><strong>Phrase every fact as a question.</strong> "Refresh token rotation is on by default for SPAs created via the new app wizard" → "What is the default refresh-token setting for a new SPA?" Retrieval practice, not recognition.</li>
+      <li><strong>Always learn the default and the consequence.</strong> For each setting know: default value, why that default, what breaks if changed.</li>
+      <li><strong>Build, then break.</strong> In a free dev tenant, configure each feature once and intentionally misconfigure it to see the failure (e.g., wrong <code>audience</code> → token rejected). Errors are sticky memories.</li>
+      <li><strong>Take timed mocks until boredom.</strong> Aim for pass mark + 15% on a fresh mock before booking.</li>
+      <li><strong>Keep a "mistake log."</strong> Every missed question gets one line: the cue you missed and the rule. Re-read it the morning of the exam.</li>
+      <li><strong>Read the stem twice, options once.</strong> Most errors are misreadings of the question, not ignorance of the answer.</li>
+      <li><strong>Verify exam logistics 48h ahead.</strong> Proctoring software, ID, quiet room, stable network, clear desk. A technical hiccup can void an attempt.</li>
+    </ul>
+    <div class="callout key"><span class="tag">Key</span><p>The certified engineer's loop: <em>blueprint → question-flashcards → spaced recall → timed mock → mistake log → re-drill weakest domain.</em> Repeat until mock ≥ pass + 15%. That buffer absorbs exam-day nerves and the natural variance between practice and the real item pool.</p></div>
+  </section>
+
+  <!-- ============================================================= 13 -->
+  <section id="interview">
+    <h2>13. Interview Questions (with Model Answers)</h2>
+    <p>These double as deep-recall flashcards for the exam <em>and</em> as senior-interview prep — the overlap is large.</p>
+
+    <h4>Q1. Why is Authorization Code with PKCE preferred over Implicit flow for SPAs?</h4>
+    <p><strong>Model answer:</strong> Implicit returns tokens directly in the redirect URI fragment, exposing them to browser history, logs, and referrer leakage, and provides no mechanism to bind the response to the requesting client. Auth Code + PKCE returns a short-lived <em>code</em> that is exchanged server-to-Auth0 for tokens; PKCE's <code>code_verifier</code> binds the exchange to the original client so an intercepted code is useless. It also supports refresh tokens with rotation. Implicit is deprecated for these reasons.</p>
+
+    <h4>Q2. Differentiate ID token, access token, and refresh token.</h4>
+    <p><strong>Model answer:</strong> The <em>ID token</em> proves a user authenticated and is consumed by the client (audience = client_id). The <em>access token</em> authorizes calls to an API (audience = API identifier) and carries scopes/permissions. The <em>refresh token</em> is a long-lived credential the client exchanges for new access/ID tokens without re-prompting the user; for public clients it should rotate with reuse detection.</p>
+
+    <h4>Q3. When do you use Client Credentials grant?</h4>
+    <p><strong>Model answer:</strong> Machine-to-machine: a backend service, cron job, or daemon calling an API with <em>no user present</em>. The app authenticates with its client_id/secret to obtain an access token scoped to the API. There is no ID token and no refresh token because there is no user session.</p>
+
+    <h4>Q4. How would you isolate two business customers within one product?</h4>
+    <p><strong>Model answer:</strong> Use Auth0 <em>Organizations</em>: each customer is an org with its own members, enterprise connections, branding, and roles, while sharing the same application logic. This gives B2B isolation without standing up separate tenants per customer.</p>
+
+    <h4>Q5. Rules/Hooks vs Actions — what should new projects use and why?</h4>
+    <p><strong>Model answer:</strong> Actions. They are the current, supported extensibility framework with versioning, a richer trigger model (post-login, pre-user-registration, client-credentials, etc.), secrets management, and the ability to compose/order them in flows. Rules and Hooks are legacy and on a deprecation path; building new logic on them is a maintenance liability.</p>
+
+    <h4>Q6. How does an API validate an Auth0-issued access token?</h4>
+    <p><strong>Model answer:</strong> Fetch the tenant's public keys from the JWKS endpoint, verify the JWT signature (RS256), then assert <code>iss</code> matches the tenant, <code>aud</code> equals the API identifier, <code>exp</code> is in the future, and the required scope/permission is present. Cache JWKS keyed by <code>kid</code> for performance.</p>
+
+    <h4>Q7. Why separate tenants per environment?</h4>
+    <p><strong>Model answer:</strong> Isolation and safety: config changes, connection experiments, and Action deploys in dev can't affect production users or secrets. It also enables a promotion pipeline (export config from dev, deploy to prod via Deploy CLI / Terraform) and cleaner access control for who can touch prod.</p>
+  </section>
+
+  <!-- ============================================================= 14 -->
+  <section id="certtips">
+    <h2>14. Certification Tips — Concentrated Exam Wisdom</h2>
+    <ul>
+      <li><strong>Know the defaults cold.</strong> RS256 signing, PKCE for public clients, rotation for SPA refresh tokens, separate tenants per env, Actions over Rules. Defaults are free points.</li>
+      <li><strong>Master the noun map (§8).</strong> Translate any scenario into "which noun, configured how."</li>
+      <li><strong>Memorize the flow decision tree (§3.4).</strong> Browser? Secret? User? — three questions resolve most flow items.</li>
+      <li><strong>Recognize deprecated tech instantly:</strong> Implicit, ROPG, Rules, Hooks. They are distractors more often than answers.</li>
+      <li><strong>Attack-protection feature names</strong> are dropped verbatim into questions — know what each one defends against (§9.4 table).</li>
+      <li><strong>"Choose two/three"</strong> = all-or-nothing; count your boxes.</li>
+      <li><strong>Three-pass time strategy (§10):</strong> answer-flag-return; never leave blanks; guess after eliminating.</li>
+      <li><strong>Prefer the current best-practice answer</strong> over the merely-functional one when both seem valid.</li>
+      <li><strong>Use a free dev tenant</strong> to physically configure each feature once — hands-on memory outperforms reading.</li>
+      <li><strong>Logistics:</strong> test your proctoring setup, ID ready, clean desk, stable network. Don't lose a pass to a webcam glitch.</li>
+    </ul>
+    <div class="callout tip"><span class="tag">Tip</span><p>If you're between the Developer and Administrator exams, note the emphasis shift: Developer leans into SDKs, flows, tokens, and Actions; Administrator leans into tenant/environment architecture, connections, lifecycle, security policy, and monitoring/migration. Study the same nouns, weighted differently.</p></div>
+  </section>
+
+  <!-- ============================================================= 15 -->
+  <section id="handson">
+    <h2>15. Hands-On Exercises</h2>
+    <ol>
+      <li><strong>Blueprint spreadsheet.</strong> Build the objective tracker from §7 with columns: domain, objective, weight, confidence(1–5), priority = weight×(5−confidence). Sort descending. This is your study queue.</li>
+      <li><strong>Configure each flow in a dev tenant.</strong> Create a SPA app, a Regular Web app, an M2M app, and an API. Obtain a token with each flow via the SDK or curl. Decode each token at jwt.io and identify <code>aud</code>, <code>iss</code>, <code>scope</code>, <code>exp</code>.</li>
+      <li><strong>Break it on purpose.</strong> Call your API with the wrong <code>audience</code>, with an ID token, and with an expired token. Record the exact error each produces. These errors are exam answers.</li>
+      <li><strong>Spin up the quiz engine (§6).</strong> Run the FastAPI + React app, load the §18 questions, take it timed, and note which domain the engine flags as weakest.</li>
+      <li><strong>Write 10 of your own questions</strong> for your weakest domain, each with one key and three engineered distractors (use the §5 distractor types). Writing distractors forces deep understanding.</li>
+      <li><strong>Postman collection.</strong> Build a collection with a Client-Credentials token request and a protected API call that uses the token via a collection variable. (Outline below.)</li>
+    </ol>
+    <pre><code class="language-json">// Postman: minimal collection skeleton (Import &gt; Raw text)
+{
+  "info": { "name": "Auth0 Cert Drill", "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json" },
+  "item": [
+    {
+      "name": "Get M2M token",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "url": "https://YOUR_DOMAIN/oauth/token",
+        "body": { "mode": "raw",
+          "raw": "{\"client_id\":\"{{cid}}\",\"client_secret\":\"{{secret}}\",\"audience\":\"{{aud}}\",\"grant_type\":\"client_credentials\"}" }
+      },
+      "event": [{ "listen": "test", "script": { "exec": [
+        "pm.environment.set('token', pm.response.json().access_token);"
+      ] } }]
+    },
+    {
+      "name": "Call protected API",
+      "request": {
+        "method": "GET",
+        "header": [{ "key": "Authorization", "value": "Bearer {{token}}" }],
+        "url": "{{aud}}/private"
+      }
+    }
+  ]
+}
+</code></pre>
+  </section>
+
+  <!-- ============================================================= 16 -->
+  <section id="assignment">
+    <h2>16. Assignment</h2>
+    <p><strong>Goal:</strong> produce a complete, evidence-backed readiness package proving you are exam-ready.</p>
+    <ol>
+      <li>Complete the blueprint spreadsheet with an honest baseline confidence for every objective.</li>
+      <li>Study the top-priority objectives until each is rated ≥4, recording one flashcard per objective (minimum 40 flashcards).</li>
+      <li>Take the §18 quiz <em>and</em> the §17 mock under timed conditions. Record per-domain scores in a table.</li>
+      <li>Write a one-page <strong>revision plan</strong> for your two weakest domains: what you'll do, when, and how you'll measure improvement.</li>
+      <li>Maintain a mistake log of at least 15 entries (cue missed + rule learned).</li>
+      <li><strong>Deliverable:</strong> the spreadsheet, the flashcard deck, the two score tables, the revision plan, and the mistake log. You are ready to book when a <em>fresh</em> mock scores pass mark + 15%.</li>
+    </ol>
+    <div class="callout note"><span class="tag">Note</span><p>Self-grade against this rubric: blueprint coverage (every objective rated) /30, flashcards as questions /20, timed mock + per-domain table /20, targeted revision plan /15, mistake log quality /15. Below 80? Re-drill before booking.</p></div>
+  </section>
+
+  <!-- ============================================================= 17 -->
+  <section id="miniproject">
+    <h2>17. Mini Project — One Full Timed Mock Exam (with Answer Key &amp; Explanations)</h2>
+    <p><strong>Rules:</strong> 20 questions, <strong>30 minutes</strong>, no notes, no internet. Answer all before opening the key. Pass = 70% (14/20). Aim 85%+ for confidence.</p>
+
+    <ol>
+      <li><strong>M1.</strong> A native mobile app must authenticate users and call your API. Which is the recommended approach?
+        <br>A) Implicit flow &nbsp; B) Authorization Code + PKCE &nbsp; C) Client Credentials &nbsp; D) ROPG</li>
+      <li><strong>M2.</strong> Which token does a resource API validate to authorize a request?
+        <br>A) ID token &nbsp; B) Access token &nbsp; C) Refresh token &nbsp; D) SAML assertion</li>
+      <li><strong>M3.</strong> A cron job with no user calls your internal API. Which grant?
+        <br>A) Auth Code &nbsp; B) Device Code &nbsp; C) Client Credentials &nbsp; D) Implicit</li>
+      <li><strong>M4.</strong> What is the recommended JWT signing algorithm for Auth0-issued tokens?
+        <br>A) HS256 &nbsp; B) none &nbsp; C) RS256 &nbsp; D) MD5</li>
+      <li><strong>M5.</strong> You must add a custom claim to the access token after login. Where?
+        <br>A) A Rule &nbsp; B) A post-login Action &nbsp; C) Tenant settings &nbsp; D) The API's scopes</li>
+      <li><strong>M6.</strong> Refresh token rotation primarily protects which client type?
+        <br>A) Confidential web apps &nbsp; B) M2M apps &nbsp; C) Public clients (SPA/native) &nbsp; D) SAML SPs</li>
+      <li><strong>M7.</strong> Which feature detects use of credentials known from public breaches?
+        <br>A) Bot Detection &nbsp; B) Breached Password Detection &nbsp; C) Brute-Force Protection &nbsp; D) Suspicious IP Throttling</li>
+      <li><strong>M8.</strong> How should you separate development and production?
+        <br>A) Two applications in one tenant &nbsp; B) Two connections &nbsp; C) Two separate tenants &nbsp; D) Two APIs</li>
+      <li><strong>M9.</strong> Which claim must an API check equals its own identifier?
+        <br>A) sub &nbsp; B) iss &nbsp; C) aud &nbsp; D) nonce</li>
+      <li><strong>M10.</strong> To isolate multiple B2B customers in one app, use:
+        <br>A) Multiple tenants &nbsp; B) Organizations &nbsp; C) Multiple databases &nbsp; D) Roles only</li>
+      <li><strong>M11.</strong> PKCE prevents which attack?
+        <br>A) Token theft via XSS &nbsp; B) Authorization-code interception &nbsp; C) CSRF on logout &nbsp; D) Phishing</li>
+      <li><strong>M12.</strong> The <code>nonce</code> in an OIDC request mitigates:
+        <br>A) Code interception &nbsp; B) ID-token replay &nbsp; C) Brute force &nbsp; D) Token expiry</li>
+      <li><strong>M13.</strong> Which is the current extensibility model (not legacy)?
+        <br>A) Rules &nbsp; B) Hooks &nbsp; C) Actions &nbsp; D) Webtask scripts</li>
+      <li><strong>M14.</strong> Employees of a customer log in with their corporate Entra ID. You configure:
+        <br>A) A database connection &nbsp; B) A social connection &nbsp; C) An enterprise connection &nbsp; D) A passwordless connection</li>
+      <li><strong>M15.</strong> Where do RBAC permissions ultimately come from for a user?
+        <br>A) Scopes requested by the client &nbsp; B) Roles assigned to the user &nbsp; C) The ID token &nbsp; D) The refresh token</li>
+      <li><strong>M16.</strong> Best place to store tokens in a browser SPA?
+        <br>A) localStorage &nbsp; B) In memory (+ rotating refresh tokens) &nbsp; C) A cookie readable by JS &nbsp; D) sessionStorage as plaintext</li>
+      <li><strong>M17.</strong> A user with a browser but no keyboard (smart TV) needs to log in. Which flow?
+        <br>A) Implicit &nbsp; B) Device Authorization (device code) &nbsp; C) Client Credentials &nbsp; D) ROPG</li>
+      <li><strong>M18.</strong> Which endpoint exposes the public keys to verify token signatures?
+        <br>A) /userinfo &nbsp; B) /authorize &nbsp; C) /.well-known/jwks.json &nbsp; D) /oauth/token</li>
+      <li><strong>M19.</strong> You see "invalid audience" errors calling your API. Most likely cause?
+        <br>A) Expired refresh token &nbsp; B) Token requested without the correct <code>audience</code> param &nbsp; C) MFA disabled &nbsp; D) Wrong signing alg only</li>
+      <li><strong>M20.</strong> Adaptive MFA decides when to challenge based on:
+        <br>A) A fixed schedule &nbsp; B) Risk signals (new device, impossible travel, etc.) &nbsp; C) The client secret &nbsp; D) Token size</li>
+    </ol>
+
+    <details>
+      <summary>Show answer key &amp; explanations (M1–M20)</summary>
+      <ol>
+        <li><strong>B.</strong> Native = public client; Auth Code + PKCE is the recommendation. A is deprecated, C has no user, D is discouraged.</li>
+        <li><strong>B.</strong> APIs validate <em>access</em> tokens. The ID token (A) is for the client; refresh (C) is for getting new tokens; SAML (D) is a different protocol artifact.</li>
+        <li><strong>C.</strong> No user present → Client Credentials. Device Code (B) is for browser-but-no-keyboard <em>user</em> login.</li>
+        <li><strong>C.</strong> RS256 (asymmetric) is recommended; HS256 needs a shared secret everywhere; "none" and MD5 are insecure.</li>
+        <li><strong>B.</strong> Post-login Actions add claims. Rules (A) are legacy. Scopes (D) don't add arbitrary claims.</li>
+        <li><strong>C.</strong> Public clients can't protect a refresh token with a client secret, so rotation + reuse detection limits theft impact.</li>
+        <li><strong>B.</strong> Breached Password Detection checks against leaked credential datasets.</li>
+        <li><strong>C.</strong> Separate tenants give true isolation between dev and prod.</li>
+        <li><strong>C.</strong> <code>aud</code> must equal the API identifier. <code>iss</code> identifies the issuer; <code>sub</code> the user; <code>nonce</code> replay-protects ID tokens.</li>
+        <li><strong>B.</strong> Organizations provide per-customer B2B isolation within one application.</li>
+        <li><strong>B.</strong> PKCE binds the code exchange to the original client, defeating code interception. XSS token theft (A) is mitigated differently (in-memory storage, rotation).</li>
+        <li><strong>B.</strong> <code>nonce</code> ties the ID token to the specific auth request, preventing replay.</li>
+        <li><strong>C.</strong> Actions are current; Rules/Hooks/Webtasks are legacy.</li>
+        <li><strong>C.</strong> Corporate IdP federation = enterprise connection (SAML/OIDC).</li>
+        <li><strong>B.</strong> Permissions derive from roles assigned to the user; scopes (A) are client requests, not the source of user permissions.</li>
+        <li><strong>B.</strong> In-memory + rotating refresh tokens minimizes XSS exposure; localStorage (A) is readable by injected scripts.</li>
+        <li><strong>B.</strong> Device Authorization flow is designed for input-constrained devices.</li>
+        <li><strong>C.</strong> The JWKS endpoint publishes the public signing keys.</li>
+        <li><strong>B.</strong> "Invalid audience" almost always means the token was obtained without the correct <code>audience</code> parameter for that API.</li>
+        <li><strong>B.</strong> Adaptive MFA challenges based on risk signals, not a fixed schedule.</li>
+      </ol>
+      <p><strong>Scoring:</strong> 18–20 = exam-ready. 14–17 = passing but drill misses. ≤13 = re-study the domains your misses cluster in before booking.</p>
+    </details>
+  </section>
+
+  <!-- ============================================================= 18 -->
+  <section id="quiz">
+    <h2>18. Quiz — 25 Questions (Beginner → Advanced) with Answer Key</h2>
+    <p>Tag: [B]=beginner, [I]=intermediate, [A]=advanced. Answer all, then open the key.</p>
+    <ol>
+      <li>[B] What does AuthN mean vs AuthZ?</li>
+      <li>[B] Which OAuth grant is for machine-to-machine with no user?</li>
+      <li>[B] Which token is consumed by the client to confirm a login happened?</li>
+      <li>[B] What is the recommended flow for a single-page app?</li>
+      <li>[B] Name the current Auth0 extensibility model (one word).</li>
+      <li>[B] What does MFA stand for, and give one factor type example.</li>
+      <li>[I] Why is RS256 preferred over HS256 for token signing?</li>
+      <li>[I] What does PKCE protect against?</li>
+      <li>[I] What two claims must an API validate besides signature and expiry?</li>
+      <li>[I] What is the difference between a scope and an RBAC permission?</li>
+      <li>[I] Which attack-protection feature throttles high-velocity IPs?</li>
+      <li>[I] Why use a separate tenant per environment?</li>
+      <li>[I] What is the purpose of the <code>nonce</code> parameter?</li>
+      <li>[I] When would you use the Device Authorization flow?</li>
+      <li>[I] What is the JWKS endpoint used for?</li>
+      <li>[A] Explain refresh token rotation and reuse detection and why both matter for public clients.</li>
+      <li>[A] A scenario needs per-customer branding, members, and enterprise connections in one app. What feature, and why not separate tenants?</li>
+      <li>[A] Why is the ID token unsuitable as an API authorization credential?</li>
+      <li>[A] Describe the correct order to migrate users from a legacy DB without forcing password resets.</li>
+      <li>[A] You must enforce that EU data export is blocked outside the EU even for admins. Which authorization model(s) fit and why?</li>
+      <li>[A] How does Adaptive MFA decide to step up, and what's the benefit over always-on MFA?</li>
+      <li>[A] Why are Rules/Hooks distractors more often than answers on a 2026 exam?</li>
+      <li>[A] What's the difference between a Regular Web App and a SPA in terms of client confidentiality and flow?</li>
+      <li>[A] An access token call returns "invalid audience." Walk through your debugging steps.</li>
+      <li>[A] Why does the three-pass time strategy and "never leave blanks" maximize score?</li>
+    </ol>
+
+    <details>
+      <summary>Show answer key (Q1–Q25)</summary>
+      <ol>
+        <li>AuthN = authentication ("who are you?", proving identity). AuthZ = authorization ("what may you do?", granting access).</li>
+        <li>Client Credentials grant.</li>
+        <li>The ID token.</li>
+        <li>Authorization Code with PKCE (plus rotating refresh tokens).</li>
+        <li>Actions.</li>
+        <li>Multi-Factor Authentication; factor types: something you know (password), have (TOTP/authenticator, security key), are (biometric).</li>
+        <li>RS256 is asymmetric — Auth0 signs with a private key and verifiers use the public key from JWKS, so no shared secret must be distributed/protected by every verifier (HS256's weakness).</li>
+        <li>Authorization-code interception on public clients (the stolen code can't be redeemed without the <code>code_verifier</code>).</li>
+        <li><code>iss</code> (issuer = your tenant) and <code>aud</code> (audience = the API identifier); plus required scope/permission.</li>
+        <li>A scope is requested by the client and represents requested access; an RBAC permission is granted to a user via assigned roles and is enforced server-side. Scopes ≠ user entitlements.</li>
+        <li>Suspicious IP Throttling.</li>
+        <li>Isolation/safety: dev config and experiments can't affect prod users/secrets; enables a promotion pipeline (Deploy CLI/Terraform).</li>
+        <li>It binds the ID token to a specific authentication request, preventing ID-token replay.</li>
+        <li>For input-constrained devices (smart TVs, CLIs) where the user authenticates on a separate device/browser.</li>
+        <li>Publishing the tenant's public signing keys so resource servers/clients can verify JWT signatures (keyed by <code>kid</code>).</li>
+        <li>Rotation issues a new refresh token on each use and invalidates the old one; reuse detection revokes the entire token family if a previously-used token reappears (theft signal). Public clients lack a client secret to protect the refresh token, so these mechanisms limit blast radius.</li>
+        <li>Organizations. Separate tenants per customer is heavy to operate, fragments config/monitoring, and doesn't share one app cleanly; Organizations give isolation (members, connections, branding, roles) inside one tenant/app.</li>
+        <li>Its audience is the client (client_id), not the API; it's proof of authentication, not authorization for resource access. APIs must validate access tokens whose <code>aud</code> = the API identifier.</li>
+        <li>Stand up a custom database connection with a "login"/get-user script (or import users with their existing password hashes); enable lazy migration so users are verified against the legacy store and seamlessly moved on first successful login; verify; then decommission the legacy DB. No forced resets because credentials are validated/migrated transparently.</li>
+        <li>ABAC and/or PBAC: the decision depends on attributes (data residency = EU) and context (request location), which static RBAC roles can't express. A policy "deny export when resource.region=EU AND request.location≠EU" captures it; enforce via Actions/FGA or an external policy engine.</li>
+        <li>It evaluates risk signals (new device, impossible travel, anomalous IP, etc.) and challenges only risky logins, reducing user friction for normal logins while still protecting high-risk ones — better UX/security balance than always-on MFA.</li>
+        <li>Rules and Hooks are legacy and on a deprecation path; the current best-practice answer is Actions, so distractors offering Rules/Hooks are testing whether you know what's current.</li>
+        <li>A Regular Web App is a confidential client (server-side, can hold a client secret) using Auth Code (with secret); a SPA is a public client (no secret in the browser) using Auth Code + PKCE with rotating refresh tokens.</li>
+        <li>Confirm the token was requested with the correct <code>audience</code> for that API; decode the token and inspect <code>aud</code>; verify the API identifier matches; check the SDK/config sends the right audience; re-request and retest. Almost always a missing/incorrect audience parameter.</li>
+        <li>There's no penalty for wrong answers, so a guess weakly dominates a blank; answering knowns first banks easy points and time, flagging hards prevents clock-sink, and elimination raises guess odds — maximizing expected correct answers within the fixed time.</li>
+      </ol>
+    </details>
+    <div class="callout key"><span class="tag">Key</span><p>If you can answer Q16–Q25 (the [A] set) fluently <em>in your own words</em>, you are operating at certification-pass level. The advanced questions are where deep "why" understanding separates a 70% from a 90%.</p></div>
+  </section>
+
+  <!-- ============================================================= 19 -->
+  <section id="cheatsheet">
+    <h2>19. Cheat Sheet — One-Page Exam Crib</h2>
+    <pre class="diagram">
+   ┌─────────────────────── FLOWS (browser? secret? user?) ──────────────────────┐
+   │ SPA / native ............ Auth Code + PKCE (+ rotating refresh tokens)        │
+   │ Regular web app ......... Auth Code (+ client secret, + refresh token)        │
+   │ Machine-to-machine ...... Client Credentials (no user, no refresh token)      │
+   │ TV / CLI (no keyboard) .. Device Authorization (device code)                  │
+   │ TRAPS ................... Implicit (deprecated), ROPG (legacy/discouraged)    │
+   ├─────────────────────────────── TOKENS ──────────────────────────────────────┤
+   │ ID token ... for the CLIENT (aud=client_id, nonce). NOT for APIs.            │
+   │ Access tok . for the API (aud=API id, scopes/perms). API validates THIS.     │
+   │ Refresh .... gets new tokens; rotate + reuse-detect for public clients.      │
+   │ Validate ... sig(RS256 via JWKS) + iss + aud + exp + scope/permission.       │
+   ├──────────────────────────── EXTENSIBILITY ──────────────────────────────────┤
+   │ Actions = CURRENT.  Rules / Hooks / Webtasks = LEGACY (distractors).         │
+   ├──────────────────────────── SECURITY MENU ──────────────────────────────────┤
+   │ Bot Detection | Suspicious IP Throttling | Brute-Force | Breached Password   │
+   │ | Adaptive MFA (risk-based step-up). RS256 default. PKCE for public.         │
+   ├──────────────────────────── ARCH NOUNS ─────────────────────────────────────┤
+   │ Tenant(per-env) > Application(client) + API(audience) + Connection(DB/social │
+   │ /enterprise) + User > Role > Permission + Action + Organization(B2B isolate) │
+   ├──────────────────────────── EXAM TACTICS ───────────────────────────────────┤
+   │ 3 passes: answer-flag-return | never blank | eliminate to guess              │
+   │ "(Choose 2)" = all-or-nothing | absolutes usually false | prefer best-prac.  │
+   └─────────────────────────────────────────────────────────────────────────────┘
+    </pre>
+  </section>
+
+  <!-- ============================================================= 20 -->
+  <section id="takeaways">
+    <h2>20. Key Takeaways</h2>
+    <ul>
+      <li><strong>The blueprint is the answer key.</strong> Study domains in proportion to weight × your weakness; turn each objective into a question-flashcard.</li>
+      <li><strong>Encode for retrieval, not recognition.</strong> Re-reading is near-worthless; timed self-testing is the study. Aim mock score ≥ pass + 15% before booking.</li>
+      <li><strong>Know the defaults cold:</strong> RS256, PKCE for public clients, refresh-token rotation, Actions (not Rules), separate tenants per environment.</li>
+      <li><strong>The flow decision is three questions:</strong> human at a browser? client that can keep a secret? user present at all? That resolves nearly every grant question.</li>
+      <li><strong>Tokens: ID = client, Access = API, Refresh = renewal.</strong> APIs validate access tokens (sig + iss + aud + exp + scope). Never use an ID token as an API credential.</li>
+      <li><strong>Recognize engineered distractors:</strong> deprecated-truth (Implicit/ROPG/Rules), right-tool-wrong-job (Client Credentials for a login), almost-right (PKCE minus rotation), and absolutes ("always/never").</li>
+      <li><strong>Map scenarios onto the architecture nouns</strong> (§8) — every question is "which noun, configured how."</li>
+      <li><strong>Manage the clock:</strong> three passes, never leave blanks, eliminate then guess; prefer the current best-practice answer when two seem valid.</li>
+      <li><strong>Run the loop:</strong> map → learn → recall → score → drill weakest → repeat. Keep a mistake log and re-read it the morning of the exam.</li>
+    </ul>
+    <div class="callout tip"><span class="tag">Tip</span><p>You already did the hard part across Chapters 1–28: you can build it. This chapter just re-encodes that knowledge for a 90-second-per-question format. Trust the loop, hit pass + 15% on a fresh mock, sleep well, and book it.</p></div>
+  </section>
+
+  <nav class="pager">
+    <a class="prev" href="chapter-28.html">← Previous</a>
+    <a class="next" href="chapter-30.html">Next →</a>
+  </nav>
+</main>
+<footer class="site-footer">Master Auth0 End-to-End · Chapter 29 of 32</footer>
+</body>
+</html>

@@ -1,0 +1,642 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 2 — History of Authentication | Master Auth0</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">🔐 Master Auth0</a>
+  <nav class="topnav">
+    <a href="chapter-01.html">← Prev</a>
+    <a href="index.html">Contents</a>
+    <a href="chapter-03.html">Next →</a>
+  </nav>
+</header>
+<main class="container">
+  <div class="chapter-head">
+    <span class="phase">Phase 1 · Identity Fundamentals</span>
+    <h1>Chapter 2 — History of Authentication</h1>
+    <p class="lead">Every authentication technology you will ever configure in Auth0 — passwords, MFA, social login, SAML, OIDC, passkeys — exists because something before it broke. This chapter walks the 60-year arc from a plaintext password file on a 1960s mainframe to passwordless WebAuthn, and at every step asks the only question that matters: <em>what attack or pain forced the next invention?</em> Understand the chain of failures and every Auth0 feature stops being magic and starts being inevitable.</p>
+  </div>
+
+  <!-- ===================== 1. THEORY ===================== -->
+  <section id="theory">
+    <h2>1. Theory — First Principles of "Who Are You?"</h2>
+
+    <p>Before we touch a single protocol, fix three words that beginners constantly confuse. Every system in this chapter is built out of these three primitives, so if you blur them you will misread every diagram that follows.</p>
+
+    <table>
+      <thead><tr><th>Term</th><th>Question it answers</th><th>Plain example</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Identification</strong></td><td>Who do you <em>claim</em> to be?</td><td>Typing <code>alice@acme.com</code> into a login box.</td></tr>
+        <tr><td><strong>Authentication (AuthN)</strong></td><td>Can you <em>prove</em> that claim?</td><td>Entering the password only Alice should know.</td></tr>
+        <tr><td><strong>Authorization (AuthZ)</strong></td><td>What are you <em>allowed</em> to do?</td><td>Alice can read billing, but cannot delete users.</td></tr>
+      </tbody>
+    </table>
+
+    <p>This whole chapter is about the middle column — <strong>proof of identity</strong> — and how the <em>kind</em> of proof we accept has evolved. Proof always comes from one or more of three <strong>authentication factors</strong>:</p>
+
+    <ul>
+      <li><strong>Something you know</strong> — a password, PIN, or the answer to "your first pet's name". Cheap, but copyable: if I learn it, I <em>am</em> you.</li>
+      <li><strong>Something you have</strong> — a phone, a hardware key, a smartcard. Harder to copy, but can be lost or stolen.</li>
+      <li><strong>Something you are</strong> — a fingerprint, face, or iris. Convenient, but cannot be changed once leaked.</li>
+    </ul>
+
+    <p>The entire history of authentication is one long migration: from relying on a single <em>knowledge</em> factor that turned out to be trivially stealable, toward combining <em>possession</em> and <em>inherence</em> factors that an attacker on the other side of the planet cannot reproduce. A second, parallel story runs alongside it — <strong>delegation</strong>: how do I prove who I am to <em>many</em> systems without handing my password to each one? That second thread gives us SSO, SAML, OAuth, and OpenID Connect.</p>
+
+    <div class="callout key"><span class="tag">Key</span><p>Two engines drive this entire history: (1) making the <em>proof</em> harder to steal (passwords → MFA → passkeys), and (2) making the proof <em>reusable across systems</em> without sharing the secret (sessions → SSO → SAML → OAuth → OIDC). Keep both engines in mind and the timeline organizes itself.</p></div>
+  </section>
+
+  <!-- ===================== 2. STORY ===================== -->
+  <section id="story">
+    <h2>2. Story — Sixty Years in the Life of a Login</h2>
+
+    <p>Meet <strong>CTSS</strong>, the Compatible Time-Sharing System at MIT, around 1961. For the first time, many people share one expensive computer, each with private files. The designers need a way to keep Bob out of Alice's files, so they invent the <strong>password</strong>: a secret word stored next to each username in a file called <code>UACCNT.SECRET</code>. It works — until 1962, when a researcher named Allan Scherr wants more machine time than his allocation allows. He simply prints the password file. The world's first password database leak happens roughly a year after the world's first password. <em>This is the recurring pattern of the entire chapter: invent a defense, the attacker adapts, invent the next defense.</em></p>
+
+    <p>Fast-forward through the decades like a film reel. <strong>1976:</strong> Robert Morris and Ken Thompson, building Unix, realize storing passwords in plaintext is insane, so they <em>hash</em> them and sprinkle in <em>salt</em>. <strong>1980s:</strong> companies buy hundreds of computers and printers — managing a user account on each one is a nightmare, so directory services (X.500, then LDAP) centralize "who exists and where". <strong>1993:</strong> MIT releases <strong>Kerberos</strong> so a user logs in once and gets <em>tickets</em> for every campus service. <strong>1994:</strong> Netscape invents the HTTP <strong>cookie</strong>, giving the stateless web a memory and making web logins possible. <strong>2002–2005:</strong> the enterprise web needs cross-company single sign-on; <strong>SAML</strong> is born. <strong>2007–2012:</strong> "Sign in with Twitter/Facebook/Google" demands delegated access without password sharing — <strong>OAuth 1.0 → 2.0</strong>. <strong>2014:</strong> OAuth was never about <em>identity</em>, so <strong>OpenID Connect</strong> bolts a real login layer on top, standardizing the <strong>JWT</strong> ID token. <strong>2010s:</strong> phishing and breaches make passwords-alone indefensible — <strong>MFA</strong> and then <strong>passwordless</strong> go mainstream. <strong>2019–2022:</strong> the FIDO Alliance and W3C ship <strong>WebAuthn / FIDO2</strong>, and Apple, Google, and Microsoft launch <strong>passkeys</strong> — finally, a credential that <em>cannot</em> be phished because it never leaves your device.</p>
+
+    <p>Auth0, the platform this course is about, sits at the end of this story: it is a single service that speaks <em>all</em> of these protocols so you don't have to re-implement six decades of hard-won security yourself.</p>
+  </section>
+
+  <!-- ===================== 3. ASCII DIAGRAMS ===================== -->
+  <section id="diagrams">
+    <h2>3. ASCII Diagrams — The Evolution at a Glance</h2>
+
+    <h3>The grand timeline (and what broke each time)</h3>
+    <pre class="diagram">
+ 1961        1976         1988        1993        1994        2002        2007/12      2014        2019+
+  |           |            |           |           |           |            |           |           |
+PASSWORD   HASH+SALT     LDAP/AD    KERBEROS    COOKIES      SAML        OAuth 1/2     OIDC      FIDO2/PASSKEYS
+  |           |            |           |           |           |            |           |           |
+  v           v            v           v           v           v            v           v           v
+"store a   "stop storing "centralize "log in   "give the   "cross-org  "delegate   "add real  "kill the
+ secret"    the secret"   identity"   ONCE for   web a       web SSO     access w/o  identity   phishable
+                                      many svc"  memory"     (XML)"      sharing pw" to OAuth"  secret"
+
+ WHY THE PREVIOUS ONE BROKE
+ ---------------------------------------------------------------------------------------------------------
+ plaintext  -> leaked file = total compromise
+ hash       -> still one factor; phishable; reused across sites
+ per-host   -> N machines = N password copies = admin nightmare  ............. LDAP/AD
+ re-auth    -> typing password to every campus service is painful  ........... Kerberos
+ stateless  -> HTTP forgets you after every request  ......................... Cookies/Sessions
+ one company-> partners/SaaS need login too, can't share AD passwords  ....... SAML
+ password-  -> 3rd-party apps stored YOUR password to act for you  ........... OAuth
+   sharing
+ OAuth      -> grants ACCESS, never says WHO the user is (identity)  ......... OpenID Connect
+ knowledge  -> any single secret can be phished/breached/reused  ............. MFA -> Passkeys
+    </pre>
+
+    <h3>Single factor vs. the layered modern stack</h3>
+    <pre class="diagram">
+   THEN (1 factor)                          NOW (defense in depth)
+ +-----------------+                +-----------------------------------+
+ |  password only  |                |  Factor 1: passkey / password     |
+ +-----------------+                |  Factor 2: TOTP / push / WebAuthn |
+        |                           |  + risk signals (IP, device, geo) |
+   one secret =                     +-----------------------------------+
+   game over if                              |
+   stolen                           steal one factor -> still locked out
+    </pre>
+
+    <h3>The "log in once, use everywhere" idea (the core of SSO)</h3>
+    <pre class="diagram">
+        +----------------------+
+        |   Identity Provider  |  (Kerberos KDC / SAML IdP / OIDC Provider / Auth0)
+        |   verifies you ONCE  |
+        +----------+-----------+
+                   | issues a portable proof (ticket / assertion / token)
+        +----------+-----------+-----------+
+        v          v           v           v
+    +-------+  +-------+   +--------+  +---------+
+    | App A |  | App B |   | SaaS C |  | API D   |
+    +-------+  +-------+   +--------+  +---------+
+       (each TRUSTS the IdP; none of them ever sees your password)
+    </pre>
+  </section>
+
+  <!-- ===================== 4. ANALOGY ===================== -->
+  <section id="analogy">
+    <h2>4. Real-World Analogy — The Hotel and the Festival</h2>
+
+    <p><strong>Passwords</strong> are like a house key you carry: prove possession, get in. But a copied key is as good as the original, and if a burglar photographs it, they can cut a duplicate — exactly like a phished password.</p>
+
+    <p><strong>Sessions/cookies</strong> are a hotel wristband. You show ID once at the front desk (login), they give you a wristband (session cookie), and for the rest of your stay the pool, gym, and bar just check the band instead of re-verifying your passport on every visit. Lose the wristband and whoever finds it can use the pool — which is why session hijacking is dangerous and why bands expire at checkout (session timeout).</p>
+
+    <p><strong>Kerberos</strong> is a theme park. At the gate you trade your ticket for a wristband (a Ticket-Granting Ticket). Each ride doesn't re-check your purchase; it checks a per-ride stamp the central booth issues from your wristband. The rides never see your credit card (your password) — only short-lived stamps.</p>
+
+    <p><strong>SAML / OIDC SSO</strong> is the airport. Your government issued a passport (the Identity Provider). Airlines, duty-free, and lounges (the apps) don't run their own background checks — they trust the passport. Show it once and a boarding pass gets you through many gates. <strong>OAuth</strong> is valet parking: you hand over a <em>valet key</em> that starts the car and opens the doors but won't open the trunk or glovebox — limited, scoped, revocable access, <em>without</em> giving away your master key (your password).</p>
+
+    <p><strong>Passkeys</strong> are a tamper-proof, biometric-locked ID that, by law, can never be photocopied and only works at the genuine counter — wave a fake counter at it and it refuses. That "refuses the fake counter" property is what makes passkeys un-phishable.</p>
+  </section>
+
+  <!-- ===================== 5. INTERNAL WORKING ===================== -->
+  <section id="internals">
+    <h2>5. Internal Working — How Each Mechanism Actually Functions</h2>
+
+    <h3>5.1 Plaintext &amp; hashed passwords</h3>
+    <p>A <strong>plaintext</strong> store keeps <code>alice : hunter2</code> literally on disk. Login = string compare. The fatal flaw: anyone who reads the file (a leak, a backup, a rogue admin) instantly knows everyone's password — and people reuse passwords, so one leak cascades everywhere.</p>
+    <p>A <strong>hash</strong> is a one-way function: easy to compute <code>H(password)</code>, computationally infeasible to invert. We store the hash, never the password. At login we hash the submitted value and compare hashes. But two more attacks remain: (1) identical passwords produce identical hashes, letting attackers spot reuse and precompute <em>rainbow tables</em>; the fix is a <strong>salt</strong> — a unique random value mixed in per user so <code>H(salt + password)</code> differs even for the same password. (2) Fast hashes (MD5, SHA-256) let attackers try billions of guesses per second; the fix is a <strong>slow, memory-hard</strong> hash (bcrypt, scrypt, Argon2) with a tunable cost factor, deliberately making each guess expensive.</p>
+
+    <pre class="diagram">
+ REGISTER:  password --+--> [ Argon2(salt, cost) ] --> store {salt, hash}
+                        |
+ LOGIN:     attempt ----+--> [ Argon2(stored salt, cost) ] --> compare == stored hash?
+                                                                 |
+                                                       constant-time compare (no timing leak)
+    </pre>
+
+    <h3>5.2 LDAP &amp; directory services / Active Directory</h3>
+    <p>A <strong>directory</strong> is a hierarchical, read-optimized database of "things in an org": users, groups, computers, printers. <strong>LDAP</strong> (Lightweight Directory Access Protocol, 1993) is the network protocol to query it. Entries are named by a <strong>Distinguished Name (DN)</strong> like <code>cn=alice,ou=eng,dc=acme,dc=com</code> — read right-to-left like a path. To authenticate, a client performs an LDAP <strong>bind</strong>: it sends the DN and password; the server verifies them against the stored credential. <strong>Active Directory (AD)</strong> is Microsoft's directory product — it speaks LDAP <em>and</em> Kerberos and DNS, and is the backbone of nearly every corporate Windows network. Auth0 connects to AD/LDAP via the <em>AD/LDAP Connector</em> so enterprise users keep their existing corporate credentials.</p>
+
+    <h3>5.3 Kerberos — tickets and the KDC</h3>
+    <p>Kerberos solves "log in once, access many services, and never send the password over the wire after that". The trusted third party is the <strong>Key Distribution Center (KDC)</strong>, with two halves: the <strong>Authentication Server (AS)</strong> and the <strong>Ticket-Granting Server (TGS)</strong>. Everything rests on symmetric encryption and the assumption that the KDC shares a secret key with every principal.</p>
+    <pre class="diagram">
+  CLIENT                    KDC                          SERVICE (e.g. file server)
+    |   1. AS-REQ (I am alice) |                                   |
+    |------------------------->|  AS checks alice exists           |
+    |   2. AS-REP: TGT +       |  encrypts TGT with KDC key,       |
+    |      session key (enc.)  |  session key with alice's key     |
+    |<-------------------------|                                   |
+    |   3. TGS-REQ: TGT + "I   |                                   |
+    |      want fileserver"    |                                   |
+    |------------------------->|  TGS validates TGT                |
+    |   4. TGS-REP: SERVICE    |                                   |
+    |      TICKET (enc. w/ svc |                                   |
+    |      key) + new sess key |                                   |
+    |<-------------------------|                                   |
+    |   5. AP-REQ: service ticket + authenticator                  |
+    |------------------------------------------------------------->|
+    |   6. (optional) mutual auth reply                            |
+    |<-------------------------------------------------------------|
+   The password is used ONCE (step 2 decryption) and never transmitted.
+   Tickets are time-stamped & short-lived => stolen ticket expires fast.
+    </pre>
+
+    <h3>5.4 Cookies &amp; server-side sessions</h3>
+    <p>HTTP is <strong>stateless</strong>: each request is independent, so the server forgets you instantly. To stay "logged in", on successful login the server creates a <strong>session</strong> (a server-side record keyed by a random <strong>session ID</strong>) and sends that ID to the browser in a <code>Set-Cookie</code> header. The browser returns the cookie on every subsequent request; the server looks up the session and knows it's you. The cookie holds only an <em>opaque random ID</em> — not your identity data — so stealing it grants access only until it expires or is revoked server-side.</p>
+
+    <h3>5.5 SAML &amp; web SSO</h3>
+    <p><strong>SAML</strong> (Security Assertion Markup Language, 2.0 in 2005) is XML-based browser SSO between organizations. Three roles: the <strong>Service Provider (SP)</strong> = the app, the <strong>Identity Provider (IdP)</strong> = where you log in, and the <strong>user</strong> in a browser. The IdP issues a signed XML <strong>assertion</strong> ("this is alice, here are her attributes"), and the SP trusts it because it verifies the IdP's signature against a pre-exchanged certificate.</p>
+    <pre class="diagram">
+  Browser            SP (app)                 IdP (Auth0 / Okta / ADFS)
+    | GET /app          |                         |
+    |------------------>| 302 + SAML AuthnRequest |
+    |<------------------|                         |
+    | redirect w/ request ---------------------->|  user logs in here
+    |                                            |  IdP builds SIGNED assertion
+    |<------ 302 back to SP w/ SAMLResponse ------|
+    | POST SAMLResponse |                         |
+    |------------------>| verify signature, read  |
+    |                   | assertion -> set session|
+    |<-- app content ---|                         |
+    </pre>
+
+    <h3>5.6 OAuth 1.0 → 2.0</h3>
+    <p>OAuth solves <em>delegated authorization</em>: let app X act on your behalf at service Y <strong>without giving X your Y password</strong>. <strong>OAuth 1.0</strong> (community spec 2007; formalized as RFC 5849 in 2010) worked but required every request to be cryptographically signed by the client — painful and error-prone. <strong>OAuth 2.0</strong> (RFC 6749, 2012) dropped per-request signing in favor of TLS for transport security and <strong>bearer tokens</strong>, and introduced multiple <em>grant types</em> (flows) for different app types. The dominant flow today is <strong>Authorization Code + PKCE</strong>.</p>
+    <pre class="diagram">
+  USER     CLIENT APP        AUTH SERVER          RESOURCE API
+   |  click "connect" |           |                    |
+   |----------------->| redirect to /authorize         |
+   |                  |---------->| user consents       |
+   |                  |<----------| 302 ?code=abc       |
+   |                  | POST /token (code + PKCE verif) |
+   |                  |---------->|                     |
+   |                  |<----------| access_token        |
+   |                  | GET /data (Bearer access_token) |
+   |                  |------------------------------->|
+   |                  |<-------------------------------|  data
+    </pre>
+
+    <h3>5.7 OpenID Connect &amp; JWT</h3>
+    <p>OAuth 2.0 grants <em>access</em> but deliberately says nothing standardized about <em>who the user is</em>. <strong>OpenID Connect (OIDC, 2014)</strong> is a thin identity layer on top of OAuth 2.0. It adds: an <strong>ID Token</strong> (a JWT describing the authenticated user), a standard <code>/userinfo</code> endpoint, and a discovery document at <code>/.well-known/openid-configuration</code>. A <strong>JWT</strong> (JSON Web Token) is three Base64URL parts — <code>header.payload.signature</code> — where the payload carries <em>claims</em> (<code>sub</code>, <code>iss</code>, <code>aud</code>, <code>exp</code>) and the signature lets any party verify the token wasn't tampered with, without calling back to the issuer.</p>
+    <pre class="diagram">
+   eyJhbGciOiJSUzI1NiJ9 . eyJzdWIiOiJhbGljZSIsImV4cCI6.. . SIGNATURE
+   |__ HEADER (alg,typ) _|  |____ PAYLOAD (claims) _______|  |_ verifies _|
+        which algorithm          who (sub), issuer (iss),       integrity
+                                 audience (aud), expiry (exp)
+    </pre>
+
+    <h3>5.8 MFA / 2FA &amp; passwordless</h3>
+    <p><strong>MFA</strong> requires proof from two or more <em>different</em> factor categories. Common second factors: <strong>TOTP</strong> (a 6-digit code derived from a shared secret + the current 30-second time window, per RFC 6238), <strong>push</strong> approval, and <strong>SMS OTP</strong> (weakest — vulnerable to SIM swap). <strong>Passwordless</strong> removes the knowledge factor entirely: a <strong>magic link</strong> emails you a one-time URL, or an <strong>OTP</strong> texts/emails a one-time code — the channel itself proves possession.</p>
+
+    <h3>5.9 Passkeys, FIDO2, WebAuthn</h3>
+    <p>This is the endgame. <strong>WebAuthn</strong> (the browser/W3C API) plus <strong>CTAP</strong> (device protocol) together form <strong>FIDO2</strong>. On registration, your device generates a <strong>public/private key pair</strong> scoped to that exact site's domain. The <em>private key never leaves the device</em>; only the public key is registered with the server. To log in, the server sends a random <strong>challenge</strong>; the device signs it with the private key after a local biometric/PIN check; the server verifies the signature with the stored public key. Because the key is bound to the real origin, a phishing site (wrong domain) cannot trigger a valid signature — that <strong>origin binding</strong> is why passkeys are <em>un-phishable</em>. A <strong>passkey</strong> is simply a FIDO2 credential that syncs across your devices (via iCloud Keychain, Google Password Manager, etc.).</p>
+    <pre class="diagram">
+  REGISTER:  device generates {private (stays), public (sent)} for origin=acme.com
+             server stores public key for alice
+
+  LOGIN:     server --> random challenge -->
+             device: verify origin == acme.com? user biometric OK?
+                     sign(challenge) with private key
+             <-- signed challenge --
+             server verifies signature with stored public key  => logged in
+             (fake-phish.com challenge is REFUSED: origin mismatch)
+    </pre>
+  </section>
+
+  <!-- ===================== 6. CODE WALKTHROUGH ===================== -->
+  <section id="walkthrough">
+    <h2>6. Code Walkthrough — Watch Each Era in Real Code</h2>
+
+    <h3>6.1 The bad old days: plaintext (NEVER ship this)</h3>
+    <pre><code class="language-java">// ANTI-PATTERN — shown only so you can recognize and reject it.
+if (submittedPassword.equals(user.getPlainPassword())) {   // stored in cleartext
+    grantAccess();   // one DB leak compromises every user, everywhere they reuse it
+}</code></pre>
+
+    <h3>6.2 The fix: salted, slow hashing (Spring Boot, BCrypt/Argon2)</h3>
+    <pre><code class="language-java">import org.springframework.security.crypto.argon2.Argon2PasswordEncoder;
+
+// cost-tuned, salt is generated &amp; embedded automatically inside the hash string
+PasswordEncoder enc = Argon2PasswordEncoder.defaultsForSpringSecurity_v5_8();
+
+String stored = enc.encode("hunter2");
+// $argon2id$v=19$m=16384,t=2,p=1$&lt;salt&gt;$&lt;hash&gt;  -- salt &amp; params travel WITH the hash
+
+boolean ok = enc.matches("hunter2", stored);  // constant-time compare under the hood
+</code></pre>
+
+    <h3>6.3 Cookies &amp; server-side sessions (Node.js + Express)</h3>
+    <pre><code class="language-javascript">import express from "express";
+import session from "express-session";
+
+const app = express();
+app.use(session({
+  secret: process.env.SESSION_SECRET,   // signs the cookie so it can't be forged
+  resave: false, saveUninitialized: false,
+  cookie: { httpOnly: true, secure: true, sameSite: "lax", maxAge: 3600_000 }
+  //        ^JS can't read   ^HTTPS only  ^CSRF defense   ^1h expiry
+}));
+
+app.post("/login", (req, res) =&gt; {
+  // ...verify password against the Argon2 hash above...
+  req.session.userId = user.id;          // server-side state; cookie holds only the ID
+  res.send("logged in");
+});
+
+app.get("/me", (req, res) =&gt; {
+  if (!req.session.userId) return res.status(401).send("nope");
+  res.json({ userId: req.session.userId });
+});</code></pre>
+
+    <h3>6.4 Decoding &amp; verifying a JWT / OIDC ID token (FastAPI + python-jose)</h3>
+    <pre><code class="language-python">from fastapi import FastAPI, Header, HTTPException
+from jose import jwt
+import httpx
+
+app = FastAPI()
+ISSUER   = "https://YOUR_TENANT.us.auth0.com/"
+AUDIENCE = "https://api.myapp.com"
+JWKS     = httpx.get(f"{ISSUER}.well-known/jwks.json").json()  # public signing keys
+
+@app.get("/secure")
+def secure(authorization: str = Header(...)):
+    token = authorization.removeprefix("Bearer ").strip()
+    try:
+        claims = jwt.decode(
+            token, JWKS, algorithms=["RS256"],
+            audience=AUDIENCE, issuer=ISSUER,   # verifies signature + aud + iss + exp
+        )
+    except Exception:
+        raise HTTPException(401, "invalid token")
+    return {"hello": claims["sub"]}            # sub = the verified user id</code></pre>
+
+    <h3>6.5 Triggering an OIDC login with Auth0 (React SPA, Authorization Code + PKCE)</h3>
+    <pre><code class="language-jsx">import { Auth0Provider, useAuth0 } from "@auth0/auth0-react";
+
+// PKCE is handled for you; no client secret lives in the browser.
+&lt;Auth0Provider
+  domain="YOUR_TENANT.us.auth0.com"
+  clientId="YOUR_SPA_CLIENT_ID"
+  authorizationParams={{ redirect_uri: window.location.origin,
+                         audience: "https://api.myapp.com" }}&gt;
+  &lt;App /&gt;
+&lt;/Auth0Provider&gt;
+
+function LoginButton() {
+  const { loginWithRedirect, logout, user, isAuthenticated } = useAuth0();
+  return isAuthenticated
+    ? &lt;button onClick={() =&gt; logout()}&gt;Hi {user.name} — log out&lt;/button&gt;
+    : &lt;button onClick={() =&gt; loginWithRedirect()}&gt;Log in&lt;/button&gt;;
+}</code></pre>
+
+    <h3>6.6 Next.js (App Router) — server-side session via the Auth0 SDK</h3>
+    <pre><code class="language-javascript">// middleware.js — mounts /auth/login, /auth/logout, /auth/callback
+import { auth0 } from "./lib/auth0";
+export async function middleware(request) { return auth0.middleware(request); }
+
+// app/page.jsx — read the verified session on the server
+import { auth0 } from "@/lib/auth0";
+export default async function Home() {
+  const session = await auth0.getSession();
+  return session
+    ? &lt;p&gt;Welcome {session.user.name}&lt;/p&gt;
+    : &lt;a href="/auth/login"&gt;Log in&lt;/a&gt;;
+}</code></pre>
+
+    <h3>6.7 The raw OAuth/OIDC token exchange — curl</h3>
+    <pre><code class="language-bash"># Exchange an authorization code for tokens (Authorization Code flow).
+curl -X POST "https://YOUR_TENANT.us.auth0.com/oauth/token" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "grant_type": "authorization_code",
+    "client_id": "YOUR_CLIENT_ID",
+    "client_secret": "YOUR_CLIENT_SECRET",
+    "code": "AUTH_CODE_FROM_REDIRECT",
+    "code_verifier": "PKCE_VERIFIER",
+    "redirect_uri": "https://myapp.com/callback"
+  }'
+# -> { "access_token":"...", "id_token":"eyJ...", "expires_in":86400, "token_type":"Bearer" }</code></pre>
+
+    <h3>6.8 Calling a protected API with the bearer token — curl &amp; Postman</h3>
+    <pre><code class="language-bash">curl https://api.myapp.com/secure \
+  -H "Authorization: Bearer eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9..."</code></pre>
+    <div class="callout tip"><span class="tag">Postman</span><p>In Postman, open the <strong>Authorization</strong> tab → type <strong>OAuth 2.0</strong> → "Get New Access Token". Fill Auth URL <code>/authorize</code>, Token URL <code>/oauth/token</code>, your Client ID, scope <code>openid profile email</code>, and audience. Postman runs the browser flow for you and injects the resulting <code>Bearer</code> token into every request — perfect for testing Auth0-protected APIs without writing code.</p></div>
+  </section>
+
+  <!-- ===================== 7. PRACTICAL IMPLEMENTATION ===================== -->
+  <section id="practical">
+    <h2>7. Practical Implementation — Choosing the Right Era for the Job</h2>
+    <p>You will rarely implement these from scratch — but you must know which to pick. Use this decision guide:</p>
+    <table>
+      <thead><tr><th>Your situation</th><th>Right tool today</th><th>Why</th></tr></thead>
+      <tbody>
+        <tr><td>Storing local passwords yourself</td><td>Argon2id (or bcrypt) + per-user salt</td><td>Slow, memory-hard, salted — defeats offline cracking.</td></tr>
+        <tr><td>SPA / mobile app login</td><td>OIDC Authorization Code + PKCE</td><td>No secret in the client; industry standard; what Auth0 SDKs use.</td></tr>
+        <tr><td>Server-to-server / daemon</td><td>OAuth 2.0 Client Credentials</td><td>No user present; app authenticates as itself.</td></tr>
+        <tr><td>Enterprise customer with AD/Okta</td><td>SAML or OIDC federation</td><td>They keep their own IdP; you trust their assertions.</td></tr>
+        <tr><td>Reduce password risk</td><td>MFA, then passkeys</td><td>Adds possession/inherence factors; passkeys are un-phishable.</td></tr>
+        <tr><td>Frictionless consumer login</td><td>Passwordless (magic link / OTP) or passkeys</td><td>No password to forget, reuse, or leak.</td></tr>
+      </tbody>
+    </table>
+    <div class="callout note"><span class="tag">Note</span><p>The practical superpower of Auth0 is that <em>all</em> of these are toggles and connections in one dashboard. You configure the protocol; Auth0 implements the decades of cryptography and edge cases correctly.</p></div>
+  </section>
+
+  <!-- ===================== 8. PRODUCTION ARCHITECTURE ===================== -->
+  <section id="architecture">
+    <h2>8. Production Architecture — How It All Fits Together</h2>
+    <pre class="diagram">
+                          +-----------------------------------+
+   Browser / SPA  ------->|     Auth0 (Identity Provider)     |
+   Mobile app     ------->|  - password DB (Argon2 hashes)    |
+   Enterprise SSO ------->|  - social / SAML / OIDC federation |
+                          |  - MFA engine, passkeys (WebAuthn) |
+                          |  - issues OIDC ID + OAuth access   |
+                          +------------------+----------------+
+                                             | tokens (JWT)
+            +-------------------+------------+------------+----------------+
+            v                   v                         v                v
+      +-----------+      +-------------+          +-------------+   +-------------+
+      |  Web app  |      |  Mobile     |          |  API gateway|   |  Microsvc   |
+      | (session  |      |  (token in  |          | validates   |   | trusts JWT  |
+      |  cookie)  |      |  secure     |          | JWT sig/aud |   | claims      |
+      +-----------+      |  storage)   |          | /exp/scope  |   +-------------+
+                         +-------------+          +-------------+
+        Frontends authenticate users; backends VERIFY the JWT on every request.
+        Auth0 holds the secrets; your services hold only PUBLIC verification keys.
+    </pre>
+    <p>The architectural principle distilled from 60 years of history: <strong>centralize the proof, distribute the trust</strong>. One hardened identity provider verifies users (so you don't reinvent password hashing, MFA, and SAML six times); every downstream service merely <em>verifies a signed token</em> using public keys it already trusts. That is precisely the SSO model the timeline kept reaching for.</p>
+  </section>
+
+  <!-- ===================== 9. SECURITY ANALYSIS ===================== -->
+  <section id="security">
+    <h2>9. Security Analysis — The Attacks That Drove Each Step</h2>
+    <table>
+      <thead><tr><th>Era</th><th>Primary attack</th><th>Defense it forced</th></tr></thead>
+      <tbody>
+        <tr><td>Plaintext</td><td>Database / backup theft = total compromise</td><td>Hashing</td></tr>
+        <tr><td>Fast hash</td><td>Rainbow tables, GPU brute force</td><td>Salt + slow/memory-hard hash (Argon2)</td></tr>
+        <tr><td>Passwords</td><td>Phishing, credential stuffing, reuse</td><td>MFA</td></tr>
+        <tr><td>Sessions/cookies</td><td>Session hijacking, XSS theft, CSRF</td><td><code>HttpOnly</code>, <code>Secure</code>, <code>SameSite</code>, short TTL</td></tr>
+        <tr><td>SMS OTP</td><td>SIM swap, SS7 interception</td><td>App-based TOTP / push / WebAuthn</td></tr>
+        <tr><td>Bearer tokens</td><td>Token theft / replay</td><td>Short expiry, audience binding, refresh rotation, sender-constrained (DPoP/mTLS)</td></tr>
+        <tr><td>SAML</td><td>XML Signature Wrapping, unsigned assertions</td><td>Strict signature validation, signed responses</td></tr>
+        <tr><td>MFA (push)</td><td>MFA fatigue / prompt bombing</td><td>Number matching, passkeys (no prompt to spam)</td></tr>
+        <tr><td>All knowledge factors</td><td>Phishing (the universal weakness)</td><td>FIDO2/WebAuthn passkeys (origin-bound, un-phishable)</td></tr>
+      </tbody>
+    </table>
+    <div class="callout danger"><span class="tag">Danger</span><p>Phishing is the through-line. Almost every "modern" attack is some twist on tricking a human into revealing a phishable secret. Passkeys win because there is <em>no secret to reveal</em> — the private key never leaves the device and refuses fraudulent origins.</p></div>
+  </section>
+
+  <!-- ===================== 10. PERFORMANCE ===================== -->
+  <section id="performance">
+    <h2>10. Performance Considerations</h2>
+    <ul>
+      <li><strong>Password hashing is intentionally slow.</strong> Argon2/bcrypt cost factors must be tuned so login takes ~100–300 ms — fast enough for users, painful for crackers. Too high a cost lets attackers DoS your login endpoint; rate-limit it.</li>
+      <li><strong>Stateful sessions vs. stateless JWTs.</strong> Server sessions require a lookup (and shared store like Redis when you have many servers), but are instantly revocable. JWTs need <em>no</em> lookup — verify the signature locally and scale horizontally — but are valid until they expire, so revocation is harder. This trade-off (revocability vs. scalability) is a classic system-design interview topic.</li>
+      <li><strong>JWKS caching.</strong> Verify JWT signatures with cached public keys (JWKS); don't fetch keys per request. Cache them and refresh on key rotation (watch the <code>kid</code> header).</li>
+      <li><strong>Token size.</strong> JWTs travel in every request header — bloated custom claims add latency at scale. Keep payloads lean; fetch heavy profile data from <code>/userinfo</code> when needed.</li>
+      <li><strong>Passkey UX is fast.</strong> One biometric tap, no typing, no SMS round-trip — passkeys are typically the <em>fastest</em> login of all while being the most secure.</li>
+    </ul>
+  </section>
+
+  <!-- ===================== 11. COMMON MISTAKES ===================== -->
+  <section id="mistakes">
+    <h2>11. Common Mistakes</h2>
+    <div class="callout warn"><span class="tag">Warn</span><p><strong>Rolling your own crypto/auth.</strong> The single most expensive mistake. Six decades of subtle failures live in this chapter; use vetted libraries and providers like Auth0.</p></div>
+    <ul>
+      <li>Storing passwords with fast hashes (MD5/SHA-1/SHA-256) or — unforgivably — plaintext.</li>
+      <li>Forgetting per-user salts, enabling rainbow-table attacks.</li>
+      <li>Confusing <strong>authentication</strong> (who you are) with <strong>authorization</strong> (what you can do) — and using an OAuth <em>access token</em> as proof of <em>identity</em> (use the OIDC <em>ID token</em> for that).</li>
+      <li><strong>Not verifying the JWT signature</strong> (or accepting <code>alg: none</code>) — decoding is not verifying. Always validate signature, <code>iss</code>, <code>aud</code>, and <code>exp</code>.</li>
+      <li>Cookies missing <code>HttpOnly</code>/<code>Secure</code>/<code>SameSite</code>, exposing sessions to XSS and CSRF.</li>
+      <li>Relying on SMS OTP as a strong second factor (SIM swap).</li>
+      <li>Treating any single factor as "secure enough" against phishing.</li>
+      <li>Putting a client secret in a browser/SPA — use PKCE, never embed secrets in public clients.</li>
+    </ul>
+  </section>
+
+  <!-- ===================== 12. BEST PRACTICES ===================== -->
+  <section id="bestpractices">
+    <h2>12. Best Practices</h2>
+    <ul>
+      <li>Delegate identity to a dedicated provider (Auth0) instead of hand-rolling it.</li>
+      <li>Hash with <strong>Argon2id</strong> (or bcrypt), unique salt per user, tuned cost, constant-time compare.</li>
+      <li>Use <strong>OIDC Authorization Code + PKCE</strong> for user-facing apps; <strong>Client Credentials</strong> for machine-to-machine.</li>
+      <li>Always validate JWTs fully: signature (via JWKS), <code>iss</code>, <code>aud</code>, <code>exp</code>, and required scopes.</li>
+      <li>Set cookies <code>HttpOnly; Secure; SameSite=Lax</code>; keep sessions short and rotate on privilege change.</li>
+      <li>Enforce <strong>MFA</strong>; prefer <strong>passkeys/WebAuthn</strong> and push-with-number-matching over SMS.</li>
+      <li>Use short-lived access tokens with <strong>rotating refresh tokens</strong>; bind tokens to an audience.</li>
+      <li>Move consumers toward <strong>passwordless/passkeys</strong> to eliminate phishable secrets entirely.</li>
+    </ul>
+  </section>
+
+  <!-- ===================== 13. INTERVIEW QUESTIONS ===================== -->
+  <section id="interview">
+    <h2>13. Interview Questions (with Model Answers)</h2>
+
+    <h4>Q1. Why did we move from plaintext to salted, slow hashes?</h4>
+    <p><strong>Model answer:</strong> Plaintext means a single DB leak exposes every credential, and reuse spreads the damage to other sites. Hashing makes the stored value non-reversible. Salting defeats rainbow tables and hides reuse by making identical passwords hash differently. A slow, memory-hard function (Argon2/bcrypt) makes each brute-force guess expensive, so even leaked hashes resist offline cracking.</p>
+
+    <h4>Q2. Explain the difference between authentication and authorization, and which token carries which.</h4>
+    <p><strong>Model answer:</strong> Authentication proves <em>who</em> you are; authorization decides <em>what</em> you may do. In OIDC, the <strong>ID token</strong> (a JWT) answers authentication — it describes the user. The <strong>access token</strong> (OAuth) answers authorization — it grants scoped access to an API. Using an access token to identify a user is a classic mistake.</p>
+
+    <h4>Q3. How does Kerberos avoid sending the password over the network repeatedly?</h4>
+    <p><strong>Model answer:</strong> The password is only used locally to decrypt the AS reply once. After that the client holds a Ticket-Granting Ticket and session keys; for each service it obtains a short-lived service ticket from the TGS. Tickets are time-stamped and encrypted with keys the client never sees, so the password itself never traverses the wire after initial login, and stolen tickets expire quickly.</p>
+
+    <h4>Q4. Why was OAuth 2.0 created, and how does it differ from OAuth 1.0?</h4>
+    <p><strong>Model answer:</strong> OAuth solves delegated access without sharing passwords. OAuth 1.0 required cryptographically signing every request — secure but hard to implement correctly. OAuth 2.0 relies on TLS for transport security and uses bearer tokens plus distinct grant types for different client types, dramatically simplifying adoption. The trade-off is that bearer tokens must be protected in transit and given short lifetimes.</p>
+
+    <h4>Q5. Stateful sessions vs. stateless JWTs — when do you choose each?</h4>
+    <p><strong>Model answer:</strong> Sessions are server-side, easy to revoke instantly, but need a shared store to scale and a lookup per request. JWTs are self-contained — verify locally, scale horizontally with no central lookup — but are valid until expiry, making revocation harder (mitigated with short TTLs, refresh-token rotation, and denylists). Choose sessions when instant revocation matters most; choose JWTs for stateless, distributed APIs.</p>
+
+    <h4>Q6. Why are passkeys considered un-phishable when passwords and even MFA are not?</h4>
+    <p><strong>Model answer:</strong> A passkey is a private key bound to a specific origin (domain) and stored on the device; it never transmits a reusable secret. Authentication is a challenge-response signed locally after a biometric/PIN check. A phishing site has a different origin, so the authenticator refuses to produce a valid signature. There is no code to read aloud, no secret to type into a fake page — removing the human-in-the-loop weakness that phishing exploits.</p>
+
+    <h4>Q7. What must a backend validate before trusting a JWT?</h4>
+    <p><strong>Model answer:</strong> The signature (using the issuer's public key from JWKS, with the expected algorithm — never <code>none</code>), the issuer (<code>iss</code>), the audience (<code>aud</code>) so a token for another API is rejected, the expiry (<code>exp</code>) and not-before (<code>nbf</code>), and any required scopes/permissions for the operation.</p>
+  </section>
+
+  <!-- ===================== 14. CERTIFICATION TIPS ===================== -->
+  <section id="cert">
+    <h2>14. Certification Tips</h2>
+    <div class="callout tip"><span class="tag">Tip</span><p>The Auth0/Okta certification exams love precise vocabulary. Lock these in:</p></div>
+    <ul>
+      <li><strong>IdP vs SP</strong> (SAML), <strong>Authorization Server vs Resource Server</strong> (OAuth) — know who plays which role.</li>
+      <li>OAuth defines <em>authorization</em>; <strong>OIDC adds the identity layer</strong> (ID token, <code>/userinfo</code>, discovery).</li>
+      <li>Remember the grant types: <strong>Authorization Code + PKCE</strong> (web/SPA/native), <strong>Client Credentials</strong> (M2M). Implicit and ROPC are legacy/discouraged.</li>
+      <li>ID token = identity; access token = API access; refresh token = get new tokens silently.</li>
+      <li>Auth0 <strong>Connections</strong> map to history: Database (passwords), Social (OAuth), Enterprise (SAML/OIDC/AD-LDAP), Passwordless, Passkeys.</li>
+      <li>Know standard JWT claims (<code>iss, sub, aud, exp, iat, nbf, jti</code>) and that <code>RS256</code> (asymmetric) is preferred over <code>HS256</code> for distributed verification.</li>
+    </ul>
+  </section>
+
+  <!-- ===================== 15. HANDS-ON EXERCISES ===================== -->
+  <section id="exercises">
+    <h2>15. Hands-On Exercises</h2>
+    <ol>
+      <li>Hash the same password twice with bcrypt/Argon2 and confirm the two outputs differ — then explain why (the salt).</li>
+      <li>Paste any JWT into a decoder (or split it on <code>.</code> and Base64URL-decode the first two parts) and identify <code>iss</code>, <code>aud</code>, <code>exp</code>, <code>sub</code>.</li>
+      <li>In Express, set a session cookie, then inspect it in DevTools → Application → Cookies. Toggle <code>HttpOnly</code> off and observe that <code>document.cookie</code> can now read it.</li>
+      <li>Use curl to hit a protected endpoint without a token (expect 401), then with a valid <code>Bearer</code> token (expect 200).</li>
+      <li>Register a passkey on a demo site like <code>webauthn.io</code> and watch the registration/authentication ceremonies in DevTools.</li>
+    </ol>
+  </section>
+
+  <!-- ===================== 16. ASSIGNMENT ===================== -->
+  <section id="assignment">
+    <h2>16. Assignment</h2>
+    <p>Write a one-page "evolution memo" addressed to a fictional CTO. For each technology in this chapter — plaintext, hashing, LDAP/AD, Kerberos, sessions, SAML, OAuth, OIDC, JWT, MFA, passwordless, passkeys — state in one sentence (a) what problem it solved and (b) what weakness made the <em>next</em> step necessary. End with a recommendation: which combination should a new 2026 consumer app adopt, and why. Constraint: justify every recommendation with a concrete attack it prevents.</p>
+  </section>
+
+  <!-- ===================== 17. MINI PROJECT ===================== -->
+  <section id="miniproject">
+    <h2>17. Mini Project — "Three Logins, One App"</h2>
+    <p>Build a tiny app (Node/Express + a React or plain-HTML frontend, or FastAPI) that demonstrates three eras side by side:</p>
+    <ol>
+      <li><strong>Era 1 — Local password:</strong> a <code>/register</code> + <code>/login</code> using Argon2 hashing and a server-side session cookie.</li>
+      <li><strong>Era 2 — Delegated (OIDC):</strong> add "Log in with Auth0" using the Authorization Code + PKCE flow; on callback, verify the ID token and start a session.</li>
+      <li><strong>Era 3 — Passwordless/passkey:</strong> enable a passwordless connection (email magic link or OTP) or a passkey in your Auth0 tenant and add it as a third button.</li>
+    </ol>
+    <p><strong>Deliverable:</strong> all three buttons land the user on the same <code>/dashboard</code> that prints the authenticated <code>sub</code>. In your README, explain which factors each path uses and which is most phishing-resistant. <em>Stretch:</em> protect a <code>/api/secure</code> endpoint that validates the JWT (signature + <code>aud</code> + <code>exp</code>).</p>
+  </section>
+
+  <!-- ===================== 18. QUIZ ===================== -->
+  <section id="quiz">
+    <h2>18. Quiz — 22 Questions</h2>
+    <ol>
+      <li>Name the three categories of authentication factors.</li>
+      <li>What does a salt prevent that a plain hash does not?</li>
+      <li>Why is Argon2/bcrypt preferred over SHA-256 for passwords?</li>
+      <li>Expand LDAP and give one example of a Distinguished Name.</li>
+      <li>What protocol(s) does Active Directory speak beyond LDAP?</li>
+      <li>In Kerberos, what are the two components of the KDC?</li>
+      <li>What is a Ticket-Granting Ticket (TGT) used for?</li>
+      <li>Why did the stateless nature of HTTP make cookies necessary?</li>
+      <li>What does a session cookie actually contain — and what does the server store?</li>
+      <li>List three security attributes you should set on a session cookie.</li>
+      <li>In SAML, what do SP and IdP stand for?</li>
+      <li>What format is a SAML assertion, and how does the SP trust it?</li>
+      <li>What problem does OAuth solve that passwords sharing could not?</li>
+      <li>Name the key difference between OAuth 1.0 and OAuth 2.0.</li>
+      <li>Which OAuth flow is recommended for SPAs and native apps?</li>
+      <li>What does OpenID Connect add on top of OAuth 2.0?</li>
+      <li>Name the three parts of a JWT.</li>
+      <li>Which JWT claims must a backend validate?</li>
+      <li>Differentiate the ID token from the access token.</li>
+      <li>Why is SMS OTP considered a weaker second factor?</li>
+      <li>What makes passkeys (FIDO2/WebAuthn) un-phishable?</li>
+      <li>In a passkey, what is registered with the server — and what never leaves the device?</li>
+    </ol>
+
+    <details>
+      <summary>Show answer key</summary>
+      <ol>
+        <li>Something you know, something you have, something you are.</li>
+        <li>Identical passwords hashing to identical values; it defeats precomputed rainbow tables and hides reuse.</li>
+        <li>They are deliberately slow and memory-hard with a tunable cost, so brute-forcing leaked hashes is expensive; SHA-256 is too fast.</li>
+        <li>Lightweight Directory Access Protocol; e.g. <code>cn=alice,ou=eng,dc=acme,dc=com</code>.</li>
+        <li>Kerberos and DNS (it is a full directory + auth stack).</li>
+        <li>The Authentication Server (AS) and the Ticket-Granting Server (TGS).</li>
+        <li>To obtain per-service tickets from the TGS without re-entering the password.</li>
+        <li>HTTP forgets state between requests, so a token (cookie) is needed to keep the user "logged in".</li>
+        <li>The cookie contains only an opaque random session ID; the server stores the actual session state keyed by that ID.</li>
+        <li><code>HttpOnly</code>, <code>Secure</code>, <code>SameSite</code> (plus a sensible <code>maxAge</code>/expiry).</li>
+        <li>Service Provider (the app) and Identity Provider (where you authenticate).</li>
+        <li>Signed XML; the SP verifies the IdP's digital signature against a pre-shared certificate.</li>
+        <li>Delegated authorization — letting an app act on your behalf without giving it your password.</li>
+        <li>OAuth 1.0 signs every request cryptographically; OAuth 2.0 relies on TLS and uses bearer tokens with grant types.</li>
+        <li>Authorization Code with PKCE.</li>
+        <li>An identity layer: the ID token (JWT), the <code>/userinfo</code> endpoint, and discovery metadata.</li>
+        <li>Header, payload (claims), and signature.</li>
+        <li>Signature (via JWKS), <code>iss</code>, <code>aud</code>, <code>exp</code>/<code>nbf</code>, and required scopes — and reject <code>alg: none</code>.</li>
+        <li>ID token proves <em>who</em> the user is (authentication); access token grants scoped <em>access</em> to an API (authorization).</li>
+        <li>It is vulnerable to SIM swapping and SS7 interception, so possession of the number can be hijacked.</li>
+        <li>The credential is a private key bound to the site's origin; a phishing site has the wrong origin and cannot obtain a valid signature, and no reusable secret is ever transmitted.</li>
+        <li>The public key is registered with the server; the private key never leaves the device.</li>
+      </ol>
+    </details>
+  </section>
+
+  <!-- ===================== 19. CHEAT SHEET ===================== -->
+  <section id="cheatsheet">
+    <h2>19. Cheat Sheet</h2>
+    <table>
+      <thead><tr><th>Concept</th><th>One-line memory hook</th></tr></thead>
+      <tbody>
+        <tr><td>Hash + salt</td><td>One-way + per-user randomness; use Argon2id/bcrypt, slow on purpose.</td></tr>
+        <tr><td>LDAP / AD</td><td>Central directory of users/devices; <code>bind</code> = authenticate; AD adds Kerberos.</td></tr>
+        <tr><td>Kerberos</td><td>KDC = AS + TGS; TGT → service tickets; password used once, never on the wire.</td></tr>
+        <tr><td>Session cookie</td><td>Opaque ID in browser; real state on server; <code>HttpOnly+Secure+SameSite</code>.</td></tr>
+        <tr><td>SAML</td><td>SP ↔ IdP, signed XML assertion, browser-redirect enterprise SSO.</td></tr>
+        <tr><td>OAuth 2.0</td><td>Delegated <em>access</em>; bearer tokens; Auth Code + PKCE / Client Credentials.</td></tr>
+        <tr><td>OIDC</td><td>OAuth + identity = ID token (JWT) + <code>/userinfo</code> + discovery.</td></tr>
+        <tr><td>JWT</td><td><code>header.payload.signature</code>; verify sig + <code>iss/aud/exp</code>.</td></tr>
+        <tr><td>MFA</td><td>Two different factor types; TOTP/push &gt; SMS.</td></tr>
+        <tr><td>Passwordless</td><td>Magic link / OTP; possession of the channel = proof.</td></tr>
+        <tr><td>Passkey / FIDO2</td><td>Origin-bound key pair; private key stays on device; un-phishable.</td></tr>
+      </tbody>
+    </table>
+    <pre class="diagram">
+ PICK-A-FLOW QUICK MAP
+ ---------------------------------------------------------------
+ SPA / mobile / web app .......... OIDC Authorization Code + PKCE
+ server-to-server / cron / API ... OAuth 2.0 Client Credentials
+ enterprise customer w/ own IdP .. SAML or OIDC federation
+ reduce account takeover ......... MFA -> passkeys
+ frictionless consumer login ..... passwordless / passkeys
+    </pre>
+  </section>
+
+  <!-- ===================== 20. KEY TAKEAWAYS ===================== -->
+  <section id="takeaways">
+    <h2>20. Key Takeaways</h2>
+    <div class="callout key"><span class="tag">Key</span><p>Authentication history is a chain of <strong>break → fix → new break</strong>. Each technology exists because the previous one failed against a specific attack — usually some form of secret theft or phishing.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p>Two engines drive everything: making proof <strong>harder to steal</strong> (passwords → MFA → passkeys) and making proof <strong>reusable across systems without sharing the secret</strong> (sessions → SSO → SAML → OAuth → OIDC).</p></div>
+    <div class="callout key"><span class="tag">Key</span><p><strong>AuthN ≠ AuthZ.</strong> OIDC ID tokens establish identity; OAuth access tokens grant scoped access. Never confuse the two, and always <em>verify</em> a JWT — decoding is not verifying.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p><strong>Passkeys are the destination.</strong> By binding a non-extractable private key to the real origin, they remove the phishable secret that every prior method depended on.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p>Auth0 is the modern embodiment of this whole timeline: one provider that correctly implements password hashing, SSO, SAML, OAuth, OIDC, MFA, passwordless, and passkeys — so you configure protocols instead of reinventing 60 years of security.</p></div>
+  </section>
+
+  <nav class="pager">
+    <a class="prev" href="chapter-01.html">← Previous</a>
+    <a class="next" href="chapter-03.html">Next →</a>
+  </nav>
+</main>
+<footer class="site-footer">Master Auth0 End-to-End · Chapter 2 of 32</footer>
+</body>
+</html>

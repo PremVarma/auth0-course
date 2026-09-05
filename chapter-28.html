@@ -1,0 +1,685 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 28 — Security Masterclass | Master Auth0</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">🔐 Master Auth0</a>
+  <nav class="topnav">
+    <a href="chapter-27.html">← Prev</a>
+    <a href="index.html">Contents</a>
+    <a href="chapter-29.html">Next →</a>
+  </nav>
+</header>
+<main class="container">
+  <div class="chapter-head">
+    <span class="phase">Phase 10 · Security</span>
+    <h1>Chapter 28 — Security Masterclass</h1>
+    <p class="lead">Every other chapter in this course taught you how to make authentication <em>work</em>. This one teaches you how to make it <em>fail safely under attack</em> — which is a completely different skill. An attacker does not care that your login page is pretty; they care about the one redirect parameter you forgot to validate, the JWT verifier that trusts the token's own <code>alg</code> header, the refresh token sitting in <code>localStorage</code> where any injected script can read it. In this masterclass we map the OWASP Top 10 onto identity, dissect the canonical OAuth and JWT attacks down to the byte level, build a STRIDE threat model for a real auth system, and write the defensive code — in Spring Boot, Node, React, Next.js, FastAPI, plus curl and Postman — that turns each theoretical attack into a non-event. We explain <strong>why</strong> each defense works before we show <strong>how</strong> to deploy it, because a defense you don't understand is a defense you'll eventually disable to "fix a bug."</p>
+  </div>
+
+  <!-- ============================================================= 1 -->
+  <section id="theory">
+    <h2>1. Theory — First Principles of Attacking Identity</h2>
+
+    <p>Security is not a feature you add; it is a property that emerges (or fails to emerge) from how your system handles <strong>trust boundaries</strong>. A trust boundary is any line across which data changes its trustworthiness — the browser/server line, the network/application line, the user/token line. Every vulnerability in this chapter lives exactly on such a boundary, where the code on one side assumed something about data that the code on the other side did not guarantee.</p>
+
+    <p>Three first-principles ideas govern everything that follows:</p>
+    <ol>
+      <li><strong>The attacker controls every input you do not explicitly control.</strong> The redirect URI in the query string, the <code>alg</code> field inside a JWT header, the <code>Origin</code> header, the <code>state</code> value coming back — if you did not generate it <em>and</em> verify it, treat it as hostile. This is the single mindset that prevents most identity bugs.</li>
+      <li><strong>Authentication is a claim; authorization is a decision.</strong> A token is just a <em>claim</em> ("I am Jane"). Whether Jane may delete invoice 482 is a <em>decision</em> your server must make on every request. Broken Access Control — OWASP's #1 risk — happens when systems treat the claim as the decision.</li>
+      <li><strong>Cryptographic verification must be a server-side decision, never a client-asserted fact.</strong> "Is this signature valid?" must be answered by code <em>you</em> wrote using a key <em>you</em> chose with an algorithm <em>you</em> pinned. The instant you let the token tell you how to verify it, you have lost.</li>
+    </ol>
+
+    <table>
+      <thead><tr><th>Term</th><th>First-principles meaning</th><th>Why it matters here</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Threat</strong></td><td>A potential negative event (token theft, account takeover)</td><td>What you defend against</td></tr>
+        <tr><td><strong>Vulnerability</strong></td><td>A weakness that makes a threat possible (no <code>state</code> check)</td><td>What you fix</td></tr>
+        <tr><td><strong>Exploit</strong></td><td>The concrete technique that turns a vuln into impact</td><td>What the attacker writes</td></tr>
+        <tr><td><strong>Attack surface</strong></td><td>The sum of all inputs an attacker can reach</td><td>What you minimize</td></tr>
+        <tr><td><strong>Defense in depth</strong></td><td>Multiple independent controls so one failure isn't fatal</td><td>Why you don't rely on any single check</td></tr>
+        <tr><td><strong>Blast radius</strong></td><td>The damage when a control <em>does</em> fail</td><td>Why you rotate keys, scope tokens, expire sessions</td></tr>
+      </tbody>
+    </table>
+
+    <div class="callout key"><span class="tag">Key</span><p>A secure auth system assumes <em>each layer will eventually be breached</em> and is designed so that no single breach yields account takeover. Short-lived access tokens limit the blast radius of token theft; refresh-token rotation limits the blast radius of refresh-token theft; MFA limits the blast radius of credential theft. Security is the art of shrinking blast radii.</p></div>
+  </section>
+
+  <!-- ============================================================= 2 -->
+  <section id="story">
+    <h2>2. Story-Based Explanation — The Night Helios Got Owned (Twice)</h2>
+    <p>It is 2:14 a.m. and you are the on-call engineer at <strong>Helios Analytics</strong>. PagerDuty fires: customer accounts are exporting data they shouldn't have. By sunrise you have reconstructed two separate, very ordinary attacks that together took over a finance admin's account.</p>
+    <p><strong>Attack one — the redirect.</strong> A phishing email sent the admin a link to the <em>real</em> Helios login URL — except the <code>redirect_uri</code> pointed at <code>helios.attacker-cdn.com</code>. Helios's Authorization Server had a sloppy allow-list that matched on <em>prefix</em>, so <code>https://helios.app.evil.com</code> passed. After a legitimate login, the authorization code was delivered straight to the attacker, who exchanged it for tokens. The admin saw nothing wrong; they logged into the real site.</p>
+    <p><strong>Attack two — the storage.</strong> Even with tokens, the attacker wanted persistence. Helios's SPA stored the <em>refresh token</em> in <code>localStorage</code>. A months-old XSS in a third-party charting widget let the attacker read it and mint fresh access tokens for weeks. Because refresh-token rotation was off, the stolen token never changed.</p>
+    <p>Neither bug was exotic. Neither required breaking cryptography. Each was a trust boundary the team <em>assumed</em> was safe: "the redirect comes from our own login, surely it's fine"; "localStorage is our own domain, surely it's private." The rest of this chapter is the set of habits that would have turned both 2 a.m. pages into nothing at all: strict exact-match redirect allow-lists, PKCE, refresh-token rotation with reuse detection, and tokens kept out of JavaScript's reach entirely.</p>
+    <div class="callout note"><span class="tag">Note</span><p>Real breaches are rarely Hollywood. They are a forgotten validation plus a default left on. The attacker's job is to find the one boundary you trusted without verifying. Your job, learned here, is to verify <em>every</em> boundary by reflex.</p></div>
+  </section>
+
+  <!-- ============================================================= 3 -->
+  <section id="diagrams">
+    <h2>3. ASCII Diagrams — The Attack Landscape</h2>
+
+    <h3>3.1 OWASP Top 10 (2021) mapped onto identity</h3>
+    <pre class="diagram">
+  OWASP 2021                       Identity-world manifestation
+  ───────────────────────────     ───────────────────────────────────────────
+  A01 Broken Access Control   ──▶  IDOR, missing scope/role checks, trusting
+                                   the token's claim as the authZ decision
+  A02 Cryptographic Failures  ──▶  weak/none JWT alg, secrets in code, no TLS,
+                                   tokens in localStorage / logs
+  A03 Injection               ──▶  XSS that steals tokens; SQLi in user store
+  A04 Insecure Design         ──▶  no rate limit on login, no MFA, no rotation
+  A05 Security Misconfig      ──▶  permissive CORS, prefix-match redirect_uri,
+                                   default admin creds, verbose error leaks
+  A06 Vulnerable Components   ──▶  outdated jose/jwt lib with alg-confusion CVE
+  A07 Identification &amp; Auth   ──▶  credential stuffing, brute force, weak
+      Failures                     session mgmt, session fixation, no MFA
+  A08 Software/Data Integrity ──▶  unsigned tokens trusted, supply-chain attack
+  A09 Logging &amp; Monitoring     ──▶  no anomaly detection, can't detect stuffing
+  A10 SSRF                    ──▶  open-redirect / JWKS-URL fetch abuse
+    </pre>
+
+    <h3>3.2 The authorization-code redirect attack (and where PKCE + state block it)</h3>
+    <pre class="diagram">
+  Victim Browser        Helios AS            Attacker
+      │                     │                    │
+      │ phished link with   │                    │
+      │ redirect_uri=EVIL ──┼──▶  ❌ EXACT-MATCH ALLOW-LIST rejects EVIL  (fix #1)
+      │                     │                    │
+      │ (if allow-list weak)│                    │
+      │  login OK, code ────┼───────────────────▶│  code stolen
+      │                     │                    │ POST /token  code+???
+      │                     │  ❌ PKCE: needs code_verifier attacker lacks (fix #2)
+      │                     │                    │  ➜ token exchange FAILS
+      │ CSRF on callback  ──┼──▶ ❌ state mismatch rejected               (fix #3)
+    </pre>
+
+    <h3>3.3 JWT verification: the trust boundary you must not cross</h3>
+    <pre class="diagram">
+   Incoming token ─▶ [ header.payload.signature ]
+                        │
+        ╔═══════════════╧════════════════════════════════════╗
+        ║  SERVER DECIDES (never the token):                  ║
+        ║   • algorithm = RS256   (PINNED — ignore hdr.alg)   ║
+        ║   • key       = JWKS by kid, from issuer you trust  ║
+        ║   • verify signature → then check claims:           ║
+        ║       iss ✓  aud ✓  exp ✓  nbf ✓  iat ✓  jti(replay)║
+        ╚════════════════════════════════════════════════════╝
+                        │ all pass?
+              ┌─────────┴──────────┐
+            YES                   NO
+         accept claim         reject (401) — log, no detail leak
+    </pre>
+
+    <h3>3.4 Refresh-token rotation with reuse detection (theft trap)</h3>
+    <pre class="diagram">
+   t0  client ── RT1 ──▶ AS   ✓  issues RT2, revokes RT1
+   t1  client ── RT2 ──▶ AS   ✓  issues RT3, revokes RT2
+                                    ⚠ THIEF also stole RT2 earlier
+   t2  thief  ── RT2 ──▶ AS   ✗  RT2 already used!  → REUSE DETECTED
+                              → revoke the ENTIRE token family (RT3 too)
+                              → force re-auth, alert user
+    </pre>
+  </section>
+
+  <!-- ============================================================= 4 -->
+  <section id="analogy">
+    <h2>4. Real-World Analogy — The Hotel Key-Card System</h2>
+    <p>A modern hotel is the perfect mental model for token security, because hotels solved these problems decades ago in the physical world.</p>
+    <ul>
+      <li><strong>The room key card = access token.</strong> It is short-lived (expires at checkout), scoped (opens <em>your</em> room and the gym, not the safe room), and it carries no password — losing it doesn't reveal your identity. This is exactly why we use short-lived, scoped access tokens instead of sending the password on every request.</li>
+      <li><strong>Your ID at the front desk = refresh token / login.</strong> Stronger, rarer to present, kept safe. You only show it to get <em>new</em> key cards. If a key card is stolen, the thief cannot make new ones without your ID. That is refresh-token separation.</li>
+      <li><strong>Re-coding the lock on each issue = refresh-token rotation.</strong> Good hotels invalidate the previous card whenever they print a new one. Hand back an old card and the lock blinks red — that red blink is <em>reuse detection</em>, and it tells the desk something is wrong.</li>
+      <li><strong>The "is this really our card?" check = signature verification.</strong> The lock trusts the hotel's secret coding, not whatever is printed on the plastic. A card that <em>says</em> "master key" in Sharpie still won't open the door — that is refusing to trust the token's self-described <code>alg</code>.</li>
+      <li><strong>Tailgating through the door behind a guest = session fixation / CSRF.</strong> Strong authentication at the desk is useless if anyone can slip through an unlocked side door. That is why we re-issue session IDs on login and require anti-CSRF tokens.</li>
+      <li><strong>Calling the desk to confirm a suspicious request = MFA.</strong> Even with a valid-looking ID, the desk calls your registered phone before changing the room on file. Phishing-resistant MFA is the call you cannot fake from across the world.</li>
+    </ul>
+    <div class="callout tip"><span class="tag">Tip</span><p>When you're unsure whether a design is safe, translate it into the hotel. "We store the master ID in the room's mini-bar" (localStorage) sounds obviously wrong the moment it's physical. The hotel test is a surprisingly reliable security smell-detector.</p></div>
+  </section>
+
+  <!-- ============================================================= 5 -->
+  <section id="internals">
+    <h2>5. Internal Working — Anatomy of the Canonical Attacks</h2>
+
+    <h3>5.1 JWT <code>alg:none</code> and algorithm confusion</h3>
+    <p>A JWT is three Base64URL parts: <code>header.payload.signature</code>. The header self-describes the algorithm. Two classic attacks abuse a verifier that <em>believes</em> that header:</p>
+    <ul>
+      <li><strong><code>alg:none</code>:</strong> The attacker sets <code>{"alg":"none"}</code>, edits the payload (<code>"role":"admin"</code>), and drops the signature entirely. A naive library that "supports" <code>none</code> accepts it because the token <em>says</em> no signature is needed.</li>
+      <li><strong>RS256 → HS256 confusion:</strong> Your server verifies RS256 with a <em>public</em> key. The attacker re-signs the token as HS256 using that public key <em>as the HMAC secret</em>. If your verifier picks the algorithm from the header and feeds it the RSA public key (which is, by definition, public), the HMAC check passes. You authenticated the attacker with your own public key.</li>
+    </ul>
+    <p>The fix is identical for both: the verifier must <strong>pin the expected algorithm(s)</strong> and never derive it from the token. Below, a deliberately broken verifier vs. a correct one.</p>
+    <pre><code class="language-js">// ❌ VULNERABLE — algorithm taken from the token header
+jwt.verify(token, key); // many libs infer alg from header → alg-confusion / none
+
+// ✅ SAFE — algorithm pinned by the server, key resolved from trusted JWKS
+jwt.verify(token, publicKey, {
+  algorithms: ['RS256'],          // pin! reject HS256, none, everything else
+  issuer:   'https://YOUR_TENANT.us.auth0.com/',
+  audience: 'https://api.helios.app',
+});
+</code></pre>
+
+    <h3>5.2 The OAuth mix-up attack</h3>
+    <p>When a client supports multiple identity providers, an attacker who controls one (malicious) IdP can trick the client into sending an authorization code minted by the <em>honest</em> IdP to the <em>attacker's</em> token endpoint, or vice-versa, because the client forgets <em>which</em> IdP a given response came from. The defense (RFC 9207) is the authorization server returning an <code>iss</code> parameter in the response, and the client verifying that the response's issuer matches the one it started the flow with — plus binding the per-flow <code>state</code> to the chosen provider.</p>
+
+    <h3>5.3 Session fixation</h3>
+    <p>The server hands an anonymous visitor a session ID. The attacker tricks the victim into authenticating <em>using that same, attacker-known session ID</em> (e.g., by planting it via a crafted link). After login, the server keeps the ID — now the attacker holds an authenticated session. The fix is one line of discipline: <strong>regenerate the session identifier at the moment of privilege change</strong> (login, MFA step-up). The pre-login ID becomes worthless.</p>
+
+    <h3>5.4 Replay attacks</h3>
+    <p>An attacker captures a valid message (a signed request, an OIDC <code>id_token</code>) and re-sends it. Signatures alone don't help — the replay is genuinely signed. Defenses bind the message to a single use or moment: short <code>exp</code>, a server-generated <code>nonce</code> the response must echo (OIDC <code>nonce</code>), and a unique <code>jti</code> the server records and refuses to accept twice within the token's lifetime.</p>
+
+    <h3>5.5 Where tokens leak</h3>
+    <pre class="diagram">
+   Token leakage channels (each is a separate trust boundary):
+     • URL / query string  → ends up in browser history, Referer, server logs
+     • localStorage        → readable by ANY script ⇒ XSS = token theft
+     • Referer header      → leaks token to third-party resources
+     • verbose logs / APM  → tokens printed in error traces
+     • browser back/cache  → cached pages with embedded tokens
+   Mitigations: tokens in HttpOnly+Secure+SameSite cookies OR in memory only,
+                never in URLs, scrub logs, set Referrer-Policy: no-referrer.
+    </pre>
+  </section>
+
+  <!-- ============================================================= 6 -->
+  <section id="walkthrough">
+    <h2>6. Code Walkthrough — Reading Attacks and Defenses</h2>
+
+    <h3>6.1 Exact-match redirect validation (defeats Attack One)</h3>
+    <pre><code class="language-python"># FastAPI authorization-server side: never prefix/substring match redirect_uri
+from urllib.parse import urlparse
+
+ALLOWED_REDIRECTS = {
+    "https://helios.app/callback",
+    "https://app.helios.com/auth/callback",
+}
+
+def validate_redirect_uri(uri: str) -> bool:
+    # ✅ exact string membership — NOT startswith(), NOT 'in', NOT regex prefix
+    return uri in ALLOWED_REDIRECTS
+# "https://helios.app.evil.com/callback" is NOT in the set → rejected
+</code></pre>
+    <p>Why exact match? Prefix matching (<code>startswith("https://helios.app")</code>) accepts <code>https://helios.app.evil.com</code>. Suffix matching accepts <code>https://evil.com/helios.app/callback</code>. Substring is worse still. Only full-string equality has no parsing ambiguity for an attacker to exploit.</p>
+
+    <h3>6.2 PKCE on the client (defeats stolen-code reuse)</h3>
+    <pre><code class="language-js">// PKCE: a per-request secret the client keeps, proving it started the flow
+import crypto from 'node:crypto';
+const b64url = (b) =&gt; b.toString('base64url');
+
+const verifier  = b64url(crypto.randomBytes(32));          // keep secret, client-side
+const challenge = b64url(crypto.createHash('sha256')
+                          .update(verifier).digest());      // sent in /authorize
+
+// /authorize?...&amp;code_challenge=CHALLENGE&amp;code_challenge_method=S256
+// /token  body includes code_verifier=VERIFIER
+// AS recomputes SHA256(verifier) and compares to the stored challenge.
+// A thief who steals only the CODE cannot complete /token without VERIFIER.
+</code></pre>
+
+    <h3>6.3 Anti-CSRF + state on the callback (defeats login CSRF / forced login)</h3>
+    <pre><code class="language-js">// Generate per-flow state, bind to the user's session, verify on return
+const state = crypto.randomBytes(16).toString('hex');
+req.session.oauthState = state;            // server-side, tied to this session
+// ...redirect to /authorize?...&amp;state=STATE
+
+// On /callback:
+if (req.query.state !== req.session.oauthState) {
+  return res.status(400).send('state mismatch — possible CSRF');
+}
+delete req.session.oauthState;             // single use
+</code></pre>
+
+    <h3>6.4 Constant-time secret comparison (defeats timing side-channels)</h3>
+    <pre><code class="language-js">import { timingSafeEqual } from 'node:crypto';
+function safeEqual(a, b) {
+  const ba = Buffer.from(a), bb = Buffer.from(b);
+  if (ba.length !== bb.length) return false;   // length leak acceptable here
+  return timingSafeEqual(ba, bb);              // no early-exit on first diff byte
+}
+// '===' on secrets leaks how many leading bytes matched via response time.
+</code></pre>
+    <div class="callout warn"><span class="tag">Warn</span><p>Notice every defense above is <em>small</em>. The hard part is never the code — it is remembering that the boundary exists. That is what threat modeling (Section 16/STRIDE below) systematizes so you don't rely on memory.</p></div>
+  </section>
+
+  <!-- ============================================================= 7 -->
+  <section id="practical">
+    <h2>7. Practical Implementation — Hardened Verification Across Stacks</h2>
+
+    <h3>7.1 Spring Boot — resource server with pinned alg, issuer, audience</h3>
+    <pre><code class="language-java">// application.yml
+// spring.security.oauth2.resourceserver.jwt.issuer-uri:
+//   https://YOUR_TENANT.us.auth0.com/
+
+@Configuration
+@EnableWebSecurity
+public class SecurityConfig {
+
+  @Value("${spring.security.oauth2.resourceserver.jwt.issuer-uri}")
+  String issuer;
+
+  @Bean
+  JwtDecoder jwtDecoder() {
+    // Loads JWKS from issuer; algorithm comes from the JWKS key type (RS256),
+    // NOT from the attacker-controlled token header.
+    NimbusJwtDecoder decoder =
+        JwtDecoders.fromIssuerLocation(issuer);
+
+    OAuth2TokenValidator&lt;Jwt&gt; withIssuer =
+        JwtValidators.createDefaultWithIssuer(issuer);      // iss + exp + nbf
+    OAuth2TokenValidator&lt;Jwt&gt; audience = new AudienceValidator("https://api.helios.app");
+    decoder.setJwtValidator(new DelegatingOAuth2TokenValidator&lt;&gt;(withIssuer, audience));
+    return decoder;
+  }
+
+  @Bean
+  SecurityFilterChain chain(HttpSecurity http) throws Exception {
+    http
+      .authorizeHttpRequests(a -&gt; a
+        .requestMatchers("/api/admin/**").hasAuthority("SCOPE_admin:all")  // authZ decision
+        .anyRequest().authenticated())
+      .oauth2ResourceServer(o -&gt; o.jwt(Customizer.withDefaults()))
+      .csrf(c -&gt; c.disable());  // OK only for stateless Bearer APIs; KEEP csrf on cookie/session apps
+    return http.build();
+  }
+}
+
+class AudienceValidator implements OAuth2TokenValidator&lt;Jwt&gt; {
+  private final String aud;
+  AudienceValidator(String aud) { this.aud = aud; }
+  public OAuth2TokenValidatorResult validate(Jwt jwt) {
+    return jwt.getAudience().contains(aud)
+        ? OAuth2TokenValidatorResult.success()
+        : OAuth2TokenValidatorResult.failure(
+            new OAuth2Error("invalid_token", "missing audience", null));
+  }
+}
+</code></pre>
+
+    <h3>7.2 Next.js (App Router) — tokens in HttpOnly cookies, never in JS</h3>
+    <pre><code class="language-js">// app/api/auth/callback/route.js  (server-side; tokens never reach the browser JS)
+import { cookies } from 'next/headers';
+
+export async function GET(req) {
+  // ...exchange code (+ PKCE verifier from secure cookie) for tokens...
+  const { access_token, refresh_token, expires_in } = await exchange(req);
+
+  const jar = await cookies();
+  jar.set('access_token', access_token, {
+    httpOnly: true,                 // ✅ unreachable by document.cookie / XSS
+    secure: true,                   // ✅ HTTPS only
+    sameSite: 'lax',                // ✅ blocks cross-site CSRF on top-nav GETs
+    path: '/',
+    maxAge: expires_in,
+  });
+  jar.set('refresh_token', refresh_token, {
+    httpOnly: true, secure: true, sameSite: 'strict', path: '/api/auth/refresh',
+  });
+  return Response.redirect(new URL('/dashboard', req.url));
+}
+</code></pre>
+
+    <h3>7.3 React — what NOT to do, and the safe pattern</h3>
+    <pre><code class="language-jsx">// ❌ NEVER: token reachable by any injected script
+localStorage.setItem('access_token', token);   // XSS = total compromise
+
+// ✅ Keep access token in memory (module variable / context), refresh via
+//    an HttpOnly cookie hit to your backend-for-frontend. On reload it's gone
+//    from memory and silently re-acquired from the cookie-backed session.
+let inMemoryToken = null;
+export const setToken = (t) =&gt; { inMemoryToken = t; };
+export const getToken = () =&gt; inMemoryToken;
+</code></pre>
+
+    <h3>7.4 FastAPI — replay defense with a jti denylist</h3>
+    <pre><code class="language-python">import time, jwt   # PyJWT
+from fastapi import Header, HTTPException
+
+_seen_jti: dict[str, float] = {}   # use Redis with TTL in production
+
+def verify(token: str = Header(..., alias="Authorization")):
+    raw = token.removeprefix("Bearer ")
+    claims = jwt.decode(
+        raw, key=PUBLIC_KEY,
+        algorithms=["RS256"],                 # pinned
+        issuer="https://YOUR_TENANT.us.auth0.com/",
+        audience="https://api.helios.app",
+        options={"require": ["exp", "iat", "jti"]},
+    )
+    jti, exp = claims["jti"], claims["exp"]
+    if jti in _seen_jti:                        # replay!
+        raise HTTPException(401, "token replay detected")
+    _seen_jti[jti] = exp                        # remember until it expires
+    return claims
+</code></pre>
+
+    <h3>7.5 curl &amp; Postman — proving the defenses by attacking them</h3>
+    <pre><code class="language-bash"># Try the alg:none forgery — a hardened API must answer 401, not 200
+FORGED='eyJhbGciOiJub25lIn0.eyJzdWIiOiJhZG1pbiIsInJvbGUiOiJhZG1pbiJ9.'
+curl -s -o /dev/null -w '%{http_code}\n' \
+  -H "Authorization: Bearer $FORGED" https://api.helios.app/api/admin/users
+# expect: 401
+
+# Brute-force probe: a hardened login returns 429 after the threshold
+for i in $(seq 1 20); do
+  curl -s -o /dev/null -w '%{http_code} ' \
+    -X POST https://YOUR_TENANT.us.auth0.com/oauth/token \
+    -d grant_type=password -d username=victim@helios.app -d password=wrong$i \
+    -d client_id=CID
+done; echo   # expect a run of 401s then 429 (rate-limited / brute-force-protected)
+</code></pre>
+    <p>In <strong>Postman</strong>, create a "Security" collection with these requests and add a Test script asserting the expected failure, so your hardening is regression-tested:</p>
+    <pre><code class="language-js">// Postman > Tests tab for the alg:none request
+pm.test("alg:none forgery is rejected", function () {
+  pm.expect(pm.response.code).to.be.oneOf([401, 403]);
+});
+</code></pre>
+  </section>
+
+  <!-- ============================================================= 8 -->
+  <section id="architecture">
+    <h2>8. Production Architecture — Defense in Depth for Auth</h2>
+    <pre class="diagram">
+   ┌──────────┐   TLS 1.3   ┌───────────────┐        ┌──────────────────┐
+   │  Browser │────────────▶│  WAF / CDN     │───────▶│ BFF / API Gateway │
+   │ (SPA/SSR)│  HSTS,CSP    │  rate limit,   │        │  • validate JWT   │
+   └────┬─────┘  no token    │  bot/DDoS,     │        │    (pinned alg,   │
+        │        in JS        │  geo/IP rules  │        │     iss/aud/exp)  │
+        │ HttpOnly cookies   └───────────────┘         │  • enforce scope/ │
+        ▼                                              │    role (authZ)   │
+   ┌──────────────────┐                                │  • CSRF on cookies│
+   │ Auth0 (AS / IdP) │◀── refresh-token rotation ─────┤  • mTLS to APIs   │
+   │  • PKCE, state    │     + reuse detection          └───────┬──────────┘
+   │  • brute-force /   │                                       │
+   │    bot detection  │                              ┌─────────▼─────────┐
+   │  • MFA / step-up  │                              │   Microservices   │
+   │  • Attack Protect │                              │  least-privilege  │
+   │  • anomaly logs ──┼──────▶ SIEM / log pipeline   │  per-service aud  │
+   └──────────────────┘         (A09 monitoring)      └───────────────────┘
+
+   Secrets: KMS/HSM-backed; JWKS rotated; signing keys NEVER in repo/env dumps.
+    </pre>
+    <p>Principles encoded in this diagram: <strong>(1)</strong> the SPA never touches a raw token — a Backend-for-Frontend holds them in HttpOnly cookies; <strong>(2)</strong> every hop re-verifies rather than trusting upstream ("zero trust" between services, each with its own <code>aud</code>); <strong>(3)</strong> Auth0's Attack Protection (brute-force, breached-password, bot detection, suspicious-IP throttling) sits in front of the credential boundary; <strong>(4)</strong> all anomaly signals flow to a SIEM so A09 (logging/monitoring) is real, not aspirational; <strong>(5)</strong> signing keys live in a KMS/HSM and rotate, so a leaked key has a bounded blast radius.</p>
+    <div class="callout key"><span class="tag">Key</span><p>The architectural rule of thumb: <em>tokens live where script cannot reach, secrets live where humans cannot copy, and every boundary re-verifies instead of trusting the boundary before it.</em></p></div>
+  </section>
+
+  <!-- ============================================================= 9 -->
+  <section id="security-analysis">
+    <h2>9. Security Analysis — STRIDE Threat Model of the Login System</h2>
+    <p>STRIDE is Microsoft's mnemonic for the six classes of threat. Applied to an auth system, it forces you to enumerate attacks <em>systematically</em> instead of relying on whatever you happen to remember at 2 a.m.</p>
+    <table>
+      <thead><tr><th>STRIDE</th><th>Threat in auth</th><th>Concrete attack</th><th>Primary mitigation</th></tr></thead>
+      <tbody>
+        <tr><td><strong>S</strong>poofing identity</td><td>Pretend to be another user</td><td>Credential stuffing, phishing, alg-confusion forgery</td><td>MFA, breached-password detection, pinned-alg JWT verify</td></tr>
+        <tr><td><strong>T</strong>ampering</td><td>Alter tokens/requests</td><td>Edit JWT payload, IDOR on object IDs</td><td>Signature verify, server-side authZ on every object</td></tr>
+        <tr><td><strong>R</strong>epudiation</td><td>Deny an action happened</td><td>No audit trail of who exported data</td><td>Immutable, signed audit logs to SIEM</td></tr>
+        <tr><td><strong>I</strong>nformation disclosure</td><td>Leak secrets/tokens</td><td>Token in URL/localStorage/logs, verbose errors</td><td>HttpOnly cookies, log scrubbing, generic errors</td></tr>
+        <tr><td><strong>D</strong>enial of service</td><td>Exhaust the auth path</td><td>Login flood, JWKS-fetch hammering</td><td>Rate limiting, WAF, caching JWKS</td></tr>
+        <tr><td><strong>E</strong>levation of privilege</td><td>Gain rights you lack</td><td>Trusting client-sent role, broken scope check</td><td>Server-derived roles, least privilege, deny by default</td></tr>
+      </tbody>
+    </table>
+    <p>The discipline is to walk the data-flow diagram (Section 8), draw the trust boundaries, and ask all six STRIDE questions <em>at each boundary</em>. The browser→BFF boundary alone yields spoofing (stolen cookie), tampering (CSRF), and info disclosure (XSS reading tokens) — each with a named mitigation above. A threat model is "done" when every boundary × every applicable STRIDE letter has either a control or an accepted, documented risk.</p>
+    <div class="callout danger"><span class="tag">Danger</span><p>The most expensive STRIDE letter in identity is <strong>E — Elevation of Privilege</strong>, because it <em>is</em> Broken Access Control (OWASP A01). Always test: can a normal user reach <code>/api/admin/*</code>? Can user A read user B's object by changing an ID? If you only test one thing in this chapter, test horizontal and vertical privilege escalation.</p></div>
+  </section>
+
+  <!-- ============================================================= 10 -->
+  <section id="performance">
+    <h2>10. Performance Considerations — Fast and Secure Are Not Enemies</h2>
+    <ul>
+      <li><strong>JWKS caching:</strong> Verifying RS256 needs the issuer's public key. Fetching JWKS on every request adds latency <em>and</em> a DoS amplification path. Cache keys by <code>kid</code> with a sane TTL (e.g., 10 min) and refresh on cache-miss of an unknown <code>kid</code> (handles rotation). This makes verification a few microseconds of local crypto, not a network round-trip.</li>
+      <li><strong>Local vs. introspection:</strong> Stateless JWT verification is O(1) local crypto — fast. Token <em>introspection</em> (calling the AS to ask "is this token still valid?") is a network call but gives instant revocation. Choose per route: short-lived access tokens make local verification safe; introspect only the high-value endpoints.</li>
+      <li><strong>Replay <code>jti</code> store:</strong> A denylist must be fast and bounded. Use Redis with a TTL equal to the token's remaining lifetime so the set self-cleans; never an unbounded in-memory map (memory DoS).</li>
+      <li><strong>Argon2/bcrypt cost:</strong> Password hashing is <em>intentionally</em> slow to resist cracking, but too slow becomes a login-flood DoS. Tune work factor to ~100–250 ms on your hardware, and put rate limiting in front so the slow path can't be weaponized.</li>
+      <li><strong>Constant-time compares</strong> add negligible cost; never trade them away for speed.</li>
+    </ul>
+    <div class="callout tip"><span class="tag">Tip</span><p>Performance security trade-offs are usually false dilemmas: cache the public keys, keep tokens short-lived, and you get both fast verification <em>and</em> bounded revocation lag. The only real cost is thinking about TTLs.</p></div>
+  </section>
+
+  <!-- ============================================================= 11 -->
+  <section id="mistakes">
+    <h2>11. Common Mistakes</h2>
+    <ul>
+      <li><strong>Trusting <code>hdr.alg</code>:</strong> Letting the library infer the algorithm from the token. <em>Always pin.</em></li>
+      <li><strong>Skipping <code>aud</code>/<code>iss</code> checks:</strong> A token valid for service X gets accepted by service Y. Verify audience on every service.</li>
+      <li><strong>Prefix/regex redirect matching:</strong> <code>helios.app.evil.com</code> slips through. Exact match only.</li>
+      <li><strong>Tokens in <code>localStorage</code>:</strong> Turns any XSS into account takeover. Use HttpOnly cookies or in-memory.</li>
+      <li><strong>No refresh-token rotation:</strong> A stolen refresh token works forever. Rotate + detect reuse.</li>
+      <li><strong>Trusting client-supplied roles/scopes:</strong> The client says <code>role=admin</code> and you believe it. Derive authorization server-side from verified claims.</li>
+      <li><strong>No session regeneration on login:</strong> Session fixation. Regenerate the ID on every privilege change.</li>
+      <li><strong>Verbose error messages:</strong> "user not found" vs "wrong password" enables user enumeration. Return one generic failure.</li>
+      <li><strong>Disabling CSRF on cookie-auth apps:</strong> CSRF disable is only safe for stateless Bearer APIs. Cookie/session apps need anti-CSRF tokens or strict SameSite.</li>
+      <li><strong>Logging tokens:</strong> Access/refresh tokens in APM traces or access logs. Scrub before logging.</li>
+      <li><strong>No rate limiting on login/MFA:</strong> Enables credential stuffing and OTP brute force. Rate-limit and lock progressively.</li>
+      <li><strong>Long-lived access tokens:</strong> Big blast radius on theft. Keep access tokens minutes, not days.</li>
+    </ul>
+  </section>
+
+  <!-- ============================================================= 12 -->
+  <section id="best-practices">
+    <h2>12. Best Practices</h2>
+    <ol>
+      <li><strong>Pin algorithms, verify <code>iss</code>/<code>aud</code>/<code>exp</code>/<code>nbf</code></strong> on every token, every service.</li>
+      <li><strong>Use Authorization Code + PKCE</strong> for every interactive client (SPA, native, web). Never the implicit flow.</li>
+      <li><strong>Exact-match redirect URIs</strong> in the allow-list; no wildcards in production.</li>
+      <li><strong>Keep tokens out of JavaScript:</strong> HttpOnly + Secure + SameSite cookies via a BFF, or in-memory access tokens.</li>
+      <li><strong>Rotate refresh tokens</strong> with automatic reuse detection (revoke the whole family on reuse).</li>
+      <li><strong>Short-lived access tokens</strong> (minutes); revoke/introspect high-value paths.</li>
+      <li><strong>Enforce MFA</strong>, prefer phishing-resistant factors (passkeys/WebAuthn, FIDO2) over SMS OTP.</li>
+      <li><strong>Enable Auth0 Attack Protection:</strong> brute-force, breached-password, suspicious-IP throttling, bot detection.</li>
+      <li><strong>Deny by default</strong> in authZ; derive roles/scopes server-side; test privilege escalation explicitly.</li>
+      <li><strong>Set strong headers:</strong> <code>Content-Security-Policy</code>, <code>Strict-Transport-Security</code>, <code>Referrer-Policy: no-referrer</code>, <code>X-Content-Type-Options: nosniff</code>.</li>
+      <li><strong>Manage keys in KMS/HSM</strong>, rotate signing keys, never commit secrets; scan repos and CI.</li>
+      <li><strong>Log security events to a SIEM</strong> with anomaly alerting; make repudiation impossible.</li>
+      <li><strong>Keep dependencies patched</strong> (A06); pin and audit your JWT/crypto libraries.</li>
+      <li><strong>Threat-model with STRIDE</strong> before shipping and after every architecture change.</li>
+    </ol>
+  </section>
+
+  <!-- ============================================================= 13 -->
+  <section id="interview">
+    <h2>13. Interview Questions (with Model Answers)</h2>
+
+    <h3>Q1. Why is it dangerous to let the JWT library pick the algorithm from the token header?</h3>
+    <p><strong>Model answer:</strong> Because the header is attacker-controlled. Two attacks follow: <code>alg:none</code> (the attacker drops the signature and the verifier accepts an unsigned token) and RS256→HS256 confusion (the attacker re-signs with your <em>public</em> key as an HMAC secret; a verifier that picks HS256 from the header and uses the RSA public key as the secret validates the forgery). The fix is to pin the expected algorithm(s) server-side and resolve the key from a trusted JWKS by <code>kid</code>, ignoring the header's claimed algorithm.</p>
+
+    <h3>Q2. A SPA stores its access and refresh tokens in localStorage. What's wrong and what would you do?</h3>
+    <p><strong>Model answer:</strong> localStorage is readable by any JavaScript, so a single XSS becomes full account takeover and (with the refresh token) long-term persistence. I'd move to a Backend-for-Frontend that holds tokens in HttpOnly+Secure+SameSite cookies so script can't read them, keep the access token in memory only if a pure-SPA pattern is required, enable refresh-token rotation with reuse detection, add a strict CSP to reduce XSS, and set short access-token lifetimes to bound the blast radius.</p>
+
+    <h3>Q3. Explain how PKCE and <code>state</code> defend the authorization-code flow, and what each one does <em>not</em> protect.</h3>
+    <p><strong>Model answer:</strong> PKCE binds the token exchange to the client that started the flow: the client sends <code>code_challenge=SHA256(verifier)</code> and later proves possession with <code>code_verifier</code>, so a stolen authorization code is useless without the verifier — this defeats code interception/injection. <code>state</code> is a per-flow, session-bound nonce verified on the callback; it defeats CSRF / forced-login and login-CSRF. PKCE does <em>not</em> stop CSRF on the callback (that's <code>state</code>'s job), and <code>state</code> does <em>not</em> stop code theft (that's PKCE's job) — you need both, plus exact-match redirect URIs.</p>
+
+    <h3>Q4. What is refresh-token rotation with reuse detection, and why is it stronger than a long-lived refresh token?</h3>
+    <p><strong>Model answer:</strong> On each refresh the AS issues a new refresh token and invalidates the previous one. If a previously-used (and thus revoked) refresh token is presented again, that signals theft: the AS revokes the entire token family and forces re-authentication. A long-lived refresh token, once stolen, works indefinitely and invisibly; rotation turns the thief's reuse into a detectable, self-revoking event, shrinking the blast radius from "forever" to "until the next legitimate refresh."</p>
+
+    <h3>Q5. Map Broken Access Control to a concrete identity bug and the test you'd run.</h3>
+    <p><strong>Model answer:</strong> BAC (OWASP A01) shows up as IDOR and missing scope/role checks — e.g., <code>GET /api/invoices/482</code> returns the invoice without verifying it belongs to the caller, or a normal user reaching <code>/api/admin/*</code>. I test both <em>horizontal</em> escalation (user A requests user B's object ID) and <em>vertical</em> escalation (non-admin hits admin routes). The fix is server-side, deny-by-default authorization on every object and route, deriving identity from the verified token rather than from any client-supplied ID or role.</p>
+
+    <h3>Q6. How would you make MFA phishing-resistant?</h3>
+    <p><strong>Model answer:</strong> SMS/TOTP can be phished or relayed in real time (AiTM proxies). Phishing-resistant MFA uses WebAuthn/FIDO2 passkeys, where the authenticator signs a challenge bound to the <em>origin</em>; a proxy on a look-alike domain gets the wrong origin and the signature won't validate. I'd also enable step-up auth for sensitive actions and bind sessions to device signals so a relayed cookie alone isn't enough.</p>
+  </section>
+
+  <!-- ============================================================= 14 -->
+  <section id="cert">
+    <h2>14. Certification Tips</h2>
+    <ul>
+      <li><strong>Know Auth0 Attack Protection by name:</strong> Brute-Force Protection, Suspicious IP Throttling, Breached Password Detection, and Bot Detection — what each defends and where it's configured (Dashboard → Security → Attack Protection).</li>
+      <li><strong>Flows:</strong> The exam expects you to know that public clients (SPA/native) must use Authorization Code + PKCE, that the implicit flow is deprecated, and why.</li>
+      <li><strong>Token validation:</strong> Be able to list the claims a resource server must validate: signature, <code>iss</code>, <code>aud</code>, <code>exp</code>, <code>nbf</code>, and (for OIDC) <code>nonce</code>/<code>azp</code>.</li>
+      <li><strong>Refresh tokens:</strong> Know rotation, reuse detection, and absolute/inactivity lifetimes as tenant settings.</li>
+      <li><strong>MFA:</strong> Recognize factor types and that WebAuthn/passkeys are phishing-resistant; know Adaptive MFA / step-up triggers.</li>
+      <li><strong>Mapping:</strong> Expect scenario questions that ask you to pick the control for a described attack (e.g., "users report tokens being reused" → enable rotation + reuse detection).</li>
+      <li><strong>Storage:</strong> The "correct" answer for SPA token storage on the exam is HttpOnly cookies / not localStorage — memorize the rationale (XSS).</li>
+    </ul>
+    <div class="callout note"><span class="tag">Note</span><p>Certification questions love the word "best." When asked the "best" MFA, "best" token storage, or "best" flow, choose the option that minimizes blast radius and removes attacker-controlled trust: passkeys, HttpOnly cookies, Auth Code + PKCE.</p></div>
+  </section>
+
+  <!-- ============================================================= 15 -->
+  <section id="exercises">
+    <h2>15. Hands-On Exercises</h2>
+    <ol>
+      <li><strong>Forge and fail:</strong> Craft an <code>alg:none</code> token (header <code>{"alg":"none"}</code>, payload <code>{"role":"admin"}</code>, empty signature) and send it to a protected endpoint. Confirm a 401. Then temporarily remove the <code>algorithms</code> pin and observe the danger — re-pin immediately.</li>
+      <li><strong>Redirect bypass:</strong> Implement a <code>validate_redirect_uri</code> with <code>startswith()</code>, prove <code>https://helios.app.evil.com</code> passes, then switch to exact match and prove it's rejected.</li>
+      <li><strong>PKCE by hand:</strong> Generate a verifier/challenge pair with the snippet in 6.2 and run a full authorize→token exchange against your Auth0 tenant with curl. Then retry the token exchange without the verifier and confirm it fails.</li>
+      <li><strong>Rotation trap:</strong> Enable refresh-token rotation in your tenant, capture <code>RT2</code>, use it once, replay it, and confirm the family is revoked.</li>
+      <li><strong>CSP lab:</strong> Add a <code>Content-Security-Policy</code> header, attempt an inline-script "XSS," and watch the browser block it.</li>
+      <li><strong>Brute-force demo:</strong> Run the curl loop from 7.5 against a test app and observe rate-limiting kick in.</li>
+    </ol>
+  </section>
+
+  <!-- ============================================================= 16 -->
+  <section id="assignment">
+    <h2>16. Assignment — A STRIDE Threat Model</h2>
+    <p>Take the Helios architecture from Section 8 and produce a written threat model:</p>
+    <ol>
+      <li>Draw the data-flow diagram and mark every trust boundary (browser↔BFF, BFF↔Auth0, BFF↔microservices, service↔datastore).</li>
+      <li>For <em>each</em> boundary, enumerate the applicable STRIDE threats with a concrete attack and a named mitigation (use the Section 9 table as a template).</li>
+      <li>Identify the three highest-risk items (likelihood × impact) and write the specific code or config change that closes each.</li>
+      <li>List every place a token could leak in your design and the control preventing it.</li>
+      <li>Define your token lifetimes (access, refresh inactivity, refresh absolute) and justify each against blast radius.</li>
+    </ol>
+    <p>Deliverable: a 2–4 page document plus the diagram. This is exactly the artifact a security reviewer or interviewer will ask you to produce.</p>
+  </section>
+
+  <!-- ============================================================= 17 -->
+  <section id="mini-project">
+    <h2>17. Mini Project — "Harden Helios"</h2>
+    <p>Build a small but realistic hardened app and a test suite that proves the hardening:</p>
+    <ul>
+      <li><strong>BFF (Node/Next or FastAPI):</strong> Authorization Code + PKCE login against Auth0, tokens in HttpOnly+Secure+SameSite cookies, anti-CSRF on state-changing routes, refresh via a server endpoint with rotation.</li>
+      <li><strong>Resource server (Spring Boot or FastAPI):</strong> pinned-alg JWT verification with <code>iss</code>/<code>aud</code>/<code>exp</code> checks, deny-by-default authorization, a <code>/api/admin/*</code> route guarded by scope, and a <code>jti</code> replay denylist in Redis.</li>
+      <li><strong>Headers:</strong> CSP, HSTS, Referrer-Policy, X-Content-Type-Options on every response.</li>
+      <li><strong>Attack-suite (Postman/curl):</strong> automated tests that send <code>alg:none</code>, a tampered payload, a missing-audience token, an evil <code>redirect_uri</code>, a state-less callback, and a replayed <code>jti</code> — each asserting the correct rejection.</li>
+      <li><strong>Tenant config:</strong> enable rotation + reuse detection, brute-force protection, breached-password detection, and MFA (passkey).</li>
+    </ul>
+    <p><strong>Done means:</strong> every request in your attack-suite returns the expected 4xx, every legitimate flow works, and you can explain — per the STRIDE table — which boundary each test exercises.</p>
+  </section>
+
+  <!-- ============================================================= 18 -->
+  <section id="quiz">
+    <h2>18. Quiz — 24 Questions</h2>
+    <ol>
+      <li>Which OWASP 2021 category is #1, and what is its most common identity manifestation?</li>
+      <li>What two JWT attacks does pinning the algorithm prevent?</li>
+      <li>In RS256→HS256 confusion, what does the attacker use as the HMAC secret?</li>
+      <li>Why must redirect URIs be matched by exact string, not prefix?</li>
+      <li>What does PKCE bind the token exchange to, and what does it defeat?</li>
+      <li>What attack does the OAuth <code>state</code> parameter defend against?</li>
+      <li>Name the response parameter (RFC 9207) that defends against the OAuth mix-up attack.</li>
+      <li>What single line of discipline prevents session fixation?</li>
+      <li>Why do signatures alone not stop replay attacks, and what claim helps?</li>
+      <li>Give three channels through which tokens commonly leak.</li>
+      <li>Why is storing tokens in <code>localStorage</code> dangerous?</li>
+      <li>What is refresh-token rotation, and what happens on reuse detection?</li>
+      <li>Why are short-lived access tokens a security control, not just a performance choice?</li>
+      <li>What does the <code>aud</code> claim protect against if every service validates it?</li>
+      <li>Define horizontal vs. vertical privilege escalation.</li>
+      <li>What makes WebAuthn/passkeys phishing-resistant where SMS OTP is not?</li>
+      <li>Name the four Auth0 Attack Protection features.</li>
+      <li>Why should login errors be generic ("invalid credentials")?</li>
+      <li>When is it safe to disable CSRF protection, and when is it not?</li>
+      <li>What does each STRIDE letter stand for?</li>
+      <li>Which STRIDE letter corresponds to Broken Access Control?</li>
+      <li>Why use a constant-time comparison for secrets?</li>
+      <li>What is credential stuffing, and which controls counter it?</li>
+      <li>Why cache JWKS, and how do you still handle key rotation?</li>
+    </ol>
+
+    <details>
+      <summary>Show answer key</summary>
+      <ol>
+        <li><strong>A01 Broken Access Control</strong>; manifests as IDOR and missing scope/role checks (treating the auth claim as the authZ decision).</li>
+        <li><code>alg:none</code> (unsigned token accepted) and RS256→HS256 algorithm confusion.</li>
+        <li>Your RSA <strong>public key</strong>, used as the symmetric HMAC secret.</li>
+        <li>Prefix/suffix/substring/regex matching let look-alikes like <code>helios.app.evil.com</code> pass; only exact equality is unambiguous.</li>
+        <li>It binds the exchange to the client that started the flow (via <code>code_verifier</code>); it defeats authorization-code interception/injection.</li>
+        <li>CSRF / forced-login (login CSRF) on the OAuth callback.</li>
+        <li>The <code>iss</code> (issuer) response parameter, verified by the client.</li>
+        <li>Regenerate the session ID at every privilege change (login/step-up).</li>
+        <li>The replay is genuinely signed; bind to one use via short <code>exp</code>, a server <code>nonce</code>, and a unique recorded <code>jti</code>.</li>
+        <li>URLs/query strings (history, Referer, logs), <code>localStorage</code> (XSS), and verbose logs/APM traces (also Referer header, cache).</li>
+        <li>Any injected script can read it, so a single XSS becomes full account takeover plus long-term persistence via the refresh token.</li>
+        <li>Issuing a new refresh token and revoking the old one on each refresh; on reuse the whole token family is revoked and re-auth is forced.</li>
+        <li>They bound the blast radius of token theft to minutes, forcing the attacker back to the (better-protected) refresh path.</li>
+        <li>It stops a token minted for service X being accepted by service Y (cross-service token reuse / confused-deputy).</li>
+        <li>Horizontal: accessing another user's resources at the same privilege level (IDOR). Vertical: gaining higher privileges (user→admin).</li>
+        <li>The authenticator signs a challenge bound to the origin; an AiTM/phishing proxy on a look-alike domain produces the wrong origin, so the signature fails.</li>
+        <li>Brute-Force Protection, Suspicious IP Throttling, Breached Password Detection, Bot Detection.</li>
+        <li>To prevent user enumeration — distinct messages reveal whether an account exists.</li>
+        <li>Safe only for stateless Bearer-token APIs (no ambient cookies); not safe for cookie/session-authenticated apps, which need anti-CSRF tokens or strict SameSite.</li>
+        <li>Spoofing, Tampering, Repudiation, Information disclosure, Denial of service, Elevation of privilege.</li>
+        <li><strong>E</strong> — Elevation of privilege.</li>
+        <li>To avoid timing side-channels that leak how many leading bytes matched.</li>
+        <li>Replaying leaked username/password pairs across sites; counter with MFA, breached-password detection, rate limiting, and bot detection.</li>
+        <li>To avoid a network round-trip (latency) and a DoS amplification path per request; handle rotation by refreshing the cache on an unknown <code>kid</code> (cache by <code>kid</code> with a TTL).</li>
+      </ol>
+      <p><em>(24 questions; the key consolidates the leakage-channel and combined items.)</em></p>
+    </details>
+  </section>
+
+  <!-- ============================================================= 19 -->
+  <section id="cheatsheet">
+    <h2>19. Cheat Sheet</h2>
+    <pre class="diagram">
+  TOKEN VERIFICATION (every service, every request)
+    pin algorithms:['RS256']  ·  verify iss · aud · exp · nbf · iat
+    resolve key from JWKS by kid  ·  NEVER trust header.alg
+    record jti to block replay  ·  reject → 401, generic message
+
+  OAUTH FLOW HARDENING
+    Authorization Code + PKCE (S256)  ·  exact-match redirect_uri
+    per-flow state, session-bound, single-use  ·  verify iss (RFC 9207)
+    short access tokens (min) · refresh rotation + reuse detection
+
+  TOKEN STORAGE
+    HttpOnly + Secure + SameSite cookies via BFF  (or in-memory access token)
+    NEVER localStorage  ·  NEVER in URLs  ·  scrub tokens from logs
+
+  HEADERS
+    Content-Security-Policy  ·  Strict-Transport-Security
+    Referrer-Policy: no-referrer  ·  X-Content-Type-Options: nosniff
+
+  ATTACK PROTECTION (Auth0)
+    Brute-Force · Suspicious-IP Throttling · Breached-Password · Bot Detection
+    MFA → prefer passkeys/WebAuthn (phishing-resistant) · step-up for sensitive ops
+
+  AUTHZ
+    deny by default · derive roles/scopes server-side · test H+V escalation
+
+  THREAT MODEL
+    STRIDE per trust boundary  ·  Spoof/Tamper/Repudiate/Info/DoS/Elevation
+    E (Elevation) == OWASP A01 Broken Access Control — test it first
+
+  CRYPTO/SECRETS
+    constant-time compare  ·  KMS/HSM keys  ·  rotate signing keys
+    never commit secrets · scan repos + CI · patch JWT/crypto libs (A06)
+    </pre>
+  </section>
+
+  <!-- ============================================================= 20 -->
+  <section id="takeaways">
+    <h2>20. Key Takeaways</h2>
+    <ul>
+      <li><strong>Attackers exploit trusted boundaries, not broken crypto.</strong> Most identity breaches are a forgotten validation plus a default left on. Verify every input you didn't generate.</li>
+      <li><strong>Never let the token tell you how to verify it.</strong> Pin the algorithm; resolve keys from a trusted JWKS; check <code>iss</code>/<code>aud</code>/<code>exp</code>/<code>nbf</code> — this kills <code>alg:none</code> and algorithm confusion.</li>
+      <li><strong>Authentication is a claim; authorization is a decision.</strong> Broken Access Control (OWASP A01 = STRIDE Elevation) is the #1 risk; make a server-side, deny-by-default decision on every route and object, and test horizontal + vertical escalation.</li>
+      <li><strong>Code + PKCE + exact-match redirects + state</strong> together close the redirect/CSRF/code-theft family. Each defends a different boundary; you need all of them.</li>
+      <li><strong>Keep tokens out of JavaScript and out of URLs.</strong> HttpOnly cookies or in-memory only; this turns XSS from "account takeover" into "annoyance."</li>
+      <li><strong>Rotate refresh tokens with reuse detection</strong> and keep access tokens short — security is the discipline of shrinking blast radius at every layer.</li>
+      <li><strong>Prefer phishing-resistant MFA (passkeys/WebAuthn)</strong> and enable Auth0 Attack Protection to defeat credential stuffing, brute force, and bots at the credential boundary.</li>
+      <li><strong>Threat-model with STRIDE before you ship</strong>, log everything to a SIEM, and treat every breach as inevitable — design so that no single failure is fatal.</li>
+    </ul>
+    <div class="callout key"><span class="tag">Key</span><p>If you internalize one sentence from this chapter: <em>trust nothing the attacker can touch, verify on every boundary, and design so that any single control failing still leaves the attacker locked out.</em> That is defense in depth, and it is the whole game.</p></div>
+  </section>
+
+  <nav class="pager">
+    <a class="prev" href="chapter-27.html">← Previous</a>
+    <a class="next" href="chapter-29.html">Next →</a>
+  </nav>
+</main>
+<footer class="site-footer">Master Auth0 End-to-End · Chapter 28 of 32</footer>
+</body>
+</html>

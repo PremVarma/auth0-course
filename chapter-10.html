@@ -1,0 +1,668 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 10 — JWT Security: Attacks and Best Practices | Master Auth0</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">🔐 Master Auth0</a>
+  <nav class="topnav">
+    <a href="chapter-09.html">← Prev</a>
+    <a href="index.html">Contents</a>
+    <a href="chapter-11.html">Next →</a>
+  </nav>
+</header>
+<main class="container">
+  <div class="chapter-head">
+    <span class="phase">Phase 4 · JWT Deep Dive</span>
+    <h1>Chapter 10 — JWT Security: Attacks and Best Practices</h1>
+    <p class="lead">A JWT is only as trustworthy as the code that validates it. In the last chapters you learned how JWTs are built, signed, and decoded. Now we flip the table and think like an attacker: we will forge tokens with <code>alg=none</code>, trick a server into verifying an RS256 token with the public key as an HMAC secret, replay stolen tokens, brute-force weak secrets, and slip past servers that forget to check <code>aud</code>, <code>iss</code>, and <code>exp</code>. For every attack you will see exactly <em>why</em> it works at the byte level, then the precise defense — culminating in the RFC 8725 best-practices checklist that every senior engineer is expected to know cold. By the end you will be able to audit any JWT-based system and explain, from first principles, whether it is safe.</p>
+  </div>
+
+  <!-- ============ 1. THEORY ============ -->
+  <section id="theory">
+    <h2>1. Theory — First Principles of JWT Trust</h2>
+    <p>A JSON Web Token (JWT) is a <strong>self-contained, cryptographically signed claim set</strong>. Three Base64URL parts joined by dots: <code>header.payload.signature</code>. The header and payload are <em>not encrypted</em> — they are merely encoded, so anyone can read them. The signature is the only thing standing between an honest token and a forged one.</p>
+    <p>To reason about JWT security you must hold one idea above all others:</p>
+    <div class="callout key"><span class="tag">Key</span><p>A JWT is trustworthy <strong>only if the receiver independently re-computes and verifies the signature using a key it controls, with an algorithm it dictates</strong>. The token must never be allowed to choose its own algorithm or key. The moment the attacker influences <em>how</em> you verify, the signature is meaningless.</p></div>
+    <p>Every JWT attack in this chapter exploits a violation of that one principle. Let us derive the trust model from scratch.</p>
+    <h3>The two signature families</h3>
+    <ul>
+      <li><strong>HMAC (HS256/384/512)</strong> — <em>symmetric</em>. The same secret key both signs and verifies. Whoever can verify can also forge. Used when one party owns both ends (e.g., a monolith signing its own session tokens).</li>
+      <li><strong>RSA / ECDSA (RS256, ES256, PS256)</strong> — <em>asymmetric</em>. A <strong>private key signs</strong>; a <strong>public key verifies</strong>. The public key is safe to publish (Auth0 exposes it at <code>/.well-known/jwks.json</code>). Verifiers never hold the signing key. This is what every OIDC provider, including Auth0, uses for ID tokens and access tokens.</li>
+    </ul>
+    <p>Why does Auth0 default to RS256? Because in a distributed system you have <em>many verifiers</em> (your API, your gateway, your microservices) but exactly <em>one signer</em> (Auth0). With HMAC, every verifier would need the shared secret — and any one of them, if compromised, could mint tokens. With RS256 the private key never leaves Auth0; verifiers only ever see the public key, which cannot forge anything. <strong>Asymmetric crypto separates the power to verify from the power to forge.</strong> That separation is the whole point.</p>
+    <h3>Confidentiality vs. integrity</h3>
+    <p>JWTs (the JWS variety, which is 99% of what you meet) provide <strong>integrity and authenticity</strong>, not <strong>confidentiality</strong>. Anyone with the token can read every claim. So rule one: never put secrets — passwords, SSNs, full credit-card numbers — inside a JWT. If you genuinely need an encrypted token, that is a JWE (JSON Web Encryption), a separate and rarer construct.</p>
+  </section>
+
+  <!-- ============ 2. STORY ============ -->
+  <section id="story">
+    <h2>2. Story — The Night the Admin Panel Fell</h2>
+    <p>Picture a startup, "Ledgerly", shipping fast. Their Node API checks JWTs like this: it Base64-decodes the token, reads the <code>alg</code> field from the header, and verifies accordingly. Convenient — the library "just figures out" the algorithm.</p>
+    <p>One evening a security researcher named Mara intercepts her own token in the browser. She decodes the header: <code>{"alg":"RS256","typ":"JWT"}</code>. She edits it to <code>{"alg":"none","typ":"JWT"}</code>, changes the payload's <code>"role":"user"</code> to <code>"role":"admin"</code>, deletes the signature entirely (leaving the trailing dot), and replays the request.</p>
+    <p>The server reads <code>alg:none</code>, concludes "this token says it isn't signed, so there's nothing to verify," and accepts it. Mara is now an admin. No private key, no brute force — she simply asked the server not to check, and it obliged.</p>
+    <p>The next morning Ledgerly's engineers patch it by hard-coding the expected algorithm and rejecting <code>none</code>. But Mara isn't done. She notices the API now uses a verify call that "auto-selects" between RS256 and HS256. She takes the <em>public</em> RSA key (published openly at the JWKS endpoint), and signs a forged token using <strong>HS256 with that public key as the HMAC secret</strong>. She sets <code>alg:HS256</code>. The server, trusting the token's chosen algorithm, loads its RSA <em>public</em> key and runs HMAC verification with it — and the signatures match, because Mara used the very same public string. Admin again.</p>
+    <div class="callout danger"><span class="tag">Danger</span><p>Both break-ins share one root cause: <strong>the server let the token dictate the verification algorithm.</strong> The fix is identical for both — pin the algorithm on the server side and never trust the header's <code>alg</code>.</p></div>
+    <p>This story is not hypothetical. The <code>alg=none</code> and RS256→HS256 confusion bugs were real CVEs across multiple popular JWT libraries (2015–2017), and variants still surface today in hand-rolled validators. We will reproduce both, then bulletproof against them.</p>
+  </section>
+
+  <!-- ============ 3. ASCII DIAGRAMS ============ -->
+  <section id="diagrams">
+    <h2>3. ASCII Diagrams — Anatomy of the Attacks</h2>
+    <h3>3.1 Honest RS256 verification (what should happen)</h3>
+    <pre class="diagram">
+   CLIENT                         RESOURCE SERVER (your API)
+     |                                     |
+     |  Authorization: Bearer eyJ...       |
+     |------------------------------------>|
+     |                                     |  1. split header.payload.signature
+     |                                     |  2. PIN alg = RS256  (server decides!)
+     |                                     |  3. fetch PUBLIC key from JWKS (by kid)
+     |                                     |  4. verify signature with public key
+     |                                     |  5. check exp, iss, aud, nbf
+     |                                     |
+     |        200 OK  (claims trusted)     |
+     |<------------------------------------|
+    </pre>
+
+    <h3>3.2 The alg=none forgery</h3>
+    <pre class="diagram">
+   ATTACKER                                NAIVE SERVER
+     |                                          |
+     |  header = {"alg":"none"}  (base64url)    |
+     |  payload= {"role":"admin"} (base64url)   |
+     |  signature = ""  (empty! token ends ".") |
+     |  token = "eyJhbGci...none.eyJyb2xl...admin."   |
+     |----------------------------------------->|
+     |                                          | reads alg -> "none"
+     |                                          | "nothing to verify" -> ACCEPT
+     |               200 OK  (ADMIN)            |
+     |<-----------------------------------------|
+                          ^
+                          |  no signature was ever checked
+    </pre>
+
+    <h3>3.3 RS256 → HS256 algorithm confusion</h3>
+    <pre class="diagram">
+  PUBLIC KEY (openly published at /.well-known/jwks.json)
+        |
+        |  attacker downloads it  (it's PUBLIC, that's allowed)
+        v
+   +-----------------------------+
+   | sign forged token with      |
+   |   HMAC-SHA256(              |
+   |     msg = header.payload,   |
+   |     key = PUBLIC_KEY_PEM    |  <-- public key used as a *secret*
+   |   )                         |
+   |   header.alg = "HS256"      |
+   +-----------------------------+
+        |
+        v
+   NAIVE SERVER (trusts header.alg)
+        |  alg says HS256 -> use HMAC
+        |  key material it has = the SAME public key
+        |  HMAC(header.payload, public_key) == attacker's signature  -> MATCH
+        v
+      ACCEPT (forged admin token)
+    </pre>
+
+    <h3>3.4 Token replay / theft</h3>
+    <pre class="diagram">
+   USER ---(valid Bearer token over HTTPS)---> API   [legit]
+                   |
+                   |  token leaks: XSS / logs / referer / proxy / repo
+                   v
+   ATTACKER ---(replays the SAME token, unchanged)---> API
+                   |
+                   |  signature is valid (it's a real token!)
+                   |  exp not yet reached  ->  ACCEPT  (impersonation)
+                   v
+              defense: short exp + sender-constraint (DPoP/mTLS) + revocation
+    </pre>
+  </section>
+
+  <!-- ============ 4. ANALOGY ============ -->
+  <section id="analogy">
+    <h2>4. Real-World Analogy — The Wax-Seal Letter</h2>
+    <p>Imagine medieval messengers carrying letters sealed with the king's wax signet. The seal proves the letter is authentic. Now map the attacks:</p>
+    <ul>
+      <li><strong>alg=none</strong> is a guard who accepts a letter that says, at the top, "This letter requires no seal." A competent guard checks the seal regardless of what the letter <em>claims</em> about itself.</li>
+      <li><strong>RS256→HS256 confusion</strong> is subtler. The king's signet (private key) makes the seal; everyone owns a <em>cast copy of the seal's imprint</em> (public key) to <em>compare against</em> — but you can only compare, you cannot stamp with a mere imprint. The confusion attack tricks the guard into using that public imprint as if it were the secret stamp itself, so the attacker — who also has the public imprint — can produce matching seals.</li>
+      <li><strong>Replay</strong> is stealing a genuine sealed letter and delivering it yourself. The seal is real, so it passes — which is why royal letters carry an expiry date and name the intended recipient.</li>
+      <li><strong>Weak HMAC secret</strong> is a kingdom whose "secret" stamp is the word "password" — any blacksmith can replicate it overnight.</li>
+      <li><strong>Missing aud/iss checks</strong> is a guard who accepts any sealed letter without reading who it was addressed to (<code>aud</code>) or which king sent it (<code>iss</code>) — so a letter meant for a neighboring castle is honored at yours.</li>
+    </ul>
+  </section>
+
+  <!-- ============ 5. INTERNAL WORKING ============ -->
+  <section id="internals">
+    <h2>5. Internal Working — Bytes, Signing, and Why the Confusion Works</h2>
+    <p>The signing input is the ASCII string <code>BASE64URL(header) + "." + BASE64URL(payload)</code>. Call it the <em>signing input</em> <code>M</code>.</p>
+    <pre><code class="language-text">HS256:  signature = HMAC_SHA256(key=secret,  message=M)
+        verify    : recompute HMAC and compare (constant time)
+
+RS256:  signature = RSA_SIGN(privateKey, SHA256(M))
+        verify    : RSA_VERIFY(publicKey, SHA256(M), signature)</code></pre>
+    <p>Here is the crux of the confusion attack, made concrete. A vulnerable verify function looks like:</p>
+    <pre><code class="language-javascript">// VULNERABLE pseudo-implementation inside a naive library
+function verify(token, key) {
+  const { header, payload, signature } = split(token);
+  const M = base64url(header) + "." + base64url(payload);
+
+  if (header.alg === "HS256") {
+    return hmacSha256(M, key) === signature;   // key treated as HMAC SECRET
+  }
+  if (header.alg === "RS256") {
+    return rsaVerify(M, signature, key);        // key treated as RSA PUBLIC key
+  }
+}</code></pre>
+    <p>The single variable <code>key</code> is overloaded. The server intends it to be an RSA public key. But the attacker sets <code>header.alg = "HS256"</code>, so the function takes the first branch and feeds that same public-key string into <code>hmacSha256</code> as the <em>secret</em>. Because the RSA public key is public, the attacker computed the very same <code>HMAC_SHA256(publicKeyPEM, M)</code> offline. The two HMACs match. Forgery complete — no private key ever needed.</p>
+    <div class="callout note"><span class="tag">Note</span><p>The byte-level subtlety: tiny formatting differences in how the public key is serialized (PEM with or without trailing newline, headers like <code>-----BEGIN PUBLIC KEY-----</code> included or stripped) change the HMAC. Real exploits try several common serializations. The point stands: the defense is not "format the key carefully" — it is "<strong>never let one branch decide between symmetric and asymmetric based on the token</strong>."</p></div>
+    <h3>Why exp/iss/aud exist at the protocol level</h3>
+    <p>A valid signature only proves "Auth0 issued this exact claim set." It says nothing about <em>when</em>, <em>for whom</em>, or <em>whether it is still meant to be used</em>. The registered claims close those gaps:</p>
+    <ul>
+      <li><code>exp</code> (expiration) — after this Unix timestamp the token is invalid. Bounds the blast radius of theft.</li>
+      <li><code>iss</code> (issuer) — who minted it (e.g., <code>https://your-tenant.us.auth0.com/</code>). Stops tokens from a different/attacker IdP being honored.</li>
+      <li><code>aud</code> (audience) — the intended recipient (your API identifier). Stops a token meant for API A being replayed against API B (the "confused deputy" within a tenant).</li>
+      <li><code>nbf</code> (not before), <code>iat</code> (issued at) — timing windows.</li>
+      <li><code>kid</code> (in the header) — which key signed it, so you fetch the right public key from JWKS.</li>
+    </ul>
+  </section>
+
+  <!-- ============ 6. CODE WALKTHROUGH ============ -->
+  <section id="walkthrough">
+    <h2>6. Code Walkthrough — Reproducing the Attacks (Lab)</h2>
+    <div class="callout warn"><span class="tag">Warn</span><p>Run these only against your own throwaway lab service. Forging tokens against systems you do not own is a crime.</p></div>
+    <h3>6.1 Crafting an alg=none token by hand (curl)</h3>
+    <pre><code class="language-bash"># header {"alg":"none","typ":"JWT"}  and  payload {"sub":"123","role":"admin"}
+# base64url-encode each (note: '=' padding stripped, +/ -&gt; -_)
+H=$(printf '%s' '{"alg":"none","typ":"JWT"}'   | basenc --base64url | tr -d '=')
+P=$(printf '%s' '{"sub":"123","role":"admin"}' | basenc --base64url | tr -d '=')
+
+# alg=none means NO signature -&gt; token ends with a trailing dot, empty 3rd part
+TOKEN="$H.$P."
+echo "$TOKEN"
+
+curl -i https://lab.example.com/admin \
+  -H "Authorization: Bearer $TOKEN"
+# A vulnerable server returns 200. A correct server returns 401.</code></pre>
+
+    <h3>6.2 Forging an RS256→HS256 confusion token (Node lab script)</h3>
+    <pre><code class="language-javascript">import crypto from "node:crypto";
+import fs from "node:fs";
+
+// The attacker downloads the server's PUBLIC key (it's published, that's fine).
+const publicKeyPem = fs.readFileSync("server_public.pem", "utf8");
+
+const b64url = (buf) =&gt;
+  Buffer.from(buf).toString("base64")
+    .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+
+const header  = b64url(JSON.stringify({ alg: "HS256", typ: "JWT" }));
+const payload = b64url(JSON.stringify({ sub: "123", role: "admin",
+                       exp: Math.floor(Date.now()/1000) + 3600 }));
+const signingInput = `${header}.${payload}`;
+
+// Sign with HMAC, using the PUBLIC KEY string as the "secret".
+const sig = crypto.createHmac("sha256", publicKeyPem)
+                  .update(signingInput).digest("base64")
+                  .replace(/\+/g,"-").replace(/\//g,"_").replace(/=+$/g,"");
+
+console.log(`${signingInput}.${sig}`);  // forged admin token, no private key used</code></pre>
+
+    <h3>6.3 The correct, safe verification (Node, jose)</h3>
+    <pre><code class="language-javascript">import { createRemoteJWKSet, jwtVerify } from "jose";
+
+const JWKS = createRemoteJWKSet(
+  new URL("https://your-tenant.us.auth0.com/.well-known/jwks.json"));
+
+export async function verifyAccessToken(token) {
+  const { payload } = await jwtVerify(token, JWKS, {
+    algorithms: ["RS256"],                       // PIN the algorithm. No "none", no HS256.
+    issuer:   "https://your-tenant.us.auth0.com/", // check iss
+    audience: "https://api.ledgerly.com",          // check aud
+    clockTolerance: "5s",                          // small skew only; exp/nbf enforced
+  });
+  return payload; // safe to trust now
+}</code></pre>
+    <p>Walk through every guard: <code>algorithms:["RS256"]</code> defeats both <code>alg=none</code> and HS256 confusion because the library refuses any other algorithm <em>before</em> selecting a verification path. <code>createRemoteJWKSet</code> guarantees we verify with Auth0's <em>public</em> key fetched by <code>kid</code> — never a secret, never the token's choice. <code>issuer</code> and <code>audience</code> close the redirect/confused-deputy gaps. <code>jwtVerify</code> enforces <code>exp</code>/<code>nbf</code> automatically; <code>clockTolerance</code> keeps that strict.</p>
+  </section>
+
+  <!-- ============ 7. PRACTICAL IMPLEMENTATION ============ -->
+  <section id="practical">
+    <h2>7. Practical Implementation — Hardened Validators Across Stacks</h2>
+    <h3>7.1 Java Spring Boot (Spring Security Resource Server)</h3>
+    <pre><code class="language-java">// application.yml — issuer-uri makes Spring fetch JWKS and pin RS256 automatically
+// spring.security.oauth2.resourceserver.jwt.issuer-uri=https://your-tenant.us.auth0.com/
+
+@Configuration
+@EnableWebSecurity
+public class SecurityConfig {
+
+  @Value("${spring.security.oauth2.resourceserver.jwt.issuer-uri}")
+  String issuer;
+
+  @Bean
+  JwtDecoder jwtDecoder() {
+    // Loads JWKS, restricts to RS256 (the JWKS key type), validates signature.
+    NimbusJwtDecoder decoder =
+        JwtDecoders.fromIssuerLocation(issuer);
+
+    OAuth2TokenValidator&lt;Jwt&gt; withIssuer =
+        JwtValidators.createDefaultWithIssuer(issuer); // checks iss + exp
+    OAuth2TokenValidator&lt;Jwt&gt; audience = new AudienceValidator("https://api.ledgerly.com");
+    decoder.setJwtValidator(new DelegatingOAuth2TokenValidator&lt;&gt;(withIssuer, audience));
+    return decoder;
+  }
+
+  @Bean
+  SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+    http.authorizeHttpRequests(a -&gt; a.anyRequest().authenticated())
+        .oauth2ResourceServer(o -&gt; o.jwt(Customizer.withDefaults()));
+    return http.build();
+  }
+}
+
+// Custom audience validator — Spring does NOT check aud by default!
+class AudienceValidator implements OAuth2TokenValidator&lt;Jwt&gt; {
+  private final String audience;
+  AudienceValidator(String audience) { this.audience = audience; }
+  public OAuth2TokenValidatorResult validate(Jwt jwt) {
+    if (jwt.getAudience().contains(audience))
+      return OAuth2TokenValidatorResult.success();
+    return OAuth2TokenValidatorResult.failure(
+      new OAuth2Error("invalid_token", "Required audience missing", null));
+  }
+}</code></pre>
+    <div class="callout warn"><span class="tag">Warn</span><p>Spring Security validates <code>iss</code>, <code>exp</code>, and the signature out of the box, but it does <strong>not</strong> validate <code>aud</code> unless you add a validator. Forgetting this is one of the most common production gaps — your API will happily accept a token minted for a different API in the same tenant.</p></div>
+
+    <h3>7.2 FastAPI (Python)</h3>
+    <pre><code class="language-python">import jwt                       # PyJWT
+from jwt import PyJWKClient
+from fastapi import Depends, FastAPI, HTTPException, Header
+
+ISSUER   = "https://your-tenant.us.auth0.com/"
+AUDIENCE = "https://api.ledgerly.com"
+jwks = PyJWKClient(f"{ISSUER}.well-known/jwks.json")
+
+def verify(authorization: str = Header(...)) -&gt; dict:
+    if not authorization.startswith("Bearer "):
+        raise HTTPException(401, "Missing bearer token")
+    token = authorization.split(" ", 1)[1]
+    try:
+        signing_key = jwks.get_signing_key_from_jwt(token).key
+        return jwt.decode(
+            token, signing_key,
+            algorithms=["RS256"],          # PIN — blocks none + HS256 confusion
+            audience=AUDIENCE,             # checks aud
+            issuer=ISSUER,                 # checks iss
+            options={"require": ["exp", "iat", "iss", "aud"]},  # demand they exist
+        )
+    except jwt.InvalidTokenError as e:
+        raise HTTPException(401, f"Invalid token: {e}")
+
+app = FastAPI()
+
+@app.get("/admin")
+def admin(claims: dict = Depends(verify)):
+    if "admin" not in claims.get("permissions", []):
+        raise HTTPException(403, "Forbidden")
+    return {"ok": True, "sub": claims["sub"]}</code></pre>
+
+    <h3>7.3 React — store the access token in memory, not localStorage</h3>
+    <pre><code class="language-jsx">// Auth0 React SDK keeps tokens in memory and refreshes via rotating
+// refresh tokens in an httpOnly cookie or silent iframe — NOT localStorage.
+import { Auth0Provider, useAuth0 } from "@auth0/auth0-react";
+
+function Root() {
+  return (
+    &lt;Auth0Provider
+      domain="your-tenant.us.auth0.com"
+      clientId="abc123"
+      authorizationParams={{
+        audience: "https://api.ledgerly.com",
+        redirect_uri: window.location.origin,
+      }}
+      useRefreshTokens={true}
+      cacheLocation="memory"   /* default; NEVER "localstorage" for XSS safety */
+    &gt;
+      &lt;App /&gt;
+    &lt;/Auth0Provider&gt;
+  );
+}
+
+function CallApi() {
+  const { getAccessTokenSilently } = useAuth0();
+  const call = async () =&gt; {
+    const token = await getAccessTokenSilently(); // fetched fresh, held in memory
+    const res = await fetch("https://api.ledgerly.com/admin", {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    return res.json();
+  };
+  return &lt;button onClick={call}&gt;Call API&lt;/button&gt;;
+}</code></pre>
+
+    <h3>7.4 Next.js — keep tokens server-side in an httpOnly cookie</h3>
+    <pre><code class="language-javascript">// With the Auth0 Next.js SDK, the session (incl. tokens) lives in an
+// encrypted, httpOnly, SameSite cookie. The browser JS never touches the
+// raw access token, so XSS cannot read it.
+// middleware.ts
+import { auth0 } from "./lib/auth0";
+export const middleware = auth0.middleware; // manages the encrypted session cookie
+
+// app/api/proxy/route.ts — server route attaches the token; client never sees it
+import { auth0 } from "@/lib/auth0";
+export async function GET() {
+  const { token } = await auth0.getAccessToken(); // server-side only
+  const res = await fetch("https://api.ledgerly.com/admin", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  return Response.json(await res.json());
+}</code></pre>
+  </section>
+
+  <!-- ============ 8. PRODUCTION ARCHITECTURE ============ -->
+  <section id="architecture">
+    <h2>8. Production Architecture — Defense in Depth</h2>
+    <pre class="diagram">
+                       +-------------------+
+                       |      Auth0        |  (single SIGNER, holds private key)
+                       |  RS256, JWKS, kid |
+                       +---------+---------+
+                                 | publishes PUBLIC keys
+                                 v
+   Browser/SPA          /.well-known/jwks.json   (cached by verifiers)
+   token in MEMORY              |        |        |
+   refresh in cookie           v        v        v
+        |             +--------+   +--------+   +--------+
+        | Bearer      | API GW |   | Svc A  |   | Svc B  |   <- many VERIFIERS
+        |------------>| pin    |   | pin    |   | pin    |      (public key only)
+        |             | RS256  |   | RS256  |   | RS256  |
+        |             | iss/aud|   | aud=A  |   | aud=B  |
+        |             | exp    |   | exp    |   | exp    |
+        |             +---+----+   +--------+   +--------+
+        |                 |
+        |   short TTL (5-15m) access tokens; revocation via:
+        |   - refresh-token rotation + reuse detection (Auth0)
+        |   - deny-list of jti for emergency revoke (Redis, TTL=exp)
+        |   - sender-constrained tokens (DPoP / mTLS) for high value
+        v
+    HTTPS everywhere; HSTS; no tokens in URLs/logs
+    </pre>
+    <p>Architectural principles, justified:</p>
+    <ul>
+      <li><strong>One signer, many verifiers, asymmetric keys.</strong> The private key lives only in Auth0. Every service verifies with the public JWKS. A compromised microservice cannot mint tokens.</li>
+      <li><strong>Per-API audience.</strong> Each service pins its own <code>aud</code>. A token for Service A is rejected by Service B even though both trust the same issuer — containing lateral movement.</li>
+      <li><strong>Short access-token TTL (5–15 min)</strong> bounds replay. Long-lived <em>refresh</em> tokens, kept server-side or in httpOnly cookies, are exchanged for new access tokens and are <strong>rotated</strong> on every use with reuse detection.</li>
+      <li><strong>Emergency revocation:</strong> a Redis deny-list keyed by <code>jti</code> with TTL set to the token's <code>exp</code>, checked by the gateway. Stateless JWTs cannot be revoked natively, so this is the standard escape hatch.</li>
+    </ul>
+  </section>
+
+  <!-- ============ 9. SECURITY ANALYSIS ============ -->
+  <section id="security">
+    <h2>9. Security Analysis — Attack Catalogue and Countermeasures</h2>
+    <table>
+      <thead><tr><th>Attack</th><th>How it works</th><th>Root cause</th><th>Defense</th></tr></thead>
+      <tbody>
+        <tr><td><code>alg=none</code></td><td>Strip signature, set alg to none</td><td>Server trusts token's alg; treats "none" as "no check"</td><td>Pin algorithm allow-list (e.g. <code>["RS256"]</code>); reject none</td></tr>
+        <tr><td>RS256→HS256 confusion</td><td>HMAC-sign with the public key as secret, set alg=HS256</td><td>One key variable used for both symmetric &amp; asymmetric</td><td>Pin algorithm; never auto-select; bind key to algorithm</td></tr>
+        <tr><td>Weak HMAC secret</td><td>Offline brute force / dictionary of the secret</td><td>Short, guessable, or default secret</td><td>≥256-bit random secret; or use RS256 to avoid shared secrets entirely</td></tr>
+        <tr><td>Replay / theft</td><td>Reuse a stolen but valid token</td><td>Bearer tokens are not bound to the holder</td><td>Short TTL; DPoP/mTLS sender-constraint; revocation list; TLS</td></tr>
+        <tr><td>Missing <code>aud</code></td><td>Token for API A accepted by API B</td><td>Verifier never checks intended recipient</td><td>Validate <code>aud</code> equals this service's identifier</td></tr>
+        <tr><td>Missing <code>iss</code></td><td>Token from attacker's IdP accepted</td><td>Verifier doesn't check who issued it</td><td>Validate <code>iss</code> equals your exact tenant URL</td></tr>
+        <tr><td>Missing <code>exp</code></td><td>Stolen token usable forever</td><td>Expiry not enforced</td><td>Require &amp; enforce <code>exp</code>; tight clock tolerance</td></tr>
+        <tr><td><code>kid</code> injection / JWKS spoof</td><td>Point <code>kid</code> at attacker-controlled key/URL</td><td>Verifier fetches key from an untrusted location</td><td>Hard-code the JWKS URL; ignore <code>jku</code>/<code>x5u</code> in token</td></tr>
+        <tr><td>XSS token exfiltration</td><td>Injected JS reads token from localStorage</td><td>Token reachable by page JavaScript</td><td>Store in memory or httpOnly cookie; strong CSP</td></tr>
+      </tbody>
+    </table>
+    <div class="callout danger"><span class="tag">Danger</span><p><strong>Never trust header-supplied key locations.</strong> The <code>jku</code> (JWKS URL) and <code>x5u</code> (cert URL) header parameters let a token point at where its key lives. If your verifier honors them, an attacker hosts their own key and signs with the matching private key. Always hard-code the issuer's JWKS endpoint and ignore any URL the token suggests.</p></div>
+  </section>
+
+  <!-- ============ 10. PERFORMANCE ============ -->
+  <section id="performance">
+    <h2>10. Performance Considerations</h2>
+    <ul>
+      <li><strong>JWKS caching.</strong> Fetching the public key on every request adds an HTTP round trip and lets the JWKS endpoint become a bottleneck or DoS target. Cache keys by <code>kid</code> (Auth0 keys rotate rarely). Honor <code>Cache-Control</code>; refresh on an unknown <code>kid</code> (signals rotation), but rate-limit that refresh so an attacker can't force a JWKS fetch storm with random <code>kid</code> values.</li>
+      <li><strong>RS256 verify vs HS256.</strong> RSA verification is slower than HMAC but still sub-millisecond and trivially parallel — and it's a public-key op (cheap side), not signing. The security win (no shared secret) dwarfs the cost. Don't choose HS256 "for speed."</li>
+      <li><strong>Stateless = no DB hit.</strong> The reason JWTs scale is that verification needs no central session store — purely local CPU plus a cached key. Adding a revocation deny-list reintroduces a lookup; keep it in a fast in-memory store (Redis) and only consult it where the risk justifies the latency.</li>
+      <li><strong>Token size.</strong> Big tokens (many claims/roles) inflate every request header. Keep payloads lean; reference large authorization data by ID rather than embedding it.</li>
+      <li><strong>Constant-time compares.</strong> Signature/secret comparison must be constant-time (libraries do this) to avoid timing side channels — relevant mainly to HMAC.</li>
+    </ul>
+  </section>
+
+  <!-- ============ 11. COMMON MISTAKES ============ -->
+  <section id="mistakes">
+    <h2>11. Common Mistakes</h2>
+    <ul>
+      <li><strong>Decoding instead of verifying.</strong> Calling <code>jwt.decode()</code> (or splitting + Base64) without checking the signature. Decoding is not verification — it trusts attacker-controlled data.</li>
+      <li><strong>Trusting <code>header.alg</code>.</strong> Letting the token pick the algorithm. Always pin an allow-list.</li>
+      <li><strong>Verifying <code>aud</code> nowhere.</strong> Especially in Spring Boot, where it's off by default.</li>
+      <li><strong>Hard-coding HS256 with a weak secret</strong> like <code>"secret"</code> or <code>"changeme"</code> in a config file checked into git.</li>
+      <li><strong>Storing access tokens in localStorage.</strong> One XSS flaw = full token theft. Prefer in-memory + httpOnly refresh.</li>
+      <li><strong>No expiry, or huge expiry.</strong> 24-hour access tokens turn any leak into a day-long breach.</li>
+      <li><strong>Logging tokens.</strong> Tokens in access logs, error traces, or URLs (query strings) leak via log aggregation, browser history, and Referer headers.</li>
+      <li><strong>Treating ID tokens as access tokens.</strong> ID tokens are for the client to learn who the user is; they are not for authorizing API calls. Send the <em>access</em> token to APIs.</li>
+      <li><strong>Skipping <code>exp</code> with a giant clock tolerance</strong> ("just set 1 hour skew") — that silently defeats expiry.</li>
+    </ul>
+  </section>
+
+  <!-- ============ 12. BEST PRACTICES ============ -->
+  <section id="bestpractices">
+    <h2>12. Best Practices — RFC 8725 ("JWT Best Current Practices")</h2>
+    <p>RFC 8725 is the IETF's distilled guidance after years of real-world JWT breaks. Memorize these — they are interview and certification gold.</p>
+    <div class="callout key"><span class="tag">Key — RFC 8725 Checklist</span><p>
+      ✅ <strong>Always validate the signature</strong> before using any claim.<br>
+      ✅ <strong>Use an algorithm allow-list</strong>; the verifier dictates the algorithm, not the token.<br>
+      ✅ <strong>Reject <code>alg=none</code></strong> (and any algorithm not on your list).<br>
+      ✅ <strong>Bind key to algorithm</strong>: a key is for exactly one alg; never use a public key for HMAC.<br>
+      ✅ <strong>Use strong keys</strong>: HMAC secrets ≥256 bits of entropy; prefer asymmetric (RS256/ES256) for distributed verification.<br>
+      ✅ <strong>Validate all critical claims</strong>: <code>iss</code>, <code>aud</code>, <code>exp</code> (and <code>nbf</code>/<code>iat</code> as relevant).<br>
+      ✅ <strong>Use the <code>typ</code> header</strong> / explicit typing to prevent cross-token confusion (e.g. <code>at+jwt</code> for access tokens).<br>
+      ✅ <strong>Don't trust <code>jku</code>/<code>x5u</code>/<code>kid</code> to choose key locations</strong>; pin the JWKS source.<br>
+      ✅ <strong>Keep tokens short-lived</strong>; use rotation + revocation for the rest.<br>
+      ✅ <strong>Never put secrets in the payload</strong> — JWS is signed, not encrypted.
+    </p></div>
+    <p>Beyond the RFC: serve everything over TLS/HSTS; store access tokens in memory (SPA) or httpOnly+SameSite cookies (web); rotate refresh tokens with reuse detection; for high-value APIs add <strong>sender-constrained tokens</strong> (DPoP or mutual TLS) so a stolen bearer token is useless without the holder's key.</p>
+  </section>
+
+  <!-- ============ 13. INTERVIEW ============ -->
+  <section id="interview">
+    <h2>13. Interview Questions (with Model Answers)</h2>
+    <h4>Q1. Explain the alg=none attack and the fix.</h4>
+    <p><strong>A.</strong> The header declares <code>alg:none</code>, meaning "unsecured JWT" with an empty signature. A verifier that trusts the token's algorithm concludes there is nothing to verify and accepts a fully attacker-controlled payload. Fix: pin a server-side algorithm allow-list (e.g. <code>["RS256"]</code>) so any token whose alg isn't allowed — including <code>none</code> — is rejected before verification logic runs.</p>
+    <h4>Q2. Why is RS256 safer than HS256 in a microservices system?</h4>
+    <p><strong>A.</strong> RS256 is asymmetric: only Auth0 holds the private signing key; services verify with the public key. So the power to verify is separated from the power to forge, and no shared secret is distributed across services. HS256 shares one secret for sign and verify, so any verifier (or a leak of the secret) can mint tokens.</p>
+    <h4>Q3. Walk me through the RS256→HS256 confusion attack.</h4>
+    <p><strong>A.</strong> The attacker takes the public key (published at JWKS), HMAC-signs a forged payload using that public key string as the HMAC secret, and sets <code>alg:HS256</code>. A verifier that auto-selects based on the header runs HMAC with the same public key as the secret, the signatures match, and the forged token is accepted — no private key needed. Defense: pin RS256; never let one code path switch between symmetric and asymmetric based on the token.</p>
+    <h4>Q4. A token's signature is valid but you still reject it. Why might that be?</h4>
+    <p><strong>A.</strong> A valid signature only proves authenticity of the claims. It can still fail <code>exp</code> (expired), <code>nbf</code>, <code>iss</code> (wrong issuer), <code>aud</code> (meant for another API), or appear on a revocation deny-list. All of those are independent of signature validity.</p>
+    <h4>Q5. Where should a SPA store the access token, and why?</h4>
+    <p><strong>A.</strong> In memory (JS variable / SDK cache). localStorage and sessionStorage are readable by any script, so a single XSS exfiltrates the token. Memory is wiped on reload, and the Auth0 SDK silently re-obtains tokens via rotating refresh tokens. For server-rendered apps, keep tokens in an encrypted httpOnly+SameSite cookie so page JS can't read them at all.</p>
+    <h4>Q6. JWTs are stateless — how do you revoke one before it expires?</h4>
+    <p><strong>A.</strong> Natively you can't; you compensate. Keep access-token TTL short (5–15 min) so revocation is "eventually" automatic. For immediate revocation, maintain a deny-list of <code>jti</code> (with TTL = token's <code>exp</code>) checked at the gateway, and revoke the user's refresh tokens so no new access tokens are issued. Refresh-token rotation with reuse detection invalidates a whole token family if a stolen refresh token is replayed.</p>
+    <h4>Q7. What stops a token issued for API A from working against API B?</h4>
+    <p><strong>A.</strong> The <code>aud</code> claim. Each API validates that <code>aud</code> equals its own identifier, so a token minted for A (<code>aud=A</code>) is rejected by B even though both trust the same issuer.</p>
+    <h4>Q8. How would you make a stolen bearer token useless?</h4>
+    <p><strong>A.</strong> Sender-constrain it. With DPoP or mutual-TLS, the token is cryptographically bound to a key held by the legitimate client; the resource server checks a proof of possession, so a replayed token without the matching private key fails. Short TTL and TLS reduce exposure further.</p>
+  </section>
+
+  <!-- ============ 14. CERTIFICATION ============ -->
+  <section id="certification">
+    <h2>14. Certification Tips</h2>
+    <ul>
+      <li><strong>Know Auth0's defaults:</strong> APIs default to <strong>RS256</strong>; signing keys are at <code>/.well-known/jwks.json</code>, selected by <code>kid</code>. The exam loves "which algorithm / where is the public key."</li>
+      <li><strong>ID token vs access token:</strong> ID token = authentication info for the client (audience = client_id); access token = authorization for an API (audience = API identifier). Don't send ID tokens to APIs.</li>
+      <li><strong>Validation order:</strong> signature → <code>iss</code> → <code>aud</code> → <code>exp</code>/<code>nbf</code>. Expect a question on which claim prevents which attack.</li>
+      <li><strong>Refresh token rotation</strong> and <strong>reuse detection</strong> are heavily featured — know that reusing a rotated refresh token revokes the entire family.</li>
+      <li><strong>Token storage:</strong> Auth0 SDKs default to in-memory; <code>cacheLocation: "localstorage"</code> exists but is flagged as an XSS risk — know the trade-off.</li>
+      <li><strong>RFC 8725</strong> by name: algorithm allow-list, reject <code>none</code>, validate claims, don't trust header-chosen keys.</li>
+    </ul>
+  </section>
+
+  <!-- ============ 15. HANDS-ON ============ -->
+  <section id="handson">
+    <h2>15. Hands-On Exercises</h2>
+    <ol>
+      <li><strong>Forge &amp; fail.</strong> Stand up the FastAPI validator in §7.2. Hand-craft an <code>alg=none</code> token (§6.1) and confirm it returns 401. Then temporarily remove <code>algorithms=["RS256"]</code> and observe whether your library now accepts <code>none</code> — document the difference.</li>
+      <li><strong>Confusion proof.</strong> Export your dev API's public key, run the §6.2 script, and try the forged HS256 token against a deliberately vulnerable verify function vs. the hardened one. Capture both responses.</li>
+      <li><strong>aud gap in Spring.</strong> Deploy the Spring config <em>without</em> the <code>AudienceValidator</code>. Mint a token for a different API in your tenant and confirm it is wrongly accepted; then add the validator and confirm rejection.</li>
+      <li><strong>Weak secret brute force.</strong> Sign an HS256 token with the secret <code>"secret"</code>, then crack it with <code>hashcat -m 16500</code> on a wordlist. Now sign with a 32-byte random secret and watch the crack fail.</li>
+      <li><strong>Storage XSS demo.</strong> In a throwaway SPA, store a fake token in localStorage and run <code>document.querySelector("img").onerror</code>-style injected JS that reads it — proving exfiltration. Move it to memory and show the injected script can't reach it.</li>
+    </ol>
+  </section>
+
+  <!-- ============ 16. ASSIGNMENT ============ -->
+  <section id="assignment">
+    <h2>16. Assignment</h2>
+    <p>Write a <strong>JWT Security Audit Report</strong> for a fictional API. Deliverables:</p>
+    <ol>
+      <li>A hardened resource-server validator in the stack of your choice (Spring Boot, FastAPI, or Node/jose) that pins RS256, validates <code>iss</code>/<code>aud</code>/<code>exp</code>, and fetches keys only from a hard-coded JWKS URL.</li>
+      <li>A test suite proving rejection of: <code>alg=none</code>, an HS256-confusion token, an expired token, a wrong-<code>aud</code> token, and a wrong-<code>iss</code> token. Each test asserts 401.</li>
+      <li>A one-page threat model mapping each of the nine attacks in §9 to your specific mitigation, citing the relevant RFC 8725 clause.</li>
+      <li>A storage decision: justify in-memory vs. httpOnly cookie for your client type, with the XSS/CSRF trade-off spelled out.</li>
+    </ol>
+  </section>
+
+  <!-- ============ 17. MINI PROJECT ============ -->
+  <section id="miniproject">
+    <h2>17. Mini Project — "TokenForge Range": an Intentionally Vulnerable Lab</h2>
+    <p>Build a two-service lab to internalize attack and defense side by side:</p>
+    <ul>
+      <li><strong>Service A (Vulnerable):</strong> a Node/Express API that verifies tokens by reading <code>header.alg</code> and auto-selecting HS256/RS256 with a single overloaded key, and reads tokens from a query string into logs. Expose <code>/admin</code>.</li>
+      <li><strong>Service B (Hardened):</strong> the same API using <code>jose</code> with <code>algorithms:["RS256"]</code>, issuer/audience checks, JWKS caching, and a Redis <code>jti</code> deny-list.</li>
+      <li><strong>Attack toolkit:</strong> scripts for the <code>alg=none</code> forgery, the HS256 confusion forgery, and a replay (capture a real token, fire it from a second client).</li>
+      <li><strong>Scoreboard:</strong> a small harness that runs each attack against both services and prints a table of which succeeded. Target: every attack succeeds on A, every attack fails on B.</li>
+      <li><strong>Stretch:</strong> add DPoP to Service B and demonstrate that replaying a captured token without the client's proof-of-possession key now fails.</li>
+    </ul>
+    <div class="callout tip"><span class="tag">Tip</span><p>Keep the lab on localhost or an isolated VPC. The value is the contrast: the same attack, two outcomes, because of a few lines of pinning and claim validation.</p></div>
+  </section>
+
+  <!-- ============ 18. QUIZ ============ -->
+  <section id="quiz">
+    <h2>18. Quiz — Test Yourself (25 Questions)</h2>
+    <ol>
+      <li>What does the <code>alg=none</code> value mean, and why is it dangerous?</li>
+      <li>Why can an attacker download the RS256 public key legitimately?</li>
+      <li>In the RS256→HS256 confusion attack, what is used as the HMAC secret?</li>
+      <li>What single server-side setting defeats both <code>alg=none</code> and HS256 confusion?</li>
+      <li>True/False: decoding a JWT also verifies it.</li>
+      <li>Which claim prevents a token meant for API A being accepted by API B?</li>
+      <li>Which claim stops a token from an attacker-controlled issuer?</li>
+      <li>Which claim limits the lifetime of a stolen token?</li>
+      <li>Why is RS256 preferred over HS256 in a multi-service architecture?</li>
+      <li>Name two places a JWT can leak besides XSS.</li>
+      <li>Where should a SPA store its access token, and why not localStorage?</li>
+      <li>How do you achieve immediate revocation of a stateless JWT?</li>
+      <li>What does refresh-token rotation with reuse detection do when a rotated token is replayed?</li>
+      <li>Why must HMAC secrets be at least 256 bits of entropy?</li>
+      <li>What are the <code>jku</code> and <code>x5u</code> header parameters, and why ignore token-supplied values?</li>
+      <li>Does Spring Security validate <code>aud</code> by default?</li>
+      <li>What is the difference between an ID token and an access token?</li>
+      <li>What is a sender-constrained token (DPoP/mTLS) and what attack does it stop?</li>
+      <li>Why should access-token TTLs be short?</li>
+      <li>What is the <code>kid</code> header used for?</li>
+      <li>Why is putting a password inside a JWT payload wrong?</li>
+      <li>What does RFC 8725 say about choosing the verification algorithm?</li>
+      <li>How does JWKS caching both help performance and create a DoS concern?</li>
+      <li>Give the correct claim-validation order after signature verification.</li>
+      <li>Why does a large clock tolerance partially defeat <code>exp</code>?</li>
+    </ol>
+    <details>
+      <summary>Show answer key</summary>
+      <ol>
+        <li>"Unsecured JWT" — empty signature. Dangerous because a verifier that trusts the token's alg accepts attacker-controlled claims with no verification.</li>
+        <li>It's published at <code>/.well-known/jwks.json</code> by design; public keys are meant to be shared so anyone can verify.</li>
+        <li>The RSA public key string itself, fed into HMAC as the secret.</li>
+        <li>An algorithm allow-list pinned on the server (e.g. <code>algorithms:["RS256"]</code>), so the token can't choose the algorithm.</li>
+        <li>False. Decoding only Base64URL-decodes; verification re-computes and checks the signature.</li>
+        <li><code>aud</code> (audience).</li>
+        <li><code>iss</code> (issuer).</li>
+        <li><code>exp</code> (expiration).</li>
+        <li>Asymmetric keys: only the IdP holds the private signing key; services verify with the public key, so no shared secret is distributed and verifiers can't forge.</li>
+        <li>Any two: server/access logs, URLs/query strings, Referer headers, browser history, error traces, proxies, source-control commits.</li>
+        <li>In memory (or httpOnly cookie for SSR). localStorage is readable by any script, so XSS exfiltrates it.</li>
+        <li>Short TTL plus a <code>jti</code> deny-list checked at the gateway, and revoke the user's refresh tokens.</li>
+        <li>It invalidates the entire token family, logging the user out and signaling theft.</li>
+        <li>To make offline brute-force / dictionary attacks computationally infeasible; short or guessable secrets crack quickly.</li>
+        <li>They point to a JWKS/cert URL. Token-supplied values let an attacker host their own key, so verifiers must pin the JWKS source and ignore them.</li>
+        <li>No — you must add a custom <code>AudienceValidator</code>; Spring checks signature, <code>iss</code>, and <code>exp</code> only.</li>
+        <li>ID token tells the client who the user is (audience = client_id); access token authorizes API calls (audience = API identifier). Don't send ID tokens to APIs.</li>
+        <li>A token cryptographically bound to a key the client holds; the API checks proof of possession. It stops replay of a stolen bearer token.</li>
+        <li>To bound the blast radius of theft — a leaked short-lived token is useful only briefly.</li>
+        <li>Identifies which signing key (by id) was used, so the verifier fetches the matching public key from JWKS.</li>
+        <li>JWS is signed, not encrypted — anyone with the token reads the payload, exposing the password.</li>
+        <li>The verifier must choose the algorithm via an allow-list; never trust the algorithm declared in the token header. Reject <code>none</code>.</li>
+        <li>Caching avoids a JWKS fetch per request (performance); but auto-refreshing on unknown <code>kid</code> can be abused with random <code>kid</code>s to force fetch storms, so rate-limit refreshes.</li>
+        <li>Signature → <code>iss</code> → <code>aud</code> → <code>exp</code>/<code>nbf</code> (and required-claims presence).</li>
+        <li>It widens the acceptable time window, so expired tokens within the tolerance are still accepted — keep it to a few seconds.</li>
+      </ol>
+    </details>
+  </section>
+
+  <!-- ============ 19. CHEAT SHEET ============ -->
+  <section id="cheatsheet">
+    <h2>19. Cheat Sheet</h2>
+    <pre class="diagram">
+JWT SECURITY — QUICK REFERENCE
+==============================================================
+VERIFY, DON'T DECODE.  Token never chooses alg or key.
+
+ALWAYS, server-side:
+  algorithms = ["RS256"]      # pin -> kills alg=none + HS256 confusion
+  issuer     = exact tenant URL          (iss)
+  audience   = this API's identifier     (aud)
+  enforce exp / nbf, small clock skew (<=5s)
+  JWKS URL hard-coded; ignore jku / x5u / token-chosen key
+
+KEYS:
+  RS256 (asymmetric) -> distributed: 1 signer, many verifiers
+  HS256 (symmetric)  -> only if one party owns both ends
+  HMAC secret >= 256 bits random; never a public key as secret
+
+STORAGE:
+  SPA   -> access token in MEMORY (not localStorage)
+  SSR   -> httpOnly + SameSite cookie
+  refresh token -> rotate + reuse detection
+
+LIFETIME / REVOCATION:
+  access TTL 5-15 min; refresh rotated
+  emergency revoke: jti deny-list (TTL = exp) at gateway
+  high value: DPoP / mTLS sender-constrained tokens
+
+NEVER:
+  trust header.alg | accept "none" | put secrets in payload
+  log tokens / put them in URLs | use ID token to call APIs
+==============================================================</pre>
+    <h4>curl smoke test</h4>
+    <pre><code class="language-bash"># Expired/forged/none tokens should all return 401:
+curl -i https://api.ledgerly.com/admin -H "Authorization: Bearer $TOKEN"</code></pre>
+  </section>
+
+  <!-- ============ 20. KEY TAKEAWAYS ============ -->
+  <section id="takeaways">
+    <h2>20. Key Takeaways</h2>
+    <div class="callout key"><span class="tag">Key</span><p>
+      1. A JWT is trustworthy only when the <strong>receiver controls the algorithm and the key</strong> — never the token.<br>
+      2. <strong>Pinning an algorithm allow-list</strong> (<code>["RS256"]</code>) defeats both <code>alg=none</code> and the RS256→HS256 confusion attack in one move.<br>
+      3. A valid signature is necessary but not sufficient — always validate <strong><code>iss</code>, <code>aud</code>, and <code>exp</code></strong>.<br>
+      4. Prefer <strong>RS256</strong>: one signer, many verifiers, no shared secret to leak. Use strong HMAC secrets only when symmetric is truly appropriate.<br>
+      5. Store access tokens in <strong>memory or httpOnly cookies</strong>, never localStorage; keep them <strong>short-lived</strong>, rotate refresh tokens, and keep a revocation path.<br>
+      6. Bearer tokens are stealable — <strong>sender-constrain</strong> high-value tokens with DPoP/mTLS, and never log them or put them in URLs.<br>
+      7. <strong>RFC 8725</strong> is the canonical checklist: validate signature, allow-list algorithms, reject <code>none</code>, validate claims, don't trust header-chosen keys.
+    </p></div>
+    <div class="callout note"><span class="tag">Next</span><p>In Chapter 11 we move from defending JWTs to the broader token lifecycle — issuance, refresh, and rotation in depth — building directly on the revocation and storage strategies you just learned.</p></div>
+  </section>
+
+  <nav class="pager">
+    <a class="prev" href="chapter-09.html">← Previous</a>
+    <a class="next" href="chapter-11.html">Next →</a>
+  </nav>
+</main>
+<footer class="site-footer">Master Auth0 End-to-End · Chapter 10 of 32</footer>
+</body>
+</html>

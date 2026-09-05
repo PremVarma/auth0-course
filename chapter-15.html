@@ -1,0 +1,613 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Chapter 15 — Enterprise Identity: SSO, SLO and Multi-Tenant SaaS | Master Auth0</title>
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<header class="topbar">
+  <a class="brand" href="index.html">🔐 Master Auth0</a>
+  <nav class="topnav">
+    <a href="chapter-14.html">← Prev</a>
+    <a href="index.html">Contents</a>
+    <a href="chapter-16.html">Next →</a>
+  </nav>
+</header>
+<main class="container">
+  <div class="chapter-head">
+    <span class="phase">Phase 7 · Enterprise Identity</span>
+    <h1>Chapter 15 — Enterprise Identity: SSO, SLO and Multi-Tenant SaaS</h1>
+    <p class="lead">Up to now you have authenticated <em>individual users</em>. Enterprise identity is a different game: you authenticate <em>users who belong to companies</em>, each of which wants its own login experience, its own corporate identity provider, its own admins, and its own walls. This chapter takes you from the raw mechanics of Single Sign-On (three independent session layers you must reason about), through the genuinely hard problem of Single Logout, and into Auth0 Organizations — the feature that turns a multi-tenant SaaS dream into a shippable architecture. By the end you will understand SSO and SLO at the protocol level, design a B2B identity model from first principles, wire connections per organization with home-realm discovery, onboard members by invitation, and defend every decision in an interview.</p>
+  </div>
+
+  <!-- 1 -->
+  <section id="theory">
+    <h2>1. Theory — First Principles of Enterprise Identity</h2>
+    <p>Start with the word <strong>tenant</strong>. In SaaS, a tenant is an isolated customer — usually a company. "Multi-tenant" means one running application instance serves many companies at once, keeping their data and configuration logically separated. The moment you sell to companies (B2B) rather than to people (B2C), three new requirements appear that B2C never had:</p>
+    <ol>
+      <li><strong>Company-scoped identity.</strong> A user is not just <code>alice@example.com</code>; she is <em>Alice, a member of Acme Corp</em>. The same human might also be a member of Globex through a consulting gig. Identity is now a relationship: <em>(user, organization)</em>.</li>
+      <li><strong>Bring-your-own IdP.</strong> Acme already runs Okta or Microsoft Entra ID (Azure AD). Acme's CISO will refuse to let employees create yet another password in <em>your</em> app. They demand that login federates to <em>their</em> identity provider so they keep control of provisioning, MFA, and offboarding.</li>
+      <li><strong>Delegated administration.</strong> Acme wants to invite and remove its own people without filing a support ticket with you. Administration must be partitioned per tenant.</li>
+    </ol>
+    <p><strong>Single Sign-On (SSO)</strong> is the property that once a user authenticates once, they can access multiple applications without re-entering credentials. The first principle behind SSO is that authentication state lives in a <em>session</em>, and a session is just a <em>credential the server issues and the client presents on later requests</em> (typically a cookie holding a session id or a signed token). SSO works by having multiple apps trust a <em>shared</em> authoritative session held at a central authority — in our world, the Auth0 tenant.</p>
+    <p><strong>Single Logout (SLO)</strong> is the inverse and far harder property: a single logout action should terminate the user's session everywhere. It is hard precisely because SSO created <em>multiple independent sessions</em> across different security domains, and there is no reliable, synchronous channel to kill all of them at once.</p>
+    <div class="callout key"><span class="tag">Key</span><p>SSO is "many apps, one login because they share one session." Enterprise SSO adds "and that one session may itself be federated to the customer's own IdP." Every hard problem in this chapter — SLO, multi-tenancy, home-realm discovery — is a direct consequence of there being <em>more than one session layer</em>.</p></div>
+  </section>
+
+  <!-- 2 -->
+  <section id="story">
+    <h2>2. Story-Based Explanation</h2>
+    <p>You built <strong>ProjectPilot</strong>, a project-management SaaS. The first 500 customers were freelancers who signed up with email + password. Life was simple.</p>
+    <p>Then <strong>Acme Corp</strong> wants 2,000 seats — but with conditions. Their IT writes: <em>"All employees must log in with their Acme Okta accounts. When we fire someone in Okta, they must lose ProjectPilot access immediately. When an employee clicks 'Log out', they should be logged out of ProjectPilot and our internal portal."</em> A week later <strong>Globex</strong> signs — same demands, but they use Microsoft Entra ID, and they want their own branded login page at <code>globex.projectpilot.com</code>.</p>
+    <p>Your old "one connection, one user pool" model collapses. Alice the consultant has accounts at both Acme and Globex and needs to switch between them. Bob is an Acme employee who must <em>never</em> be able to use a password — only Acme's Okta. The Acme admin wants to invite 50 new hires by email without involving you. And both companies expect that when their employees log out, the session everywhere dies.</p>
+    <p>This is exactly what <strong>Auth0 Organizations</strong> plus a deliberate session and logout strategy solves. The rest of the chapter is the story of building ProjectPilot's enterprise tier correctly.</p>
+  </section>
+
+  <!-- 3 -->
+  <section id="diagrams">
+    <h2>3. ASCII Diagrams — The Three Session Layers</h2>
+    <p>The single most important mental model in this chapter is that an enterprise login creates <strong>three independent sessions</strong>, each in its own domain, each with its own lifetime and cookie.</p>
+<pre class="diagram">
+        THE THREE SESSION LAYERS (why SSO works and SLO is hard)
+
+  ┌──────────────────────┐   ┌───────────────────────┐   ┌────────────────────────┐
+  │  LAYER 1: APP         │   │  LAYER 2: AUTH0        │   │  LAYER 3: CORPORATE IdP │
+  │  (ProjectPilot)       │   │  (your tenant)         │   │  (Acme Okta / Entra)    │
+  │                       │   │                        │   │                         │
+  │  cookie: app_session  │   │  cookie: auth0 SSO     │   │  cookie: IdP session    │
+  │  domain: app.com      │   │  domain: *.auth0.com   │   │  domain: okta.acme.com  │
+  │  set by YOUR backend  │   │  set by Auth0          │   │  set by Acme            │
+  └──────────┬───────────┘   └───────────┬────────────┘   └───────────┬────────────┘
+             │ /authorize redirect        │  upstream redirect          │
+             └───────────────────────────►│────────────────────────────►
+                                          │◄────────────────────────────┘ assertion
+             ◄───────────────────────────┘  id_token / code
+        Each arrow = a redirect that may SET a cookie in a DIFFERENT domain.
+        SSO  = reuse layer 2 (and 3) so layer-1 logins are silent.
+        SLO  = must reach back across ALL THREE layers to truly log out.
+</pre>
+<pre class="diagram">
+        SSO SECOND-APP LOGIN (silent — no credentials re-entered)
+
+  User → App B  ──/authorize──►  Auth0
+                                  │  Auth0 SSO cookie already present?
+                                  │        ├─ YES → skip login, issue tokens silently
+                                  │        └─ NO  → run login (maybe federate to IdP)
+                                  ▼
+  App B  ◄── code / id_token ──  Auth0      (user "magically" already logged in)
+</pre>
+<pre class="diagram">
+        ENTERPRISE FEDERATED LOGIN (full flow, first time)
+
+  Browser        ProjectPilot        Auth0              Acme Okta (SAML/OIDC)
+    │  GET /login    │                  │                     │
+    │───────────────►│  /authorize      │                     │
+    │                │─────────────────►│  HRD: which conn?   │
+    │                │                  │  → acme-okta        │
+    │                │                  │──── SAMLRequest ───►│
+    │                │                  │                     │ user signs in (+MFA)
+    │                │                  │◄─── SAMLResponse ───│ (assertion)
+    │                │  302 ?code=...   │ create Auth0 session│
+    │                │◄─────────────────│ + org_id in token   │
+    │  set app cookie│                  │                     │
+    │◄───────────────│ exchange code→tok│                     │
+    │   logged in    │                  │                     │
+</pre>
+  </section>
+
+  <!-- 4 -->
+  <section id="analogy">
+    <h2>4. Real-World Analogy</h2>
+    <p>Think of a large <strong>conference venue</strong> (Auth0) hosting many <strong>company booths</strong> (organizations), inside which are several <strong>meeting rooms</strong> (your applications).</p>
+    <ul>
+      <li><strong>SSO = the wristband.</strong> At the entrance you show your conference badge once and get a wristband (the Auth0 SSO cookie). Every room you enter just checks the wristband — no re-badging. That is SSO: one authentication, many doors.</li>
+      <li><strong>The corporate IdP = your employer's HR desk.</strong> Acme employees don't get their badge from the venue; they bring an Acme credential, and the venue's entrance phones Acme's HR desk to confirm "yes, this person works here" (federation). The venue never stores their password.</li>
+      <li><strong>SLO = leaving the building.</strong> Cutting your wristband at the exit is easy. But you may also have left your coat in three rooms (app sessions) and your employer's HR desk still thinks you're "checked in." True SLO means someone has to walk to every room <em>and</em> phone HR to mark you out — which is exactly why it's unreliable.</li>
+      <li><strong>Organizations = the booths.</strong> The same consultant (Alice) can have a pass for both the Acme booth and the Globex booth, and which booth she's standing in determines what she can see.</li>
+    </ul>
+  </section>
+
+  <!-- 5 -->
+  <section id="internal">
+    <h2>5. Internal Working — Cookies, Tokens and the prompt Parameter</h2>
+    <h3>5.1 How SSO reuse actually happens</h3>
+    <p>When your app sends the browser to <code>https://YOUR_TENANT.auth0.com/authorize</code>, Auth0 looks for its <strong>SSO cookie</strong> on the <code>auth0.com</code> domain. This cookie was set on a previous login and represents the <em>Auth0 session</em> (Layer 2). If it exists and is valid, Auth0 can skip the login screen and immediately return a new authorization code to the requesting app — that is silent SSO. The decisive control is the OIDC <code>prompt</code> parameter:</p>
+    <table>
+      <thead><tr><th><code>prompt</code> value</th><th>Behaviour</th><th>Use it for</th></tr></thead>
+      <tbody>
+        <tr><td><code>(omitted)</code></td><td>Reuse Auth0 session if present, else show login</td><td>Normal login</td></tr>
+        <tr><td><code>none</code></td><td>Never show UI; succeed silently or error <code>login_required</code></td><td>Silent SSO check / token refresh in SPAs</td></tr>
+        <tr><td><code>login</code></td><td>Force re-authentication even if a session exists</td><td>Step-up, sensitive actions</td></tr>
+        <tr><td><code>consent</code></td><td>Force the consent screen again</td><td>New scopes</td></tr>
+      </tbody>
+    </table>
+    <h3>5.2 Why there are still three layers even with reuse</h3>
+    <p>Reusing the Auth0 session (Layer 2) does <em>not</em> touch the corporate IdP session (Layer 3). If Auth0's session has expired but Okta's has not, Auth0 redirects to Okta, Okta sees its own cookie, and returns an assertion <em>without prompting</em> — federated SSO. So a "silent" enterprise login can still involve a round-trip to Okta. Each layer expires independently; Auth0's <strong>SSO inactivity</strong> and <strong>absolute</strong> session lifetimes are configured per tenant, while the IdP's lifetime is the customer's business.</p>
+    <h3>5.3 Why SLO is hard, mechanically</h3>
+    <p>Logout means deleting cookies, but a server can only delete cookies on <em>its own</em> domain. Your backend can clear <code>app_session</code>. To clear the Auth0 session you must redirect the browser to Auth0's <code>/v2/logout</code> endpoint (so Auth0 can clear its own cookie). To clear the IdP session you need the IdP's logout endpoint — and federated SLO must be explicitly enabled per connection, supported by the IdP, and is frequently flaky because IdPs implement SAML SLO and OIDC RP-Initiated/Back-Channel logout inconsistently. There is <em>no</em> single API call that synchronously kills all three.</p>
+    <div class="callout note"><span class="tag">Note</span><p>Auth0's logout is <strong>redirect-based</strong> by design: only the browser can carry the user through each domain so each authority can clear its own cookie. This is why SLO is a chain of redirects, not a function call.</p></div>
+  </section>
+
+  <!-- 6 -->
+  <section id="walkthrough">
+    <h2>6. Code Walkthrough — Org-Aware Login &amp; Logout</h2>
+    <h3>6.1 Node.js (Express + express-openid-connect): organization login</h3>
+<pre><code class="language-javascript">// app.js — ProjectPilot backend
+const express = require('express');
+const { auth } = require('express-openid-connect');
+
+const app = express();
+
+app.use(auth({
+  authRequired: false,
+  auth0Logout: true,                       // route logout through Auth0 /v2/logout
+  baseURL: 'https://app.projectpilot.com',
+  clientID: process.env.AUTH0_CLIENT_ID,
+  issuerBaseURL: `https://${process.env.AUTH0_DOMAIN}`,
+  secret: process.env.SESSION_SECRET,
+  authorizationParams: {
+    response_type: 'code',
+    scope: 'openid profile email',
+  },
+}));
+
+// Start login for a SPECIFIC organization (B2B).
+// organization=org_xxx tells Auth0 which org context to use.
+app.get('/login/:orgId', (req, res) =&gt; {
+  res.oidc.login({
+    returnTo: '/dashboard',
+    authorizationParams: { organization: req.params.orgId },
+  });
+});
+
+// Let the user pick their org first. NOTE: Auth0's org picker is NOT triggered
+// by prompt=select_account. Instead set the application's "Login Flow" to
+// "Prompt for Organization" (client setting organization_require_behavior:
+// "pre_login_prompt") in the Dashboard / Management API. Then simply omit the
+// organization parameter and Auth0 renders the organization selection screen.
+app.get('/login', (req, res) =&gt; {
+  res.oidc.login({ returnTo: '/dashboard' });   // no organization → Auth0 shows the org picker
+});
+
+app.get('/dashboard', (req, res) =&gt; {
+  const claims = req.oidc.user;            // includes org_id when org login was used
+  res.send(`Hello ${claims.name} — org: ${claims.org_id}`);
+});
+
+app.listen(3000);
+</code></pre>
+    <p>The decisive line is <code>authorizationParams: { organization: 'org_xxx' }</code>. It scopes the login to one tenant; the resulting ID token carries an <code>org_id</code> (and, if configured, <code>org_name</code>) claim, which your app must read to enforce tenant isolation.</p>
+    <h3>6.2 Logout — clearing the right layers</h3>
+<pre><code class="language-javascript">// With auth0Logout:true, GET /logout clears the app cookie
+// THEN redirects to https://TENANT/v2/logout?client_id=...&amp;returnTo=...
+// which clears the Auth0 (Layer 2) session cookie too.
+//
+// To also clear the IdP (Layer 3), federated logout must be enabled
+// on the connection AND requested explicitly:
+app.get('/logout-everywhere', (req, res) =&gt; {
+  res.oidc.logout({
+    returnTo: 'https://app.projectpilot.com/goodbye',
+    logoutParams: { federated: '' },       // attempt upstream IdP logout
+  });
+});
+</code></pre>
+    <h3>6.3 React SPA (auth0-react): organization &amp; silent SSO</h3>
+<pre><code class="language-jsx">// main.jsx
+import { Auth0Provider } from '@auth0/auth0-react';
+
+&lt;Auth0Provider
+  domain={import.meta.env.VITE_AUTH0_DOMAIN}
+  clientId={import.meta.env.VITE_AUTH0_CLIENT_ID}
+  authorizationParams={{
+    redirect_uri: window.location.origin,
+    organization: 'org_acme_123',          // pin this SPA to one org
+    scope: 'openid profile email',
+  }}
+  useRefreshTokens={true}
+  cacheLocation="localstorage"
+&gt;
+  &lt;App /&gt;
+&lt;/Auth0Provider&gt;
+
+// LoginButton.jsx — silent SSO check happens automatically via
+// checkSession() / getAccessTokenSilently() which call /authorize?prompt=none
+import { useAuth0 } from '@auth0/auth0-react';
+export function LoginButton() {
+  const { loginWithRedirect, logout, isAuthenticated, user } = useAuth0();
+  if (isAuthenticated)
+    return &lt;button onClick={() =&gt; logout({
+      logoutParams: { returnTo: window.location.origin, federated: true }
+    })}&gt;Log out&lt;/button&gt;;
+  return &lt;button onClick={() =&gt; loginWithRedirect()}&gt;Log in&lt;/button&gt;;
+}
+</code></pre>
+    <h3>6.4 Spring Boot (Java) — reading the org claim &amp; enforcing isolation</h3>
+<pre><code class="language-java">// SecurityConfig.java — resource server validating Auth0 access tokens
+@Configuration
+@EnableWebSecurity
+public class SecurityConfig {
+  @Bean
+  SecurityFilterChain filterChain(HttpSecurity http) throws Exception {
+    http.authorizeHttpRequests(a -&gt; a.anyRequest().authenticated())
+        .oauth2ResourceServer(o -&gt; o.jwt(Customizer.withDefaults()));
+    return http.build();
+  }
+}
+
+// ProjectController.java — every query MUST be scoped by org_id
+@RestController
+class ProjectController {
+  @GetMapping("/projects")
+  List&lt;Project&gt; list(@AuthenticationPrincipal Jwt jwt) {
+    String orgId = jwt.getClaimAsString("org_id");      // tenant boundary
+    if (orgId == null) throw new AccessDeniedException("no org context");
+    return repo.findByOrgId(orgId);                     // NEVER findAll()
+  }
+}
+</code></pre>
+    <h3>6.5 curl — silent SSO check &amp; org login URL</h3>
+<pre><code class="language-bash"># Build an organization-scoped authorize URL (open in browser):
+echo "https://$AUTH0_DOMAIN/authorize?\
+client_id=$CLIENT_ID&amp;response_type=code&amp;scope=openid%20profile%20email&amp;\
+redirect_uri=https://app.projectpilot.com/callback&amp;\
+organization=org_acme_123&amp;state=xyz"
+
+# Silent SSO probe (will 302 to callback with ?code=... if Auth0 session
+# exists, else redirect with ?error=login_required):
+curl -i "https://$AUTH0_DOMAIN/authorize?client_id=$CLIENT_ID&amp;\
+response_type=code&amp;prompt=none&amp;redirect_uri=https://app.projectpilot.com/callback&amp;\
+scope=openid&amp;organization=org_acme_123&amp;state=xyz"
+</code></pre>
+  </section>
+
+  <!-- 7 -->
+  <section id="practical">
+    <h2>7. Practical Implementation — Organizations, Connections, HRD</h2>
+    <h3>7.1 Create an organization and assign connections (Management API)</h3>
+<pre><code class="language-bash"># 1) Get a Management API token (client-credentials, mgmt audience)
+TOKEN=$(curl -s --request POST "https://$AUTH0_DOMAIN/oauth/token" \
+  --header 'content-type: application/json' \
+  --data '{"client_id":"'$M2M_ID'","client_secret":"'$M2M_SECRET'",
+           "audience":"https://'$AUTH0_DOMAIN'/api/v2/","grant_type":"client_credentials"}' \
+  | jq -r .access_token)
+
+# 2) Create the Acme organization
+curl -s --request POST "https://$AUTH0_DOMAIN/api/v2/organizations" \
+  --header "authorization: Bearer $TOKEN" --header 'content-type: application/json' \
+  --data '{
+    "name": "acme",
+    "display_name": "Acme Corp",
+    "branding": { "logo_url": "https://cdn.acme.com/logo.png",
+                  "colors": { "primary": "#0055ff", "page_background": "#ffffff" } },
+    "metadata": { "plan": "enterprise" }
+  }'
+
+# 3) Enable a connection (Acme's Okta SAML/OIDC) FOR this org only,
+#    and turn on auto-membership so users from this connection auto-join.
+curl -s --request POST \
+  "https://$AUTH0_DOMAIN/api/v2/organizations/org_acme_123/enabled_connections" \
+  --header "authorization: Bearer $TOKEN" --header 'content-type: application/json' \
+  --data '{ "connection_id": "con_acmeOkta", "assign_membership_on_login": true }'
+</code></pre>
+    <h3>7.2 Home-Realm Discovery (HRD)</h3>
+    <p>HRD answers "given who is logging in, <em>which connection</em> should I send them to?" so the user never has to choose. Auth0 supports several strategies:</p>
+    <ul>
+      <li><strong>Email-domain mapping</strong> — set <code>domain_aliases</code> on the enterprise connection (e.g. <code>acme.com</code>). Auth0's Identifier-First login asks for email, matches the domain, and routes to Acme Okta automatically.</li>
+      <li><strong>Organization prompt</strong> — when <code>organization</code> is not pre-selected, Auth0 can show an org picker, then constrain connections to that org.</li>
+      <li><strong>Per-org login URL</strong> — your app passes <code>organization=org_xxx</code> directly (e.g. via subdomain routing) and skips picking entirely.</li>
+    </ul>
+<pre><code class="language-bash"># Add a domain alias so anyone @acme.com is auto-routed to Acme's Okta:
+curl -s --request PATCH "https://$AUTH0_DOMAIN/api/v2/connections/con_acmeOkta" \
+  --header "authorization: Bearer $TOKEN" --header 'content-type: application/json' \
+  --data '{ "options": { "domain_aliases": ["acme.com"] } }'
+</code></pre>
+    <h3>7.3 Inviting and onboarding members</h3>
+<pre><code class="language-bash"># Invite a new Acme member by email. Auth0 emails an invitation link;
+# accepting it creates the user (if needed) and adds org membership.
+curl -s --request POST \
+  "https://$AUTH0_DOMAIN/api/v2/organizations/org_acme_123/invitations" \
+  --header "authorization: Bearer $TOKEN" --header 'content-type: application/json' \
+  --data '{
+    "inviter":  { "name": "Acme Admin" },
+    "invitee":  { "email": "newhire@acme.com" },
+    "client_id": "'$CLIENT_ID'",
+    "connection_id": "con_acmeOkta",
+    "roles": ["rol_member"],
+    "ttl_sec": 604800,
+    "send_invitation_email": true
+  }'
+</code></pre>
+    <p>The invitation link carries <code>invitation</code>, <code>organization</code>, and <code>organization_name</code> query parameters. Your <code>/login</code> route must forward these to <code>/authorize</code> so the accept flow lands the user in the right org with the right roles.</p>
+<pre><code class="language-javascript">// Accept-invitation route (Node): forward invitation params to Auth0
+app.get('/accept', (req, res) =&gt; {
+  const { invitation, organization } = req.query;
+  res.oidc.login({
+    returnTo: '/dashboard',
+    authorizationParams: { invitation, organization },
+  });
+});
+</code></pre>
+  </section>
+
+  <!-- 8 -->
+  <section id="architecture">
+    <h2>8. Production Architecture</h2>
+<pre class="diagram">
+        MULTI-TENANT SaaS — PRODUCTION TOPOLOGY
+
+   acme.projectpilot.com        globex.projectpilot.com      app.projectpilot.com
+            │                            │                          │
+            ▼  subdomain→org map         ▼                          ▼ (HRD by email)
+   ┌──────────────────────────────────────────────────────────────────────┐
+   │                         EDGE / ROUTER (resolves org_id)                │
+   └───────────────────────────────┬──────────────────────────────────────┘
+                                    │ /authorize?organization=org_xxx
+                                    ▼
+                        ┌────────────────────────┐
+                        │   AUTH0 TENANT (1)      │
+                        │  Organizations:         │
+                        │   • org_acme  → Okta    │
+                        │   • org_globex→ Entra   │
+                        │   • org_self  → DB conn │
+                        │  Actions: add org_id,   │
+                        │   roles, app_metadata   │
+                        └───────────┬─────────────┘
+                Federated SAML/OIDC │  id_token { org_id, roles[] }
+        ┌───────────────┬──────────┴───────────┬───────────────┐
+        ▼               ▼                       ▼               ▼
+   Acme Okta       Globex Entra ID        Self-serve DB     Social (G/MS)
+        │               │                       │               │
+        └───────────────┴───────────────────────┴───────────────┘
+                                    │ tokens
+                                    ▼
+   ┌──────────────────────────────────────────────────────────────────────┐
+   │  API GATEWAY  →  validates JWT, asserts org_id, scopes every query     │
+   │  Services: Projects | Billing | Files   (all partitioned by org_id)    │
+   │  Data: row-level tenant_id == org_id   (defense in depth)              │
+   └──────────────────────────────────────────────────────────────────────┘
+</pre>
+    <p>Production guidance:</p>
+    <ul>
+      <li><strong>One Auth0 tenant, many Organizations</strong> — do <em>not</em> spin up an Auth0 tenant per customer; that doesn't scale and Organizations exist precisely to avoid it.</li>
+      <li><strong>Routing → org resolution at the edge.</strong> Map subdomain (or email domain via HRD) to <code>org_id</code> before <code>/authorize</code>.</li>
+      <li><strong>Tenant isolation in two places</strong> — enforce <code>org_id</code> at the API (from the token) <em>and</em> store <code>tenant_id</code> on every row (defense in depth). Never rely on the token alone.</li>
+      <li><strong>Actions enrich tokens</strong> with <code>org_id</code>, org roles, and <code>app_metadata</code> so downstream services authorize without extra lookups.</li>
+    </ul>
+  </section>
+
+  <!-- 9 -->
+  <section id="security">
+    <h2>9. Security Analysis</h2>
+    <table>
+      <thead><tr><th>Threat</th><th>Why it bites in B2B</th><th>Mitigation</th></tr></thead>
+      <tbody>
+        <tr><td>Cross-tenant data leak</td><td>One missing <code>WHERE org_id=?</code> exposes Acme data to Globex</td><td>Enforce <code>org_id</code> in API + row-level <code>tenant_id</code>; integration tests that assert isolation</td></tr>
+        <tr><td>Org confusion / token replay</td><td>Token from <code>org_acme</code> used against a <code>org_globex</code> endpoint</td><td>Validate <code>org_id</code> claim equals the route's expected org; reject mismatches</td></tr>
+        <tr><td>Ghost access after offboarding</td><td>Okta disables Bob, but Auth0/app sessions still valid</td><td>Short session lifetimes; enable federated logout; honor IdP-initiated logout; back-channel logout</td></tr>
+        <tr><td>Open invitation abuse</td><td>Invitation links forwarded to outsiders</td><td>Bind invite to email + connection; short <code>ttl_sec</code>; one-time use (Auth0 enforces)</td></tr>
+        <tr><td>SLO not actually logging out</td><td>App clears its cookie but Auth0/IdP sessions persist → silent re-login</td><td>Route logout through Auth0 <code>/v2/logout</code> and federated logout; verify all three layers</td></tr>
+        <tr><td>Connection enabled tenant-wide</td><td>Acme's Okta usable to log into Globex's org</td><td>Enable connections <em>per organization</em>; never globally for enterprise conns</td></tr>
+        <tr><td>Open-redirect on returnTo</td><td>Attacker sets <code>returnTo</code> to phishing site</td><td>Allowlist logout/callback URLs in the Auth0 app config</td></tr>
+      </tbody>
+    </table>
+    <div class="callout danger"><span class="tag">Danger</span><p>The number-one B2B vulnerability is the <strong>missing tenant filter</strong>. An access token proves <em>who</em> the user is and <em>which org</em>, but your code must still scope every read/write to that org. Treat <code>org_id</code> as a mandatory query predicate, not an optional one.</p></div>
+  </section>
+
+  <!-- 10 -->
+  <section id="performance">
+    <h2>10. Performance Considerations</h2>
+    <ul>
+      <li><strong>Silent SSO costs a redirect.</strong> <code>prompt=none</code> via a hidden iframe (or refresh tokens) avoids a full login UI but still hits <code>/authorize</code>. In SPAs prefer <strong>refresh tokens with rotation</strong> over iframe silent auth — third-party cookie blocking (Safari ITP, Chrome) breaks iframe-based silent SSO.</li>
+      <li><strong>Federated round-trips.</strong> A cold enterprise login may bounce App → Auth0 → Okta → Auth0 → App. Cache nothing security-sensitive, but keep Auth0 session lifetimes long enough that Layer-2 reuse spares the Okta hop on subsequent apps.</li>
+      <li><strong>Token size.</strong> Stuffing many org roles/permissions into the ID/access token inflates every request header. Put coarse claims in the token; fetch fine-grained permissions server-side or use a permissions endpoint.</li>
+      <li><strong>Management API rate limits.</strong> Bulk inviting members or listing org membership hits API rate limits — batch, back off, and cache org metadata rather than calling per request.</li>
+      <li><strong>JWKS caching.</strong> Resource servers should cache the tenant's JWKS keys (respecting rotation) instead of fetching per token validation.</li>
+    </ul>
+  </section>
+
+  <!-- 11 -->
+  <section id="mistakes">
+    <h2>11. Common Mistakes</h2>
+    <ol>
+      <li><strong>One Auth0 tenant per customer.</strong> Unmanageable; Organizations is the answer.</li>
+      <li><strong>Forgetting <code>organization</code> on <code>/authorize</code>.</strong> Users log in with no org context, <code>org_id</code> is absent, and tenant isolation silently fails.</li>
+      <li><strong>Enabling enterprise connections globally.</strong> Acme's Okta becomes usable across all orgs. Enable per organization.</li>
+      <li><strong>Logout that only clears the app cookie.</strong> The Auth0 SSO session survives, so the next login is silent and the user appears "not logged out."</li>
+      <li><strong>Assuming federated SLO just works.</strong> It must be enabled, supported by the IdP, and tested; many SAML IdPs implement SLO poorly.</li>
+      <li><strong>Trusting the token for authorization without re-checking org on the resource.</strong> Always assert the token's <code>org_id</code> matches the resource's tenant.</li>
+      <li><strong>Hardcoding one connection.</strong> Multi-tenant apps must select the connection dynamically (HRD / org).</li>
+      <li><strong>Long-lived, never-rotated sessions.</strong> Offboarded employees keep access. Use short inactivity lifetimes + back-channel logout.</li>
+      <li><strong>Putting all permissions in the token.</strong> Header bloat and stale data; fetch dynamic authz server-side.</li>
+      <li><strong>Mixing B2C and B2B users in one undifferentiated pool.</strong> Use organizations to separate company users from self-serve users.</li>
+    </ol>
+  </section>
+
+  <!-- 12 -->
+  <section id="best">
+    <h2>12. Best Practices</h2>
+    <div class="callout tip"><span class="tag">Tip</span><p>Design the identity model <em>before</em> the data model. Decide what a "tenant" is (organization), how users join (invite vs. JIT via connection), and how <code>org_id</code> flows from login to token to query — then build tables around it.</p></div>
+    <ul>
+      <li><strong>One tenant, Organizations for B2B</strong>; keep self-serve users in their own org or a default connection.</li>
+      <li><strong>Connections per organization</strong>, with <code>assign_membership_on_login</code> for JIT membership and <code>domain_aliases</code> for HRD.</li>
+      <li><strong>Always pass <code>organization</code></strong> and validate the <code>org_id</code> claim end-to-end.</li>
+      <li><strong>Enrich tokens with an Action</strong> (org roles, <code>app_metadata</code>) and keep tokens lean.</li>
+      <li><strong>Logout strategy by tier:</strong> app cookie → Auth0 <code>/v2/logout</code> → federated logout where required by contract; document and test all three.</li>
+      <li><strong>Short SSO inactivity + absolute lifetimes</strong>; support IdP-initiated and back-channel logout for fast offboarding.</li>
+      <li><strong>Delegated admin via org roles</strong> so customer admins invite/remove without you.</li>
+      <li><strong>Defense in depth</strong>: token <code>org_id</code> + row-level <code>tenant_id</code> + isolation tests in CI.</li>
+    </ul>
+  </section>
+
+  <!-- 13 -->
+  <section id="interview">
+    <h2>13. Interview Questions (with Model Answers)</h2>
+    <h3>Q1. Explain SSO at the session level.</h3>
+    <p><strong>A.</strong> SSO works because multiple applications delegate authentication to a central authority (Auth0) that holds an authoritative session in its own cookie. The first app login establishes that Auth0 session; subsequent apps redirect to <code>/authorize</code>, Auth0 finds its session cookie and issues fresh tokens without prompting. So it's "many apps, one shared upstream session," controlled by the <code>prompt</code> parameter.</p>
+    <h3>Q2. Why is Single Logout hard?</h3>
+    <p><strong>A.</strong> SSO created multiple independent sessions in different domains (app, Auth0, corporate IdP). A server can only delete cookies on its own domain, and there's no synchronous channel to kill all of them. Logout must be a chain of browser redirects so each authority clears its own cookie, and federated SLO depends on the IdP supporting and correctly implementing SAML/OIDC logout — which is inconsistent.</p>
+    <h3>Q3. A customer demands their employees log in with corporate Okta and never have a password in our app. How?</h3>
+    <p><strong>A.</strong> Create an Organization for the customer, configure an enterprise SAML/OIDC connection to their Okta, enable that connection <em>only</em> for their org, and disable database/password connections for it. Login passes <code>organization=org_xxx</code>; HRD via <code>domain_aliases</code> routes <code>@customer.com</code> users to Okta. We store no password.</p>
+    <h3>Q4. How do you prevent cross-tenant data leakage?</h3>
+    <p><strong>A.</strong> The login carries an <code>org_id</code> claim in the token; the API validates it and scopes every query by it, and we also store <code>tenant_id</code> per row as defense in depth. We add automated tests asserting that a token for org A can never read org B's data.</p>
+    <h3>Q5. Difference between Organizations and just using <code>app_metadata.company</code>?</h3>
+    <p><strong>A.</strong> Organizations are first-class: per-org connections, branding, membership, roles, invitations, and an <code>org_id</code> claim — managed by Auth0 and customer admins. Stuffing a company field in metadata gives you none of the connection isolation, delegated admin, invitation flow, or HRD; you'd reinvent all of it poorly.</p>
+    <h3>Q6. How does a single human belong to two companies?</h3>
+    <p><strong>A.</strong> One user identity can be a member of multiple organizations. Login is org-scoped, so the same user authenticates into <code>org_acme</code> or <code>org_globex</code>, and the token's <code>org_id</code> tells the app which context applies. The app can offer an org switcher that re-runs login with a different <code>organization</code>.</p>
+    <h3>Q7. What's the role of <code>prompt=none</code>?</h3>
+    <p><strong>A.</strong> It performs a silent authentication: if an Auth0 session exists, tokens are returned without UI; if not, it errors with <code>login_required</code>. SPAs use it (or refresh tokens) to silently establish/refresh sessions, though third-party cookie restrictions make refresh-token rotation the more robust choice.</p>
+  </section>
+
+  <!-- 14 -->
+  <section id="cert">
+    <h2>14. Certification Tips</h2>
+    <ul>
+      <li><strong>Know the exact claim names</strong>: <code>org_id</code> and <code>org_name</code> appear in tokens for org logins. The <code>organization</code> parameter is on <code>/authorize</code>.</li>
+      <li><strong>Connections are enabled per organization</strong>; remember <code>assign_membership_on_login</code> (auto-membership) and <code>domain_aliases</code> (HRD).</li>
+      <li><strong>Logout endpoint</strong> is <code>/v2/logout</code>; <code>federated</code> triggers upstream IdP logout; <code>returnTo</code> must be allowlisted.</li>
+      <li><strong>Two B2B login models</strong>: <em>prompt for organization</em> (set the app's Login Flow / <code>organization_require_behavior</code> to <code>pre_login_prompt</code> and omit the parameter — Auth0 shows the picker) vs. <em>organization pre-selected</em> (your app passes <code>organization=org_xxx</code>, behavior <code>no_prompt</code>). Know when each is used — <code>prompt=select_account</code> does <em>not</em> trigger the org picker.</li>
+      <li><strong>Invitations</strong> are created via the Management API under <code>/organizations/{id}/invitations</code>; they're email-bound, one-time, and time-limited.</li>
+      <li><strong>Session layers</strong>: be able to name app vs. Auth0 SSO vs. IdP session and which one each lifetime setting controls.</li>
+      <li><strong>One tenant, many organizations</strong> is the recommended B2B model — a frequent exam point.</li>
+    </ul>
+  </section>
+
+  <!-- 15 -->
+  <section id="handson">
+    <h2>15. Hands-On Exercises</h2>
+    <ol>
+      <li>Create two organizations (<code>acme</code>, <code>globex</code>) via the Management API and give each a distinct logo/color via <code>branding</code>.</li>
+      <li>Create a database connection and enable it for <code>acme</code> only. Log in with <code>organization=org_acme</code> and inspect the ID token — confirm <code>org_id</code> is present (use jwt.io).</li>
+      <li>Add a <code>domain_aliases</code> value and verify Identifier-First login routes a matching email to the right connection (HRD).</li>
+      <li>Send an organization invitation to your own email; accept it and confirm membership + role appear.</li>
+      <li>Implement <code>/logout</code> that clears the app cookie and redirects to <code>/v2/logout</code>. Then add <code>federated</code> and observe the difference in network requests.</li>
+      <li>Write an Action that adds org roles to the access token, then read them in a protected API route.</li>
+    </ol>
+  </section>
+
+  <!-- 16 -->
+  <section id="assignment">
+    <h2>16. Assignment</h2>
+    <p>Build a minimal multi-tenant version of <strong>ProjectPilot</strong>:</p>
+    <ol>
+      <li>One Auth0 tenant, two Organizations, each with its own connection (one DB, one enterprise/social standing in for Okta).</li>
+      <li>A Node or Spring Boot backend with a <code>/projects</code> endpoint that returns <em>only</em> the caller's org projects, enforced by the token's <code>org_id</code> and a row-level <code>tenant_id</code>.</li>
+      <li>Subdomain or path routing that maps <code>acme.*</code> → <code>org_acme</code> and passes <code>organization</code> to <code>/authorize</code>.</li>
+      <li>Invitation flow: an admin invites a member by email; the accept link onboards them into the correct org with a role.</li>
+      <li>A full logout button that clears all three layers, plus a written note on which layers your IdP actually supports for SLO.</li>
+    </ol>
+    <p><strong>Deliverable:</strong> repo + a one-page architecture note explaining your session/logout strategy and how cross-tenant leakage is prevented (cite the two places you enforce isolation).</p>
+  </section>
+
+  <!-- 17 -->
+  <section id="miniproject">
+    <h2>17. Mini Project — "TenantSwitch": Multi-Org Dashboard</h2>
+    <p>Create a React + Node app where a single user can belong to multiple organizations and switch between them live:</p>
+    <ul>
+      <li><strong>Org switcher UI:</strong> a dropdown listing the user's memberships (fetched from the Management API), each option re-running <code>loginWithRedirect({ authorizationParams:{ organization } })</code>.</li>
+      <li><strong>Context badge:</strong> show <code>org_name</code> from the token so it's always visible which tenant you're in.</li>
+      <li><strong>Scoped data:</strong> the Node API returns projects filtered by the token's <code>org_id</code>; prove with a test that switching orgs changes the data and that a forged <code>org_id</code> is rejected.</li>
+      <li><strong>Branded login:</strong> set per-org <code>branding</code> so each org's login page looks native to that customer.</li>
+      <li><strong>Stretch:</strong> add an admin view (gated by an org role) that lists pending invitations and lets the admin invite/revoke.</li>
+    </ul>
+    <p>This project exercises every concept in the chapter: organizations, per-org connections, HRD, invitations, org-scoped tokens, and isolation.</p>
+  </section>
+
+  <!-- 18 -->
+  <section id="quiz">
+    <h2>18. Quiz (24 Questions)</h2>
+    <ol>
+      <li>Define a "tenant" in multi-tenant SaaS.</li>
+      <li>Name the three session layers in an enterprise SSO login.</li>
+      <li>Which cookie does logging out of your app's backend clear, and which it cannot?</li>
+      <li>What does <code>prompt=none</code> do, and what error does it return on failure?</li>
+      <li>What claim identifies the organization in an org-scoped token?</li>
+      <li>How do you tell Auth0 which organization a login is for?</li>
+      <li>What is Home-Realm Discovery and name two strategies Auth0 supports.</li>
+      <li>What does <code>domain_aliases</code> on a connection enable?</li>
+      <li>What does <code>assign_membership_on_login</code> do?</li>
+      <li>Why is enabling enterprise connections globally a security problem?</li>
+      <li>Why is Single Logout fundamentally harder than Single Sign-On?</li>
+      <li>What endpoint clears the Auth0 SSO session, and what does the <code>federated</code> parameter add?</li>
+      <li>Give two reasons federated SLO often fails in practice.</li>
+      <li>What are the two places you should enforce tenant isolation?</li>
+      <li>How can one human be a member of two organizations?</li>
+      <li>Recommended Auth0 model for B2B: one tenant per customer, or one tenant with Organizations?</li>
+      <li>Why prefer refresh-token rotation over iframe silent SSO in SPAs?</li>
+      <li>What query parameters does an organization invitation link carry?</li>
+      <li>Why are invitations email-bound, one-time, and time-limited?</li>
+      <li>What is the danger of putting all permissions in the token?</li>
+      <li>How does an Action help an org-aware architecture?</li>
+      <li>What's the difference between Organizations and storing a company in <code>app_metadata</code>?</li>
+      <li>After an employee is disabled in Okta, why might they still access your app, and how do you fix it?</li>
+      <li>Why must <code>returnTo</code> on logout be allowlisted?</li>
+    </ol>
+    <details>
+      <summary>Show answer key</summary>
+      <ol>
+        <li>An isolated customer (usually a company) served by a shared application instance with logically separated data/config.</li>
+        <li>App session (your backend), Auth0 SSO session, corporate IdP session.</li>
+        <li>It clears its own <code>app_session</code> cookie; it cannot clear the Auth0 or IdP cookies (different domains).</li>
+        <li>Silent authentication — reuse the session with no UI; on failure returns <code>login_required</code>.</li>
+        <li><code>org_id</code> (with <code>org_name</code> when configured).</li>
+        <li>Pass <code>organization=org_xxx</code> on the <code>/authorize</code> request.</li>
+        <li>Choosing the right connection for a user automatically; strategies: email-domain mapping (<code>domain_aliases</code>), org prompt/picker, per-org login URL with <code>organization</code>.</li>
+        <li>Auto-routing users whose email domain matches to that connection (HRD).</li>
+        <li>Auto-adds the user to the organization on first login via that connection (JIT membership).</li>
+        <li>A customer's enterprise IdP could be used to log into other orgs; connections must be scoped per organization.</li>
+        <li>SSO created multiple independent sessions across domains; cookies can only be cleared by their own domain; no synchronous channel kills all of them, and federated SLO depends on inconsistent IdP support.</li>
+        <li><code>/v2/logout</code>; <code>federated</code> additionally attempts logout at the upstream IdP.</li>
+        <li>IdPs implement SAML/OIDC logout inconsistently; back/front-channel logout can be unsupported, misconfigured, or blocked by browsers.</li>
+        <li>At the API (validate token <code>org_id</code> and scope queries) and at the data layer (row-level <code>tenant_id</code>).</li>
+        <li>One user identity can hold membership in multiple organizations; login is org-scoped via the <code>organization</code> parameter.</li>
+        <li>One tenant with Organizations.</li>
+        <li>Iframe silent SSO relies on third-party cookies, which modern browsers block; rotating refresh tokens are robust.</li>
+        <li><code>invitation</code>, <code>organization</code>, and <code>organization_name</code>.</li>
+        <li>To prevent reuse/forwarding abuse and limit the window of exposure.</li>
+        <li>Token/header bloat and stale permissions; fetch dynamic authorization server-side.</li>
+        <li>It enriches tokens with <code>org_id</code>, org roles, and metadata so services authorize without extra lookups.</li>
+        <li>Organizations are first-class (per-org connections, branding, roles, invitations, HRD, <code>org_id</code> claim, delegated admin); metadata gives none of that.</li>
+        <li>Existing Auth0/app sessions persist; fix with short session lifetimes, federated/back-channel logout, and honoring IdP-initiated logout.</li>
+        <li>To prevent open-redirect attacks sending users to phishing destinations after logout.</li>
+      </ol>
+    </details>
+  </section>
+
+  <!-- 19 -->
+  <section id="cheatsheet">
+    <h2>19. Cheat Sheet</h2>
+<pre><code class="language-text">SESSION LAYERS      app cookie | Auth0 SSO cookie | IdP cookie  (3, independent)
+LOGIN (org)         /authorize?...&amp;organization=org_xxx&amp;[invitation=...]
+SILENT SSO          /authorize?...&amp;prompt=none   → ok | error=login_required
+FORCE LOGIN         /authorize?...&amp;prompt=login
+TOKEN CLAIMS        org_id, org_name, roles[] (via Action)
+LOGOUT (app+Auth0)  GET /v2/logout?client_id=...&amp;returnTo=&lt;allowlisted&gt;
+LOGOUT (federated)  add &amp;federated  → also signs out upstream IdP
+HRD                 connection.options.domain_aliases = ["acme.com"]
+JIT MEMBERSHIP      enabled_connections.assign_membership_on_login = true
+ENABLE CONN PER ORG POST /api/v2/organizations/{id}/enabled_connections
+INVITE MEMBER       POST /api/v2/organizations/{id}/invitations (email-bound, 1x, ttl)
+ISOLATION RULE      token.org_id  AND  row.tenant_id   (defense in depth)
+B2B MODEL           ONE Auth0 tenant + MANY Organizations  (never tenant-per-customer)
+</code></pre>
+  </section>
+
+  <!-- 20 -->
+  <section id="takeaways">
+    <h2>20. Key Takeaways</h2>
+    <div class="callout key"><span class="tag">Key</span><p><strong>Three session layers explain everything.</strong> SSO is reuse of the shared Auth0 (and IdP) session; SLO is hard because you must reach back across all three domains, each of which only its owner can clear.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p><strong>Organizations are the B2B primitive.</strong> One Auth0 tenant, many Organizations; per-org connections, branding, roles, invitations, and an <code>org_id</code> claim give you real tenant isolation and delegated admin out of the box.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p><strong>Always carry org context.</strong> Pass <code>organization</code> on login, validate <code>org_id</code> in the API, and store <code>tenant_id</code> per row. The missing tenant filter is the #1 B2B vulnerability.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p><strong>HRD removes friction</strong> via <code>domain_aliases</code> and per-org login URLs, and <strong>invitations</strong> (email-bound, one-time, time-limited) onboard members safely with delegated admin.</p></div>
+    <div class="callout key"><span class="tag">Key</span><p><strong>Logout is a tiered redirect chain</strong>: app cookie → Auth0 <code>/v2/logout</code> → federated IdP logout. Design and test it explicitly, and use short session lifetimes for fast offboarding.</p></div>
+  </section>
+
+  <nav class="pager">
+    <a class="prev" href="chapter-14.html">← Previous</a>
+    <a class="next" href="chapter-16.html">Next →</a>
+  </nav>
+</main>
+<footer class="site-footer">Master Auth0 End-to-End · Chapter 15 of 32</footer>
+</body>
+</html>
